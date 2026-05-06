@@ -3,7 +3,7 @@ import axios from "axios";
 import "./App.css";
 
 function App() {
-  const API_BASE = "http://127.0.0.1:8000";
+  const API_BASE = "https://ai-site-factory-backend.onrender.com";
 
   const [lead, setLead] = useState({});
   const [cleaned, setCleaned] = useState(null);
