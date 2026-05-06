@@ -7,26 +7,56 @@ function App() {
   const [content, setContent] = useState(null);
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
+  const [errors, setErrors] = useState({});
+  const [approvalStatus, setApprovalStatus] = useState("Pending Review");
 
   const handleChange = (e) => {
     setLead({ ...lead, [e.target.name]: e.target.value });
     setMessage("");
   };
 
-  const validateLead = () => {
-    if (!lead.businessName || !lead.email || !lead.category) {
-      setMessage("Please complete Business Name, Email, and Category.");
-      return false;
-    }
+  const loadSampleLead = () => {
+  setLead({
+    businessName: "FixIt Plumbing",
+    email: "info@fixitplumbing.co.za",
+    category: "Plumbing",
+    location: "Durban",
+    notes: "Provides emergency plumbing, pipe repairs, leak detection, and residential plumbing services.",
+  });
 
-    if (!lead.email.includes("@")) {
-      setMessage("Please enter a valid email address.");
-      return false;
-    }
+  setCleaned(null);
+  setContent(null);
+  setErrors({});
+  setMessage("Sample lead loaded successfully.");
+};
+ 
+const validateLead = () => {
+  const newErrors = {};
 
-    setMessage("Lead is valid and ready for cleaning.");
-    return true;
-  };
+  if (!lead.businessName?.trim()) {
+    newErrors.businessName = "Business name is required.";
+  }
+
+  if (!lead.email?.trim()) {
+    newErrors.email = "Email address is required.";
+  } else if (!lead.email.includes("@")) {
+    newErrors.email = "Please enter a valid email address.";
+  }
+
+  if (!lead.category?.trim()) {
+    newErrors.category = "Category / industry is required.";
+  }
+
+  setErrors(newErrors);
+
+  if (Object.keys(newErrors).length > 0) {
+    setMessage("Please fix the highlighted fields.");
+    return false;
+  }
+
+  setMessage("Lead is valid and ready for cleaning.");
+  return true;
+};
 
   const cleanLead = () => {
     if (!validateLead()) return;
@@ -79,8 +109,15 @@ function App() {
     setContent(null);
     setLoading(false);
     setMessage("");
+    setApprovalStatus("Pending Review");
   };
 
+  const copyContentPacket = () => {
+  if (!content) return;
+
+  navigator.clipboard.writeText(JSON.stringify(content, null, 2));
+  setMessage("Content packet copied to clipboard.");
+};
   const downloadPreview = () => {
     if (!content) return;
 
@@ -155,6 +192,7 @@ function App() {
               value={lead.businessName || ""}
               onChange={handleChange}
             />
+            {errors.businessName && <p className="error">{errors.businessName}</p>}
 
             <input
               name="email"
@@ -162,6 +200,7 @@ function App() {
               value={lead.email || ""}
               onChange={handleChange}
             />
+             {errors.email && <p className="error">{errors.email}</p>}
 
             <input
               name="category"
@@ -169,6 +208,7 @@ function App() {
               value={lead.category || ""}
               onChange={handleChange}
             />
+              {errors.category && <p className="error">{errors.category}</p>}
 
             <input
               name="location"
@@ -184,14 +224,19 @@ function App() {
               onChange={handleChange}
             ></textarea>
 
-            <div className="button-row">
-              <button onClick={validateLead} className="secondary-btn">
-                Validate Lead
-              </button>
+           <div className="button-row">
+             <button onClick={loadSampleLead} className="sample-btn">
+               Load Sample Lead
+             </button>
+
+             <button onClick={validateLead} className="secondary-btn">
+               Validate Lead
+             </button>
+
               <button onClick={cleanLead}>Clean Data</button>
+             </div>
+             </section>
             </div>
-          </section>
-        </div>
 
         <div className="right-panel">
           {cleaned ? (
@@ -241,13 +286,40 @@ function App() {
                   ))}
                 </div>
 
+                <div className="approval-box">
+                 <h3>Approval Status</h3>
+                  <p>
+                   Current Status: <strong>{approvalStatus}</strong>
+                  </p>
+
+              <div className="button-row">
+                <button onClick={() => setApprovalStatus("Approved")}>
+                  Approve Preview
+                </button>
+
+                  <button
+                   className="reject-btn"
+                  onClick={() => setApprovalStatus("Rejected - Regenerate Required")}
+                 >
+                    Reject / Regenerate
+                 </button>
+              </div>
+                </div> 
+
                 <button>{content.cta}</button>
               </div>
 
               <div className="button-row">
-                <button onClick={downloadPreview}>Download Preview HTML</button>
-                <button className="reset" onClick={resetApp}>
-                  Start New Lead
+               <button onClick={copyContentPacket} className="secondary-btn">
+                 Copy Content Packet
+               </button>
+
+               <button onClick={downloadPreview}>
+                  Download Preview HTML
+               </button>
+
+               <button className="reset" onClick={resetApp}>
+                 Start New Lead
                 </button>
               </div>
             </section>
