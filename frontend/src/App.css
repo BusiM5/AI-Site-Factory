@@ -284,4 +284,32 @@ pre {
   .service-grid {
     grid-template-columns: 1fr;
   }
+
+  .error {
+  color: #dc2626;
+  font-size: 13px;
+  font-weight: bold;
+  margin-top: -8px;
+  margin-bottom: 12px;
+}
+
+.sample-btn {
+  background: #7c3aed;
+}
+
+.approval-box {
+  margin-top: 20px;
+  background: #f8fafc;
+  border: 1px solid #e5e7eb;
+  padding: 18px;
+  border-radius: 16px;
+}
+
+.approval-box h3 {
+  margin-top: 0;
+}
+
+.reject-btn {
+  background: #dc2626;
+}
 }

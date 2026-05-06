@@ -1,7 +1,10 @@
 import { useState } from "react";
+import axios from "axios";
 import "./App.css";
 
 function App() {
+  const API_BASE = "http://127.0.0.1:8000";
+
   const [lead, setLead] = useState({});
   const [cleaned, setCleaned] = useState(null);
   const [content, setContent] = useState(null);
@@ -13,111 +16,111 @@ function App() {
   const handleChange = (e) => {
     setLead({ ...lead, [e.target.name]: e.target.value });
     setMessage("");
+    setErrors({});
   };
 
   const loadSampleLead = () => {
-  setLead({
-    businessName: "FixIt Plumbing",
-    email: "info@fixitplumbing.co.za",
-    category: "Plumbing",
-    location: "Durban",
-    notes: "Provides emergency plumbing, pipe repairs, leak detection, and residential plumbing services.",
-  });
+    setLead({
+      businessName: "FixIt Plumbing",
+      email: "info@fixitplumbing.co.za",
+      category: "Plumbing",
+      location: "Durban",
+      notes:
+        "Provides emergency plumbing, pipe repairs, leak detection, and residential plumbing services.",
+    });
 
-  setCleaned(null);
-  setContent(null);
-  setErrors({});
-  setMessage("Sample lead loaded successfully.");
-};
- 
-const validateLead = () => {
-  const newErrors = {};
-
-  if (!lead.businessName?.trim()) {
-    newErrors.businessName = "Business name is required.";
-  }
-
-  if (!lead.email?.trim()) {
-    newErrors.email = "Email address is required.";
-  } else if (!lead.email.includes("@")) {
-    newErrors.email = "Please enter a valid email address.";
-  }
-
-  if (!lead.category?.trim()) {
-    newErrors.category = "Category / industry is required.";
-  }
-
-  setErrors(newErrors);
-
-  if (Object.keys(newErrors).length > 0) {
-    setMessage("Please fix the highlighted fields.");
-    return false;
-  }
-
-  setMessage("Lead is valid and ready for cleaning.");
-  return true;
-};
-
-  const cleanLead = () => {
-    if (!validateLead()) return;
-
-    const cleanedData = {
-      businessName: lead.businessName.trim(),
-      email: lead.email.trim().toLowerCase(),
-      category: lead.category.trim(),
-      location: lead.location?.trim() || "Not provided",
-      cleanSummary: lead.notes?.trim() || "No additional notes provided.",
-      status: "CLEAN",
-      readyForAI: "YES",
-    };
-
-    setCleaned(cleanedData);
+    setCleaned(null);
     setContent(null);
-    setMessage("Lead cleaned successfully.");
+    setErrors({});
+    setApprovalStatus("Pending Review");
+    setMessage("Sample lead loaded successfully.");
   };
 
-  const generateContent = () => {
+  const validateLead = () => {
+    const newErrors = {};
+
+    if (!lead.businessName?.trim()) {
+      newErrors.businessName = "Business name is required.";
+    }
+
+    if (!lead.email?.trim()) {
+      newErrors.email = "Email address is required.";
+    } else if (!lead.email.includes("@")) {
+      newErrors.email = "Please enter a valid email address.";
+    }
+
+    if (!lead.category?.trim()) {
+      newErrors.category = "Category / industry is required.";
+    }
+
+    setErrors(newErrors);
+
+    if (Object.keys(newErrors).length > 0) {
+      setMessage("Please fix the highlighted fields.");
+      return false;
+    }
+
+    setMessage("Lead is valid and ready for cleaning.");
+    return true;
+  };
+
+  const cleanLead = async () => {
+    if (!validateLead()) return;
+
+    try {
+      setMessage("Cleaning lead data...");
+
+      const response = await axios.post(`${API_BASE}/api/leads/clean`, {
+        businessName: lead.businessName,
+        email: lead.email,
+        category: lead.category,
+        location: lead.location,
+        notes: lead.notes,
+      });
+
+      setCleaned(response.data);
+      setContent(null);
+      setApprovalStatus("Pending Review");
+      setMessage("Lead cleaned successfully.");
+    } catch (error) {
+      console.error(error);
+      setMessage("Backend cleaning failed. Make sure FastAPI is running on port 8000.");
+    }
+  };
+
+  const generateContent = async () => {
     if (!cleaned) {
       setMessage("Clean the lead before generating content.");
       return;
     }
 
-    setLoading(true);
-    setMessage("Generating AI content packet...");
+    try {
+      setLoading(true);
+      setMessage("Generating AI content packet...");
 
-    setTimeout(() => {
-      const generated = {
-        headline: `${cleaned.businessName} - ${cleaned.category} Services in ${cleaned.location}`,
-        summary: `${cleaned.businessName} provides reliable ${cleaned.category.toLowerCase()} services in ${cleaned.location}. ${cleaned.cleanSummary}`,
-        services: [
-          `Professional ${cleaned.category} support`,
-          "Customer-focused service delivery",
-          "Reliable local assistance",
-        ],
-        cta: `Contact ${cleaned.businessName} today to learn more.`,
-      };
+      const response = await axios.post(
+        `${API_BASE}/api/content/generate`,
+        cleaned
+      );
 
-      setContent(generated);
-      setLoading(false);
+      setContent(response.data);
+      setApprovalStatus("Pending Review");
       setMessage("Preview website generated successfully.");
-    }, 2000);
-  };
-
-  const resetApp = () => {
-    setLead({});
-    setCleaned(null);
-    setContent(null);
-    setLoading(false);
-    setMessage("");
-    setApprovalStatus("Pending Review");
+    } catch (error) {
+      console.error(error);
+      setMessage("Content generation failed. Check that the backend is running.");
+    } finally {
+      setLoading(false);
+    }
   };
 
   const copyContentPacket = () => {
-  if (!content) return;
+    if (!content) return;
 
-  navigator.clipboard.writeText(JSON.stringify(content, null, 2));
-  setMessage("Content packet copied to clipboard.");
-};
+    navigator.clipboard.writeText(JSON.stringify(content, null, 2));
+    setMessage("Content packet copied to clipboard.");
+  };
+
   const downloadPreview = () => {
     if (!content) return;
 
@@ -130,11 +133,18 @@ const validateLead = () => {
 <body>
   <h1>${content.headline}</h1>
   <p>${content.summary}</p>
+
   <h2>Services</h2>
   <ul>
-    ${content.services.map((service) => `<li>${service}</li>`).join("")}
+    ${content.services
+      .map(
+        (service) =>
+          `<li><strong>${service.title}</strong>: ${service.description}</li>`
+      )
+      .join("")}
   </ul>
-  <strong>${content.cta}</strong>
+
+  <p><strong>${content.cta}</strong></p>
 </body>
 </html>
 `;
@@ -150,14 +160,24 @@ const validateLead = () => {
     URL.revokeObjectURL(url);
   };
 
+  const resetApp = () => {
+    setLead({});
+    setCleaned(null);
+    setContent(null);
+    setLoading(false);
+    setMessage("");
+    setErrors({});
+    setApprovalStatus("Pending Review");
+  };
+
   return (
     <div className="app">
       <header className="header">
-        <span className="badge">Phase 1 Frontend</span>
+        <span className="badge">Phase 1 Frontend + Backend</span>
         <h1>AI Site Factory</h1>
         <p>
-          Lead intake, data cleaning, content generation, and preview website
-          workflow.
+          Lead intake, data cleaning, backend content generation, and preview
+          website workflow.
         </p>
       </header>
 
@@ -169,16 +189,25 @@ const validateLead = () => {
             <div className={!cleaned ? "step active" : "step done"}>
               1. Lead
             </div>
+
             <div
               className={
-                cleaned && !content ? "step active" : cleaned ? "step done" : "step"
+                cleaned && !content
+                  ? "step active"
+                  : cleaned
+                  ? "step done"
+                  : "step"
               }
             >
               2. Clean
             </div>
-            <div className={loading ? "step active" : content ? "step done" : "step"}>
+
+            <div
+              className={loading ? "step active" : content ? "step done" : "step"}
+            >
               3. Generate
             </div>
+
             <div className={content ? "step done" : "step"}>4. Preview</div>
           </div>
 
@@ -192,7 +221,9 @@ const validateLead = () => {
               value={lead.businessName || ""}
               onChange={handleChange}
             />
-            {errors.businessName && <p className="error">{errors.businessName}</p>}
+            {errors.businessName && (
+              <p className="error">{errors.businessName}</p>
+            )}
 
             <input
               name="email"
@@ -200,7 +231,7 @@ const validateLead = () => {
               value={lead.email || ""}
               onChange={handleChange}
             />
-             {errors.email && <p className="error">{errors.email}</p>}
+            {errors.email && <p className="error">{errors.email}</p>}
 
             <input
               name="category"
@@ -208,7 +239,7 @@ const validateLead = () => {
               value={lead.category || ""}
               onChange={handleChange}
             />
-              {errors.category && <p className="error">{errors.category}</p>}
+            {errors.category && <p className="error">{errors.category}</p>}
 
             <input
               name="location"
@@ -224,26 +255,26 @@ const validateLead = () => {
               onChange={handleChange}
             ></textarea>
 
-           <div className="button-row">
-             <button onClick={loadSampleLead} className="sample-btn">
-               Load Sample Lead
-             </button>
+            <div className="button-row">
+              <button onClick={loadSampleLead} className="sample-btn">
+                Load Sample Lead
+              </button>
 
-             <button onClick={validateLead} className="secondary-btn">
-               Validate Lead
-             </button>
+              <button onClick={validateLead} className="secondary-btn">
+                Validate Lead
+              </button>
 
               <button onClick={cleanLead}>Clean Data</button>
-             </div>
-             </section>
             </div>
+          </section>
+        </div>
 
         <div className="right-panel">
           {cleaned ? (
             <section className="card">
               <h2>Cleaned Data</h2>
               <p className="helper">
-                Normalized lead record ready for AI generation.
+                Normalized lead record returned from the FastAPI backend.
               </p>
 
               <pre>{JSON.stringify(cleaned, null, 2)}</pre>
@@ -255,7 +286,7 @@ const validateLead = () => {
               {loading && (
                 <div className="loading-box">
                   <div className="spinner"></div>
-                  <p>AI is creating the content packet...</p>
+                  <p>Backend is creating the content packet...</p>
                 </div>
               )}
             </section>
@@ -268,6 +299,14 @@ const validateLead = () => {
 
           {content ? (
             <section className="card">
+              <h2>Generated Content Packet</h2>
+              <p className="helper">
+                Structured content packet returned from the backend generation
+                endpoint.
+              </p>
+
+              <pre>{JSON.stringify(content, null, 2)}</pre>
+
               <h2>Preview Website</h2>
               <p className="helper">
                 Reviewable website preview generated from the content packet.
@@ -281,45 +320,48 @@ const validateLead = () => {
                   {content.services.map((service, index) => (
                     <div className="service-card" key={index}>
                       <span>0{index + 1}</span>
-                      <p>{service}</p>
+                      <h3>{service.title}</h3>
+                      <p>{service.description}</p>
                     </div>
                   ))}
                 </div>
 
-                <div className="approval-box">
-                 <h3>Approval Status</h3>
-                  <p>
-                   Current Status: <strong>{approvalStatus}</strong>
-                  </p>
-
-              <div className="button-row">
-                <button onClick={() => setApprovalStatus("Approved")}>
-                  Approve Preview
-                </button>
-
-                  <button
-                   className="reject-btn"
-                  onClick={() => setApprovalStatus("Rejected - Regenerate Required")}
-                 >
-                    Reject / Regenerate
-                 </button>
-              </div>
-                </div> 
-
                 <button>{content.cta}</button>
               </div>
 
+              <div className="approval-box">
+                <h3>Approval Status</h3>
+                <p>
+                  Current Status: <strong>{approvalStatus}</strong>
+                </p>
+
+                <div className="button-row">
+                  <button onClick={() => setApprovalStatus("Approved")}>
+                    Approve Preview
+                  </button>
+
+                  <button
+                    className="reject-btn"
+                    onClick={() =>
+                      setApprovalStatus("Rejected - Regenerate Required")
+                    }
+                  >
+                    Reject / Regenerate
+                  </button>
+                </div>
+              </div>
+
               <div className="button-row">
-               <button onClick={copyContentPacket} className="secondary-btn">
-                 Copy Content Packet
-               </button>
+                <button onClick={copyContentPacket} className="secondary-btn">
+                  Copy Content Packet
+                </button>
 
-               <button onClick={downloadPreview}>
+                <button onClick={downloadPreview}>
                   Download Preview HTML
-               </button>
+                </button>
 
-               <button className="reset" onClick={resetApp}>
-                 Start New Lead
+                <button className="reset" onClick={resetApp}>
+                  Start New Lead
                 </button>
               </div>
             </section>

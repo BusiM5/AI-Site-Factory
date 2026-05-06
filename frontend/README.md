@@ -1,3 +1,39 @@
+# AI Site Factory - Frontend
+
+This is the Phase 1 frontend for the AI Site Factory & Outreach Pipeline.
+
+## Purpose
+
+The frontend demonstrates the Phase 1 lead-to-preview workflow:
+
+1. Lead intake
+2. Data validation
+3. Data cleaning
+4. Simulated AI content generation
+5. Preview website rendering
+6. Approval status handling
+
+## Features
+
+- Lead intake form
+- Sample lead loader
+- Inline validation errors
+- Cleaned data display
+- Simulated AI generation loading state
+- Website preview renderer
+- Copy content packet button
+- Download preview HTML button
+- Approval status controls
+- Reset workflow button
+
+## How to Run
+
+```bash
+cd frontend
+npm install
+npm start
+
+
 # Getting Started with Create React App
 
 This project was bootstrapped with [Create React App](https://github.com/facebook/create-react-app).
