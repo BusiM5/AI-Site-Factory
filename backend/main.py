@@ -21,6 +21,10 @@ app.add_middleware(
 )
 
 
+class ScrapeRequest(BaseModel):
+    url: str
+
+
 class LeadInput(BaseModel):
     businessName: str
     email: EmailStr
@@ -51,8 +55,7 @@ class ContentPacket(BaseModel):
     cta: str
     tone: str
     brandNotes: str
-    generatedAt: str
-
+    generatedAt: str  
 
 @app.get("/")
 def health_check():
@@ -105,3 +108,14 @@ def generate_content(cleaned_lead: CleanedLead):
         brandNotes="Generated from cleaned lead data. No unsupported claims added.",
         generatedAt=datetime.now().isoformat(),
     )
+@app.post("/api/scrape/lead")
+def scrape_lead(request: ScrapeRequest):
+    return {
+        "businessName": "Demo Business",
+        "email": "info@demobusiness.co.za",
+        "domain": request.url,
+        "category": "General Services",
+        "location": "South Africa",
+        "notes": f"Lead generated from public website source: {request.url}",
+        "sourceType": "scraper-demo"
+    }

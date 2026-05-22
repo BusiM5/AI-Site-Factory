@@ -3,7 +3,8 @@ import axios from "axios";
 import "./App.css";
 
 function App() {
-  const API_BASE = "https://ai-site-factory-backend.onrender.com";
+  const API_BASE =
+    process.env.REACT_APP_API_BASE || "http://127.0.0.1:8000";
 
   const [lead, setLead] = useState({});
   const [cleaned, setCleaned] = useState(null);
@@ -12,6 +13,7 @@ function App() {
   const [message, setMessage] = useState("");
   const [errors, setErrors] = useState({});
   const [approvalStatus, setApprovalStatus] = useState("Pending Review");
+  const [websiteUrl, setWebsiteUrl] = useState("");
 
   const handleChange = (e) => {
     setLead({ ...lead, [e.target.name]: e.target.value });
@@ -34,6 +36,43 @@ function App() {
     setErrors({});
     setApprovalStatus("Pending Review");
     setMessage("Sample lead loaded successfully.");
+  };
+
+  const fetchLeadFromWebsite = async () => {
+    if (!websiteUrl.trim()) {
+      setMessage("Please enter a website URL.");
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setMessage("Fetching lead data from website...");
+
+      const response = await axios.post(`${API_BASE}/api/scrape/lead`, {
+        url: websiteUrl,
+      });
+
+      const data = response.data;
+
+      setLead({
+        businessName: data.businessName || "Demo Business",
+        email: data.email || "info@demobusiness.co.za",
+        category: data.category || "General Services",
+        location: data.location || "South Africa",
+        notes: data.notes || `Lead generated from website: ${websiteUrl}`,
+      });
+
+      setCleaned(null);
+      setContent(null);
+      setErrors({});
+      setApprovalStatus("Pending Review");
+      setMessage("Lead data fetched successfully.");
+    } catch (error) {
+      console.error(error);
+      setMessage("Failed to fetch lead data. Check that the backend is running.");
+    } finally {
+      setLoading(false);
+    }
   };
 
   const validateLead = () => {
@@ -84,7 +123,7 @@ function App() {
       setMessage("Lead cleaned successfully.");
     } catch (error) {
       console.error(error);
-      setMessage("Backend cleaning failed. Make sure FastAPI is running on port 8000.");
+      setMessage("Backend cleaning failed. Make sure FastAPI is running.");
     }
   };
 
@@ -137,9 +176,10 @@ function App() {
   <h2>Services</h2>
   <ul>
     ${content.services
-      .map(
-        (service) =>
-          `<li><strong>${service.title}</strong>: ${service.description}</li>`
+      .map((service) =>
+        typeof service === "string"
+          ? `<li>${service}</li>`
+          : `<li><strong>${service.title}</strong>: ${service.description}</li>`
       )
       .join("")}
   </ul>
@@ -168,6 +208,7 @@ function App() {
     setMessage("");
     setErrors({});
     setApprovalStatus("Pending Review");
+    setWebsiteUrl("");
   };
 
   return (
@@ -176,8 +217,8 @@ function App() {
         <span className="badge">Phase 1 Frontend + Backend</span>
         <h1>AI Site Factory</h1>
         <p>
-          Lead intake, data cleaning, backend content generation, and preview
-          website workflow.
+          Lead intake, scraper demo, data cleaning, backend content generation,
+          and preview website workflow.
         </p>
       </header>
 
@@ -203,7 +244,9 @@ function App() {
             </div>
 
             <div
-              className={loading ? "step active" : content ? "step done" : "step"}
+              className={
+                loading ? "step active" : content ? "step done" : "step"
+              }
             >
               3. Generate
             </div>
@@ -212,6 +255,24 @@ function App() {
           </div>
 
           <section className="card">
+            <div className="scraper-box">
+              <h3>Website Lead Scraper</h3>
+              <p className="helper">
+                Enter a public website URL to fetch demo lead data into the form.
+              </p>
+
+              <input
+                type="text"
+                placeholder="Enter website URL"
+                value={websiteUrl}
+                onChange={(e) => setWebsiteUrl(e.target.value)}
+              />
+
+              <button onClick={fetchLeadFromWebsite} disabled={loading}>
+                {loading ? "Fetching..." : "Fetch Lead From Website"}
+              </button>
+            </div>
+
             <h2>Lead Intake</h2>
             <p className="helper">Enter raw business lead details below.</p>
 
@@ -286,7 +347,7 @@ function App() {
               {loading && (
                 <div className="loading-box">
                   <div className="spinner"></div>
-                  <p>Backend is creating the content packet...</p>
+                  <p>Backend is processing the request...</p>
                 </div>
               )}
             </section>
@@ -320,8 +381,14 @@ function App() {
                   {content.services.map((service, index) => (
                     <div className="service-card" key={index}>
                       <span>0{index + 1}</span>
-                      <h3>{service.title}</h3>
-                      <p>{service.description}</p>
+                      {typeof service === "string" ? (
+                        <p>{service}</p>
+                      ) : (
+                        <>
+                          <h3>{service.title}</h3>
+                          <p>{service.description}</p>
+                        </>
+                      )}
                     </div>
                   ))}
                 </div>
