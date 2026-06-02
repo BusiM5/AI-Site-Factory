@@ -6,73 +6,23 @@ function App() {
   const API_BASE =
     process.env.REACT_APP_API_BASE || "http://127.0.0.1:8000";
 
+  const [websiteUrl, setWebsiteUrl] = useState("");
   const [lead, setLead] = useState({});
+  const [leadId, setLeadId] = useState(null);
   const [cleaned, setCleaned] = useState(null);
-  const [content, setContent] = useState(null);
+  const [generation, setGeneration] = useState(null);
+  const [previewBuild, setPreviewBuild] = useState(null);
+
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
   const [errors, setErrors] = useState({});
-  const [approvalStatus, setApprovalStatus] = useState("Pending Review");
-  const [websiteUrl, setWebsiteUrl] = useState("");
+
+  const contentPacket = generation?.contentPacket;
 
   const handleChange = (e) => {
     setLead({ ...lead, [e.target.name]: e.target.value });
     setMessage("");
     setErrors({});
-  };
-
-  const loadSampleLead = () => {
-    setLead({
-      businessName: "FixIt Plumbing",
-      email: "info@fixitplumbing.co.za",
-      category: "Plumbing",
-      location: "Durban",
-      notes:
-        "Provides emergency plumbing, pipe repairs, leak detection, and residential plumbing services.",
-    });
-
-    setCleaned(null);
-    setContent(null);
-    setErrors({});
-    setApprovalStatus("Pending Review");
-    setMessage("Sample lead loaded successfully.");
-  };
-
-  const fetchLeadFromWebsite = async () => {
-    if (!websiteUrl.trim()) {
-      setMessage("Please enter a website URL.");
-      return;
-    }
-
-    try {
-      setLoading(true);
-      setMessage("Fetching lead data from website...");
-
-      const response = await axios.post(`${API_BASE}/api/scrape/lead`, {
-        url: websiteUrl,
-      });
-
-      const data = response.data;
-
-      setLead({
-        businessName: data.businessName || "Demo Business",
-        email: data.email || "info@demobusiness.co.za",
-        category: data.category || "General Services",
-        location: data.location || "South Africa",
-        notes: data.notes || `Lead generated from website: ${websiteUrl}`,
-      });
-
-      setCleaned(null);
-      setContent(null);
-      setErrors({});
-      setApprovalStatus("Pending Review");
-      setMessage("Lead data fetched successfully.");
-    } catch (error) {
-      console.error(error);
-      setMessage("Failed to fetch lead data. Check that the backend is running.");
-    } finally {
-      setLoading(false);
-    }
   };
 
   const validateLead = () => {
@@ -99,31 +49,108 @@ function App() {
       return false;
     }
 
-    setMessage("Lead is valid and ready for cleaning.");
+    setMessage("Lead is valid.");
     return true;
   };
 
-  const cleanLead = async () => {
+  const loadSampleLead = () => {
+    setLead({
+      businessName: "FixIt Plumbing",
+      email: "info@fixitplumbing.co.za",
+      domain: "fixitplumbing.co.za",
+      category: "Plumbing",
+      location: "Durban",
+      notes:
+        "Provides emergency plumbing, pipe repairs, leak detection, and residential plumbing services.",
+    });
+
+    setWebsiteUrl("");
+    setLeadId(null);
+    setCleaned(null);
+    setGeneration(null);
+    setPreviewBuild(null);
+    setErrors({});
+    setMessage("Sample lead loaded.");
+  };
+
+  const fetchLeadFromWebsite = async () => {
+    if (!websiteUrl.trim()) {
+      setMessage("Please enter a website URL.");
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setMessage("Fetching lead data from website source...");
+
+      const response = await axios.post(`${API_BASE}/api/scrape/lead`, {
+        url: websiteUrl,
+      });
+
+      const data = response.data;
+
+      setLead({
+        businessName: data.businessName || "",
+        email: data.email || "",
+        domain: data.domain || websiteUrl,
+        category: data.category || "",
+        location: data.location || "",
+        notes: data.notes || "",
+      });
+
+      setLeadId(null);
+      setCleaned(null);
+      setGeneration(null);
+      setPreviewBuild(null);
+      setErrors({});
+      setMessage("Lead data fetched into intake form.");
+    } catch (error) {
+      console.error(error);
+      setMessage("Failed to fetch lead data from scraper API.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const submitIntakeAndClean = async () => {
     if (!validateLead()) return;
 
     try {
-      setMessage("Cleaning lead data...");
+      setLoading(true);
+      setMessage("Creating lead intake record...");
 
-      const response = await axios.post(`${API_BASE}/api/leads/clean`, {
-        businessName: lead.businessName,
-        email: lead.email,
-        category: lead.category,
-        location: lead.location,
-        notes: lead.notes,
+      const intakeResponse = await axios.post(`${API_BASE}/api/leads/intake`, {
+        rawLeadRow: {
+          businessName: lead.businessName,
+          email: lead.email,
+          domain: lead.domain || websiteUrl || "manual-entry",
+          category: lead.category,
+          location: lead.location || "Not provided",
+          notes: lead.notes || "No additional notes provided.",
+        },
+        sourceType: websiteUrl ? "scraper-demo" : "manual",
+        batchId: "phase-1-demo",
       });
 
-      setCleaned(response.data);
-      setContent(null);
-      setApprovalStatus("Pending Review");
-      setMessage("Lead cleaned successfully.");
+      const newLeadId = intakeResponse.data.leadId;
+      setLeadId(newLeadId);
+
+      setMessage("Lead intake created. Cleaning lead record...");
+
+      const cleanResponse = await axios.post(
+        `${API_BASE}/api/leads/${newLeadId}/clean`
+      );
+
+      setCleaned(cleanResponse.data);
+      setGeneration(null);
+      setPreviewBuild(null);
+
+      setMessage("Lead intake and cleaning completed.");
     } catch (error) {
       console.error(error);
-      setMessage("Backend cleaning failed. Make sure FastAPI is running.");
+      setMessage("Lead intake or cleaning failed.");
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -135,56 +162,85 @@ function App() {
 
     try {
       setLoading(true);
-      setMessage("Generating AI content packet...");
+      setMessage("Generating content packet...");
 
-      const response = await axios.post(
-        `${API_BASE}/api/content/generate`,
-        cleaned
-      );
+      const response = await axios.post(`${API_BASE}/api/content/generate`, {
+        leadRecord: cleaned,
+        generationProfile: "default",
+        templateId: "standard-service-template",
+        toneProfile: "professional",
+      });
 
-      setContent(response.data);
-      setApprovalStatus("Pending Review");
-      setMessage("Preview website generated successfully.");
+      setGeneration(response.data);
+      setPreviewBuild(null);
+
+      setMessage("Content packet generated.");
     } catch (error) {
       console.error(error);
-      setMessage("Content generation failed. Check that the backend is running.");
+      setMessage("Content generation failed.");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const buildPreview = async () => {
+    if (!leadId || !contentPacket) {
+      setMessage("Generate the content packet before building a preview.");
+      return;
+    }
+
+    try {
+      setLoading(true);
+      setMessage("Building preview website...");
+
+      const response = await axios.post(`${API_BASE}/api/site/build-preview`, {
+        leadId,
+        contentPacket,
+        templateId: "standard-service-template",
+        deployMode: "preview",
+      });
+
+      setPreviewBuild(response.data);
+      setMessage("Preview build completed.");
+    } catch (error) {
+      console.error(error);
+      setMessage("Preview build failed.");
     } finally {
       setLoading(false);
     }
   };
 
   const copyContentPacket = () => {
-    if (!content) return;
+    if (!generation) return;
 
-    navigator.clipboard.writeText(JSON.stringify(content, null, 2));
-    setMessage("Content packet copied to clipboard.");
+    navigator.clipboard.writeText(JSON.stringify(generation, null, 2));
+    setMessage("Generated content packet copied.");
   };
 
   const downloadPreview = () => {
-    if (!content) return;
+    if (!contentPacket) return;
 
     const html = `
 <!DOCTYPE html>
 <html>
 <head>
-  <title>${content.headline}</title>
+  <title>${contentPacket.headline}</title>
 </head>
 <body>
-  <h1>${content.headline}</h1>
-  <p>${content.summary}</p>
+  <h1>${contentPacket.headline}</h1>
+  <p>${contentPacket.summary}</p>
 
   <h2>Services</h2>
   <ul>
-    ${content.services
-      .map((service) =>
-        typeof service === "string"
-          ? `<li>${service}</li>`
-          : `<li><strong>${service.title}</strong>: ${service.description}</li>`
+    ${contentPacket.serviceBlocks
+      .map(
+        (service) =>
+          `<li><strong>${service.title}</strong>: ${service.description}</li>`
       )
       .join("")}
   </ul>
 
-  <p><strong>${content.cta}</strong></p>
+  <p><strong>${contentPacket.CTA}</strong></p>
 </body>
 </html>
 `;
@@ -194,31 +250,32 @@ function App() {
     const link = document.createElement("a");
 
     link.href = url;
-    link.download = "preview-website.html";
+    link.download = "phase-1-preview.html";
     link.click();
 
     URL.revokeObjectURL(url);
   };
 
   const resetApp = () => {
+    setWebsiteUrl("");
     setLead({});
+    setLeadId(null);
     setCleaned(null);
-    setContent(null);
+    setGeneration(null);
+    setPreviewBuild(null);
     setLoading(false);
     setMessage("");
     setErrors({});
-    setApprovalStatus("Pending Review");
-    setWebsiteUrl("");
   };
 
   return (
     <div className="app">
       <header className="header">
-        <span className="badge">Phase 1 Frontend + Backend</span>
+        <span className="badge">Phase 1 Lead-to-Preview Backbone</span>
         <h1>AI Site Factory</h1>
         <p>
-          Lead intake, scraper demo, data cleaning, backend content generation,
-          and preview website workflow.
+          Documentation-aligned workflow: lead source, intake, cleaning,
+          generation, and preview build.
         </p>
       </header>
 
@@ -227,38 +284,25 @@ function App() {
       <div className="layout">
         <div className="left-panel">
           <div className="progress">
-            <div className={!cleaned ? "step active" : "step done"}>
-              1. Lead
+            <div className={!leadId ? "step active" : "step done"}>
+              1. Intake
             </div>
-
-            <div
-              className={
-                cleaned && !content
-                  ? "step active"
-                  : cleaned
-                  ? "step done"
-                  : "step"
-              }
-            >
+            <div className={cleaned && !generation ? "step active" : cleaned ? "step done" : "step"}>
               2. Clean
             </div>
-
-            <div
-              className={
-                loading ? "step active" : content ? "step done" : "step"
-              }
-            >
+            <div className={generation && !previewBuild ? "step active" : generation ? "step done" : "step"}>
               3. Generate
             </div>
-
-            <div className={content ? "step done" : "step"}>4. Preview</div>
+            <div className={previewBuild ? "step done" : "step"}>
+              4. Preview
+            </div>
           </div>
 
           <section className="card">
             <div className="scraper-box">
-              <h3>Website Lead Scraper</h3>
+              <h3>Lead Source / Scraper</h3>
               <p className="helper">
-                Enter a public website URL to fetch demo lead data into the form.
+                Enter a public website URL to fetch structured demo lead data.
               </p>
 
               <input
@@ -274,7 +318,9 @@ function App() {
             </div>
 
             <h2>Lead Intake</h2>
-            <p className="helper">Enter raw business lead details below.</p>
+            <p className="helper">
+              Review or enter the raw lead before creating the intake record.
+            </p>
 
             <input
               name="businessName"
@@ -293,6 +339,13 @@ function App() {
               onChange={handleChange}
             />
             {errors.email && <p className="error">{errors.email}</p>}
+
+            <input
+              name="domain"
+              placeholder="Domain / Website"
+              value={lead.domain || ""}
+              onChange={handleChange}
+            />
 
             <input
               name="category"
@@ -325,7 +378,9 @@ function App() {
                 Validate Lead
               </button>
 
-              <button onClick={cleanLead}>Clean Data</button>
+              <button onClick={submitIntakeAndClean} disabled={loading}>
+                {loading ? "Processing..." : "Create Intake & Clean"}
+              </button>
             </div>
           </section>
         </div>
@@ -333,90 +388,85 @@ function App() {
         <div className="right-panel">
           {cleaned ? (
             <section className="card">
-              <h2>Cleaned Data</h2>
+              <h2>Cleaned Lead Record</h2>
               <p className="helper">
-                Normalized lead record returned from the FastAPI backend.
+                Output from <strong>/api/leads/&#123;leadId&#125;/clean</strong>.
               </p>
 
               <pre>{JSON.stringify(cleaned, null, 2)}</pre>
 
               <button onClick={generateContent} disabled={loading}>
-                {loading ? "Generating..." : "Generate Content"}
+                {loading ? "Generating..." : "Generate Content Packet"}
               </button>
-
-              {loading && (
-                <div className="loading-box">
-                  <div className="spinner"></div>
-                  <p>Backend is processing the request...</p>
-                </div>
-              )}
             </section>
           ) : (
             <section className="card empty-state">
-              <h2>Cleaned Data</h2>
-              <p>Complete lead intake and clean the data to continue.</p>
+              <h2>Cleaned Lead Record</h2>
+              <p>Create the lead intake and cleaning output to continue.</p>
             </section>
           )}
 
-          {content ? (
+          {generation ? (
             <section className="card">
               <h2>Generated Content Packet</h2>
               <p className="helper">
-                Structured content packet returned from the backend generation
-                endpoint.
+                Output from <strong>/api/content/generate</strong>.
               </p>
 
-              <pre>{JSON.stringify(content, null, 2)}</pre>
+              <pre>{JSON.stringify(generation, null, 2)}</pre>
 
+              <button onClick={buildPreview} disabled={loading}>
+                {loading ? "Building..." : "Build Preview"}
+              </button>
+            </section>
+          ) : (
+            <section className="card empty-state">
+              <h2>Generated Content Packet</h2>
+              <p>Generate content after cleaning the lead.</p>
+            </section>
+          )}
+
+          {contentPacket && (
+            <section className="card">
               <h2>Preview Website</h2>
               <p className="helper">
-                Reviewable website preview generated from the content packet.
+                Visual rendering from the generated content packet.
               </p>
 
               <div className="preview">
-                <h1>{content.headline}</h1>
-                <p>{content.summary}</p>
+                <h1>{contentPacket.headline}</h1>
+                <p>{contentPacket.summary}</p>
 
                 <div className="service-grid">
-                  {content.services.map((service, index) => (
+                  {contentPacket.serviceBlocks.map((service, index) => (
                     <div className="service-card" key={index}>
                       <span>0{index + 1}</span>
-                      {typeof service === "string" ? (
-                        <p>{service}</p>
-                      ) : (
-                        <>
-                          <h3>{service.title}</h3>
-                          <p>{service.description}</p>
-                        </>
-                      )}
+                      <h3>{service.title}</h3>
+                      <p>{service.description}</p>
                     </div>
                   ))}
                 </div>
 
-                <button>{content.cta}</button>
+                <button>{contentPacket.CTA}</button>
               </div>
 
-              <div className="approval-box">
-                <h3>Approval Status</h3>
-                <p>
-                  Current Status: <strong>{approvalStatus}</strong>
-                </p>
-
-                <div className="button-row">
-                  <button onClick={() => setApprovalStatus("Approved")}>
-                    Approve Preview
-                  </button>
-
-                  <button
-                    className="reject-btn"
-                    onClick={() =>
-                      setApprovalStatus("Rejected - Regenerate Required")
-                    }
-                  >
-                    Reject / Regenerate
-                  </button>
+              {previewBuild && (
+                <div className="approval-box">
+                  <h3>Preview Build Result</h3>
+                  <p>
+                    <strong>Status:</strong>{" "}
+                    {previewBuild.deploymentStatus}
+                  </p>
+                  <p>
+                    <strong>Preview URL:</strong>{" "}
+                    {previewBuild.previewUrl}
+                  </p>
+                  <p>
+                    <strong>Build Reference:</strong>{" "}
+                    {previewBuild.buildReference}
+                  </p>
                 </div>
-              </div>
+              )}
 
               <div className="button-row">
                 <button onClick={copyContentPacket} className="secondary-btn">
@@ -431,11 +481,6 @@ function App() {
                   Start New Lead
                 </button>
               </div>
-            </section>
-          ) : (
-            <section className="card empty-state">
-              <h2>Preview Website</h2>
-              <p>Generate content to view the preview website.</p>
             </section>
           )}
         </div>
