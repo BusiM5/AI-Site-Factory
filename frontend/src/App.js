@@ -12,6 +12,7 @@ function App() {
   const [cleaned, setCleaned] = useState(null);
   const [generation, setGeneration] = useState(null);
   const [previewBuild, setPreviewBuild] = useState(null);
+  const [reviewStatus, setReviewStatus] = useState("Pending Review");
 
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
@@ -268,6 +269,23 @@ function App() {
     setErrors({});
   };
 
+  const approvePreview = () => {
+  if (!previewBuild) {
+    setMessage("Build the preview before approving.");
+    return;
+  }
+
+  setReviewStatus("Approved");
+  setMessage("Preview approved by operator.");
+};
+
+const requestRegeneration = () => {
+  setReviewStatus("Regeneration Requested");
+  setGeneration(null);
+  setPreviewBuild(null);
+  setMessage("Regeneration requested. Generate a new content packet.");
+};
+
   return (
     <div className="app">
       <header className="header">
@@ -458,13 +476,31 @@ function App() {
                     {previewBuild.deploymentStatus}
                   </p>
                   <p>
-                    <strong>Preview URL:</strong>{" "}
+                    <strong>Preview Reference:</strong>{" "}
                     {previewBuild.previewUrl}
                   </p>
                   <p>
                     <strong>Build Reference:</strong>{" "}
                     {previewBuild.buildReference}
                   </p>
+                  <p>
+  <strong>Review Status:</strong> {reviewStatus}
+</p>
+
+<p className="helper">{previewBuild.limitationNote}</p>
+
+<div className="button-row">
+  <button onClick={approvePreview}>
+    Approve Preview
+  </button>
+
+  <button
+    className="reject-btn"
+    onClick={requestRegeneration}
+  >
+    Request Regeneration
+  </button>
+</div>
                 </div>
               )}
 

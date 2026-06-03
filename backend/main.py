@@ -1,10 +1,11 @@
-import re
-from urllib.parse import urlparse
-import requests
-from bs4 import BeautifulSoup
 from datetime import datetime
 from typing import Dict, List, Optional
-from uuid import uuid4 
+from uuid import uuid4
+import re
+from urllib.parse import urlparse
+
+import requests
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr
@@ -17,6 +18,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
         "https://ai-site-factory-frontend.vercel.app",
     ],
     allow_credentials=True,
@@ -25,7 +29,6 @@ app.add_middleware(
 )
 
 
-# Temporary in-memory storage for Phase 1 proof of concept
 LEADS_DB: Dict[str, dict] = {}
 CONTENT_DB: Dict[str, dict] = {}
 PREVIEW_DB: Dict[str, dict] = {}
@@ -117,16 +120,26 @@ class SiteBuildResponse(BaseModel):
     deploymentStatus: str
     buildReference: str
     generatedAt: str
+    reviewStatus: str
+    previewType: str
+    limitationNote: str
 
 
-@app.get("/")
-def health_check():
-    return {
-        "message": "AI Site Factory Backend Phase 1 is running",
-        "status": "online",
-    }
+def fetch_page_text(url: str) -> str:
+    try:
+        response = requests.get(
+            url,
+            timeout=8,
+            headers={"User-Agent": "Mozilla/5.0"},
+        )
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        return soup.get_text(" ", strip=True)
+    except requests.RequestException:
+        return ""
 
-def detect_location_from_text(text: str, domain: str) -> str:
+
+def detect_location_from_text(text: str, domain: str, base_url: str) -> str:
     text_lower = text.lower()
 
     locations = [
@@ -140,19 +153,23 @@ def detect_location_from_text(text: str, domain: str) -> str:
         "kzn",
         "western cape",
         "eastern cape",
+        "africa",
         "global",
         "international",
         "worldwide",
-        "africa",
-        "europe",
-        "asia",
-        "united states",
-        "united kingdom",
     ]
 
     for location in locations:
         if location in text_lower:
             return location.title()
+
+    extra_paths = ["/contact", "/contact-us", "/about", "/about-us"]
+
+    for path in extra_paths:
+        extra_text = fetch_page_text(base_url.rstrip("/") + path).lower()
+        for location in locations:
+            if location in extra_text:
+                return location.title()
 
     if domain.endswith(".co.za") or ".co.za" in domain:
         return "South Africa"
@@ -161,6 +178,15 @@ def detect_location_from_text(text: str, domain: str) -> str:
         return "Global"
 
     return "Not provided"
+
+
+@app.get("/")
+def health_check():
+    return {
+        "message": "AI Site Factory Backend Phase 1 is running",
+        "status": "online",
+    }
+
 
 @app.post("/api/scrape/lead")
 def scrape_lead(request: ScrapeRequest):
@@ -173,42 +199,29 @@ def scrape_lead(request: ScrapeRequest):
         response = requests.get(
             url,
             timeout=10,
-            headers={
-                "User-Agent": "Mozilla/5.0"
-            },
+            headers={"User-Agent": "Mozilla/5.0"},
         )
-
         response.raise_for_status()
-
     except requests.RequestException:
         domain = urlparse(url).netloc.replace("www.", "")
         business_name = domain.split(".")[0].title()
 
         return {
             "businessName": business_name,
-            "email": f"info@{domain}",
+            "email": f"info@{domain}" if domain else "info@example.com",
             "domain": domain,
             "category": "General Services",
-            "location": detect_location_from_text(page_text, domain),
+            "location": detect_location_from_text("", domain, url),
             "notes": f"Could not fully scrape website. Lead created from domain {domain}.",
             "sourceType": "scraper-fallback",
         }
 
     soup = BeautifulSoup(response.text, "html.parser")
 
-    title = (
-        soup.title.string.strip()
-        if soup.title and soup.title.string
-        else ""
-    )
+    title = soup.title.string.strip() if soup.title and soup.title.string else ""
 
     meta_tag = soup.find("meta", attrs={"name": "description"})
-
-    description = (
-        meta_tag.get("content", "").strip()
-        if meta_tag
-        else ""
-    )
+    description = meta_tag.get("content", "").strip() if meta_tag else ""
 
     domain = urlparse(url).netloc.replace("www.", "")
 
@@ -225,18 +238,14 @@ def scrape_lead(request: ScrapeRequest):
         page_text,
     )
 
-    email = (
-        email_match.group(0)
-        if email_match
-        else f"info@{domain}"
-    )
+    email = email_match.group(0) if email_match else f"info@{domain}"
 
     return {
         "businessName": business_name,
         "email": email,
         "domain": domain,
         "category": "General Services",
-        "location": detect_location_from_text("", domain),
+        "location": detect_location_from_text(page_text, domain, url),
         "notes": description or f"Lead generated from {domain}",
         "sourceType": "real-scraper",
     }
@@ -245,7 +254,6 @@ def scrape_lead(request: ScrapeRequest):
 @app.post("/api/leads/intake", response_model=IntakeResponse)
 def intake_lead(request: IntakeRequest):
     validation_issues = []
-
     raw = request.rawLeadRow
 
     if not raw.businessName.strip():
@@ -278,25 +286,6 @@ def clean_lead(lead_id: str):
         raise HTTPException(status_code=404, detail="Lead not found.")
 
     raw = LEADS_DB[lead_id]["rawLeadRow"]
-    validation_issues = []
-
-    if not raw.get("businessName"):
-        validation_issues.append("Missing business name.")
-
-    if not raw.get("email"):
-        validation_issues.append("Missing email.")
-
-    if not raw.get("category"):
-        validation_issues.append("Missing category.")
-
-    if validation_issues:
-        raise HTTPException(
-            status_code=400,
-            detail={
-                "cleanStatus": "FAILED",
-                "validationIssues": validation_issues,
-            },
-        )
 
     cleaned = CleanedLead(
         leadId=lead_id,
@@ -350,7 +339,7 @@ def generate_content(request: GenerationRequest):
         subject=f"Website preview for {lead.businessName}",
         body=(
             f"Hi {lead.businessName},\n\n"
-            f"We created a simple preview website concept based on your business profile. "
+            f"We created a preview website concept based on your business profile. "
             f"It highlights your {lead.category.lower()} services and can be reviewed before any publishing or outreach action.\n\n"
             f"Kind regards,\nAI Site Factory Team"
         ),
@@ -382,6 +371,9 @@ def build_preview(request: SiteBuildRequest):
         deploymentStatus="PREVIEW_READY",
         buildReference=build_reference,
         generatedAt=datetime.now().isoformat(),
+        reviewStatus="PENDING_REVIEW",
+        previewType="SIMULATED_PREVIEW_REFERENCE",
+        limitationNote="Phase 1 returns a simulated preview URL reference. A real unique site deployment can be added in a later deployment automation step.",
     )
 
     PREVIEW_DB[request.leadId] = response.model_dump()
