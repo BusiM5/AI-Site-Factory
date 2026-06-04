@@ -3,6 +3,9 @@ from typing import Dict, List, Optional
 from uuid import uuid4
 import re
 from urllib.parse import urlparse
+import os
+from dotenv import load_dotenv
+load_dotenv() 
 
 import requests
 from bs4 import BeautifulSoup
@@ -114,6 +117,13 @@ class SiteBuildRequest(BaseModel):
     templateId: Optional[str] = "standard-service-template"
     deployMode: Optional[str] = "preview"
 
+class ZendeskSyncRequest(BaseModel):
+    leadId: str
+    businessName: str
+    email: EmailStr
+    category: str
+    previewReference: str
+    approvalStatus: str
 
 class SiteBuildResponse(BaseModel):
     previewUrl: str
@@ -124,6 +134,27 @@ class SiteBuildResponse(BaseModel):
     previewType: str
     limitationNote: str
 
+class OutreachGenerateRequest(BaseModel):
+    leadId: str
+    businessName: str
+    email: EmailStr
+    category: str
+    previewReference: str
+
+
+class OutreachDraftResponse(BaseModel):
+    subject: str
+    body: str
+    recipientEmail: EmailStr
+    status: str
+
+
+class OutreachSendRequest(BaseModel):
+    zendeskTicketId: int
+    subject: str
+    body: str
+    recipientEmail: EmailStr
+   
 
 def fetch_page_text(url: str) -> str:
     try:
@@ -387,3 +418,267 @@ def get_lead(lead_id: str):
         raise HTTPException(status_code=404, detail="Lead not found.")
 
     return LEADS_DB[lead_id]
+
+
+@app.post("/api/zendesk/sync-lead")
+def sync_lead_to_zendesk(request: ZendeskSyncRequest):
+    zendesk_subdomain = os.getenv("ZENDESK_SUBDOMAIN")
+    zendesk_email = os.getenv("ZENDESK_EMAIL")
+    zendesk_token = os.getenv("ZENDESK_API_TOKEN")
+
+    if not zendesk_subdomain or not zendesk_email or not zendesk_token:
+        raise HTTPException(
+            status_code=500,
+            detail="Zendesk environment variables are missing.",
+        )
+
+    auth = (f"{zendesk_email}/token", zendesk_token)
+    base_url = f"https://{zendesk_subdomain}.zendesk.com/api/v2"
+
+    headers = {
+        "Content-Type": "application/json",
+    }
+
+    try:
+        # 1. Search for existing organization by business name
+        org_search_response = requests.get(
+            f"{base_url}/organizations/search.json",
+            params={"name": request.businessName},
+            auth=auth,
+            headers=headers,
+            timeout=15,
+        )
+        org_search_response.raise_for_status()
+
+        organizations = org_search_response.json().get("organizations", [])
+
+        if organizations:
+            organization = organizations[0]
+        else:
+            # 2. Create organization if not found
+            org_create_response = requests.post(
+                f"{base_url}/organizations.json",
+                json={
+                    "organization": {
+                        "name": request.businessName,
+                        "notes": (
+                            f"Created from AI Site Factory lead sync.\n"
+                            f"Category: {request.category}\n"
+                            f"Lead ID: {request.leadId}"
+                        ),
+                        "tags": [
+                            "ai_site_factory",
+                            "lead_organization",
+                        ],
+                    }
+                },
+                auth=auth,
+                headers=headers,
+                timeout=15,
+            )
+            org_create_response.raise_for_status()
+            organization = org_create_response.json().get("organization", {})
+
+        organization_id = organization.get("id")
+
+        # 3. Search for existing user by email
+        user_search_response = requests.get(
+            f"{base_url}/users/search.json",
+            params={"query": request.email},
+            auth=auth,
+            headers=headers,
+            timeout=15,
+        )
+        user_search_response.raise_for_status()
+
+        users = user_search_response.json().get("users", [])
+
+        if users:
+            user = users[0]
+
+            # Update user organization if needed
+            requests.put(
+                f"{base_url}/users/{user.get('id')}.json",
+                json={
+                    "user": {
+                        "organization_id": organization_id,
+                        "tags": [
+                            "ai_site_factory",
+                            "lead_contact",
+                        ],
+                    }
+                },
+                auth=auth,
+                headers=headers,
+                timeout=15,
+            )
+        else:
+            # 4. Create user if not found
+            user_create_response = requests.post(
+                f"{base_url}/users.json",
+                json={
+                    "user": {
+                        "name": request.businessName,
+                        "email": request.email,
+                        "organization_id": organization_id,
+                        "role": "end-user",
+                        "notes": (
+                            f"Lead contact created from AI Site Factory.\n"
+                            f"Lead ID: {request.leadId}\n"
+                            f"Category: {request.category}"
+                        ),
+                        "tags": [
+                            "ai_site_factory",
+                            "lead_contact",
+                        ],
+                    }
+                },
+                auth=auth,
+                headers=headers,
+                timeout=15,
+            )
+            user_create_response.raise_for_status()
+            user = user_create_response.json().get("user", {})
+
+        user_id = user.get("id")
+
+        # 5. Create Zendesk ticket linked to user and organization
+        ticket_response = requests.post(
+            f"{base_url}/tickets.json",
+            json={
+                "ticket": {
+                    "subject": f"Approved AI Site Factory Lead: {request.businessName}",
+                    "comment": {
+                        "body": (
+                            f"Approved lead synced from AI Site Factory.\n\n"
+                            f"Lead ID: {request.leadId}\n"
+                            f"Business Name: {request.businessName}\n"
+                            f"Email: {request.email}\n"
+                            f"Category: {request.category}\n"
+                            f"Preview Reference: {request.previewReference}\n"
+                            f"Approval Status: {request.approvalStatus}\n"
+                            f"Synced At: {datetime.now().isoformat()}"
+                        )
+                    },
+                    "requester_id": user_id,
+                    "organization_id": organization_id,
+                    "tags": [
+                        "ai_site_factory",
+                        "phase_2",
+                        "approved_lead",
+                        "lead_tracking",
+                    ],
+                    "priority": "normal",
+                    "type": "task",
+                }
+            },
+            auth=auth,
+            headers=headers,
+            timeout=15,
+        )
+        ticket_response.raise_for_status()
+
+    except requests.RequestException as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Zendesk sync failed: {str(error)}",
+        )
+
+    ticket_data = ticket_response.json().get("ticket", {})
+
+    return {
+        "syncStatus": "SYNCED",
+        "organizationId": organization_id,
+        "organizationName": organization.get("name"),
+        "userId": user_id,
+        "userEmail": user.get("email"),
+        "zendeskRecordId": ticket_data.get("id"),
+        "ticketUrl": (
+            f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/"
+            f"{ticket_data.get('id')}"
+        ),
+        "syncedAt": datetime.now().isoformat(),
+        "message": (
+            f"Lead {request.businessName} synced to Zendesk with organization, "
+            f"user, and ticket."
+        ),
+    }   
+@app.post("/api/outreach/generate", response_model=OutreachDraftResponse)
+def generate_outreach(request: OutreachGenerateRequest):
+    subject = f"Website preview for {request.businessName}"
+
+    body = (
+        f"Hi {request.businessName} Team,\n\n"
+        f"We created a preview website concept for your business based on your public online information. "
+        f"The preview highlights your {request.category.lower()} services and shows how your business could be presented in a simple, lead-focused format.\n\n"
+        f"Preview Reference: {request.previewReference}\n\n"
+        f"If this is something your team would like to review further, we would be happy to share more details.\n\n"
+        f"Kind regards,\n"
+        f"AI Site Factory Team"
+    )
+
+    return OutreachDraftResponse(
+        subject=subject,
+        body=body,
+        recipientEmail=request.email,
+        status="DRAFT_GENERATED",
+    )
+
+
+@app.post("/api/outreach/send")
+def send_outreach(request: OutreachSendRequest):
+    zendesk_subdomain = os.getenv("ZENDESK_SUBDOMAIN")
+    zendesk_email = os.getenv("ZENDESK_EMAIL")
+    zendesk_token = os.getenv("ZENDESK_API_TOKEN")
+
+    if not zendesk_subdomain or not zendesk_email or not zendesk_token:
+        raise HTTPException(
+            status_code=500,
+            detail="Zendesk environment variables are missing.",
+        )
+
+    auth = (f"{zendesk_email}/token", zendesk_token)
+    base_url = f"https://{zendesk_subdomain}.zendesk.com/api/v2"
+
+    payload = {
+        "ticket": {
+            "comment": {
+                "body": (
+                    f"Outbound outreach message sent through AI Site Factory.\n\n"
+                    f"Subject: {request.subject}\n\n"
+                    f"{request.body}"
+                ),
+                "public": False,
+            },
+            "status": "open",
+            "tags": [
+                "ai_site_factory",
+                "outreach_sent",
+                "phase_2",
+            ],
+        }
+    }
+
+    try:
+        response = requests.put(
+            f"{base_url}/tickets/{request.zendeskTicketId}.json",
+            json=payload,
+            auth=auth,
+            timeout=15,
+        )
+
+        response.raise_for_status()
+
+    except requests.RequestException as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Outreach send failed: {str(error)}",
+        )
+
+    return {
+        "sendStatus": "SENT",
+        "zendeskTicketId": request.zendeskTicketId,
+        "recipientEmail": request.recipientEmail,
+        "sentAt": datetime.now().isoformat(),
+        "message": "Outreach message added to Zendesk ticket as a private comment.",
+    }

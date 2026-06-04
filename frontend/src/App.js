@@ -13,6 +13,7 @@ function App() {
   const [generation, setGeneration] = useState(null);
   const [previewBuild, setPreviewBuild] = useState(null);
   const [reviewStatus, setReviewStatus] = useState("Pending Review");
+  const [zendeskResult, setZendeskResult] = useState(null);
 
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState("");
@@ -264,25 +265,55 @@ function App() {
     setCleaned(null);
     setGeneration(null);
     setPreviewBuild(null);
+    setZendeskResult(null);
     setLoading(false);
     setMessage("");
     setErrors({});
   };
 
-  const approvePreview = () => {
-  if (!previewBuild) {
+ const approvePreview = async () => {
+  if (!previewBuild || !cleaned) {
     setMessage("Build the preview before approving.");
     return;
   }
 
-  setReviewStatus("Approved");
-  setMessage("Preview approved by operator.");
+  try {
+    setLoading(true);
+
+ const response = await axios.post(
+      `${API_BASE}/api/zendesk/sync-lead`,
+      {
+        leadId: cleaned.leadId,
+        businessName: cleaned.businessName,
+        email: cleaned.email,
+        category: cleaned.category,
+        previewReference: previewBuild.previewUrl,
+        approvalStatus: "Approved",
+      }
+    );
+
+    setZendeskResult(response.data);
+    setReviewStatus("Approved");
+
+    setMessage(
+      "Preview approved and synced to Zendesk successfully."
+    );
+  } catch (error) {
+    console.error(error);
+
+    setMessage(
+      "Preview approved but Zendesk sync failed."
+    );
+  } finally {
+    setLoading(false);
+  }
 };
 
 const requestRegeneration = () => {
   setReviewStatus("Regeneration Requested");
   setGeneration(null);
   setPreviewBuild(null);
+  setZendeskResult(null);
   setMessage("Regeneration requested. Generate a new content packet.");
 };
 
@@ -485,6 +516,39 @@ const requestRegeneration = () => {
                   </p>
                   <p>
   <strong>Review Status:</strong> {reviewStatus}
+  {zendeskResult && (
+  <div style={{ marginTop: "15px" }}>
+    <h4>Zendesk Sync Result</h4>
+
+    <p>
+      <strong>Status:</strong>{" "}
+      {zendeskResult.syncStatus}
+    </p>
+
+    <p>
+      <strong>Organization:</strong>{" "}
+      {zendeskResult.organizationName}
+    </p>
+
+    <p>
+      <strong>Ticket ID:</strong>{" "}
+      {zendeskResult.zendeskRecordId}
+    </p>
+
+    <p>
+      <strong>User Email:</strong>{" "}
+      {zendeskResult.userEmail}
+    </p>
+
+    <a
+      href={zendeskResult.ticketUrl}
+      target="_blank"
+      rel="noreferrer"
+    >
+      Open Zendesk Ticket
+    </a>
+  </div>
+)}
 </p>
 
 <p className="helper">{previewBuild.limitationNote}</p>
