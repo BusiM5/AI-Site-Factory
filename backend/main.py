@@ -663,7 +663,7 @@ def build_google_maps_query(preset: Dict[str, Any], location: str, custom_query:
 
 def run_apify_google_maps(query: str, limit: int) -> List[Dict[str, Any]]:
     token = require_env("APIFY_API_TOKEN")
-    actor_id = os.getenv("APIFY_GOOGLE_MAPS_ACTOR_ID", "compass~crawler-google-places").replace("/", "~")
+    actor_id = os.getenv("APIFY_GOOGLE_MAPS_ACTOR_ID", "compass/crawler-google-places").replace("/", "~")
     max_items = max(limit, 10)
     log_event("info", "provider.apify.start", "Starting Apify Google Maps discovery.", query=query, limit=max_items, actorId=actor_id)
 
@@ -673,12 +673,11 @@ def run_apify_google_maps(query: str, limit: int) -> List[Dict[str, Any]]:
     )
 
     payload = {
-        "queries": query,
-        "language": "en",
-        "maxCrawledPlaces": max_items,
-        "maxCrawledPlacesPerSearch": max_items,
-        "includeWebResults": True,
-    }
+    "searchStringsArray": [query],
+    "language": "en",
+    "maxCrawledPlacesPerSearch": max_items,
+    "includeWebResults": True,
+}
 
     response = requests.post(
         url,

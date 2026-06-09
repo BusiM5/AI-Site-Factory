@@ -310,21 +310,33 @@ function App() {
     };
   }, [addUiLog, flowSteps]);
 
-  useEffect(() => {
-    let tooltips = [];
-    try {
-      const tooltipElements = Array.from(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
-      tooltips = tooltipElements.map((element) => new Tooltip(element));
-    } catch (error) {
-      addUiLog("warning", "tooltips.skipped", "Tooltips could not initialize.", { reason: error.message });
+useEffect(() => {
+  const tooltipElements = Array.from(
+    document.querySelectorAll('[data-bs-toggle="tooltip"]')
+  );
+
+  const tooltips = tooltipElements.map((element) => {
+    const existingTooltip = Tooltip.getInstance(element);
+    if (existingTooltip) {
+      existingTooltip.dispose();
     }
-    return () =>
-      tooltips.forEach((tooltip) => {
-        if (tooltip && typeof tooltip.dispose === "function") {
-          tooltip.dispose();
-        }
-      });
-  }, [addUiLog, debugStatus, flowSteps, leads, pipelineResult, uiLogs]);
+
+    return new Tooltip(element, {
+      trigger: "hover",
+      boundary: "window",
+    });
+  });
+
+  return () => {
+    tooltips.forEach((tooltip) => {
+      try {
+        tooltip.dispose();
+      } catch (error) {
+        // Ignore tooltip cleanup errors
+      }
+    });
+  };
+}, []);
 
   const toggleLead = (leadKey) => {
     setSelectedLeadKeys((current) =>
