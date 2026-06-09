@@ -13,5 +13,8 @@ frontend/.vercel/
 __pycache__/
 *.pyc
 
+*.log
+backend/logs/
+
 dist/
 build/

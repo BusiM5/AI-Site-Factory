@@ -1,0 +1,9 @@
+{
+  "name": "ai-site-factory",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/dev.ps1",
+    "install:all": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/dev.ps1 -InstallOnly"
+  }
+}

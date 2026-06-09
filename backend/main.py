@@ -1,7 +1,16 @@
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
+import base64
+from collections import deque
+import hashlib
+import html
+import io
+import json
+import logging
 import re
+import time
+import zipfile
 from urllib.parse import urlparse
 import os
 from dotenv import load_dotenv
@@ -9,12 +18,41 @@ load_dotenv()
 
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 
 
 app = FastAPI(title="AI Site Factory Backend - Phase 1")
+
+LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+
+logger = logging.getLogger("ai_site_factory")
+logger.setLevel(os.getenv("APP_LOG_LEVEL", "INFO").upper())
+logger.handlers.clear()
+
+log_formatter = logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+file_handler = logging.FileHandler(os.path.join(LOG_DIR, "backend.log"), encoding="utf-8")
+file_handler.setFormatter(log_formatter)
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
+
+STARTED_AT = datetime.now()
+LOG_BUFFER = deque(maxlen=int(os.getenv("APP_LOG_BUFFER_SIZE", "250")))
+SENSITIVE_KEY_PATTERN = re.compile(r"(token|key|secret|password|authorization|auth|email)", re.IGNORECASE)
+MODEL_CHUNK_CHARS = int(os.getenv("MODEL_CHUNK_CHARS", "1800"))
+MODEL_MAX_CHUNKS = int(os.getenv("MODEL_MAX_CHUNKS", "4"))
+
+REQUIRED_PROVIDER_ENV = {
+    "apify": ["APIFY_API_TOKEN"],
+    "gemini": ["GEMINI_API_KEY"],
+    "groq": ["GROQ_API_KEY"],
+    "netlify": ["NETLIFY_AUTH_TOKEN"],
+    "zendesk": ["ZENDESK_SUBDOMAIN", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN"],
+}
 
 
 app.add_middleware(
@@ -32,9 +70,224 @@ app.add_middleware(
 )
 
 
+def redact_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted: Dict[str, Any] = {}
+        for key, item in value.items():
+            if SENSITIVE_KEY_PATTERN.search(str(key)):
+                redacted[key] = mask_secret(item)
+            else:
+                redacted[key] = redact_value(item)
+        return redacted
+
+    if isinstance(value, list):
+        return [redact_value(item) for item in value[:25]]
+
+    if isinstance(value, str) and "@" in value:
+        return mask_email(value)
+
+    return value
+
+
+def mask_secret(value: Any) -> str:
+    text = str(value or "")
+    if not text:
+        return "missing"
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:3]}...{text[-3:]} ({len(text)} chars)"
+
+
+def mask_email(value: str) -> str:
+    if "@" not in value:
+        return value
+    local, domain = value.split("@", 1)
+    return f"{local[:2]}***@{domain}"
+
+
+def log_event(level: str, event: str, message: str, **details: Any) -> Dict[str, Any]:
+    entry = {
+        "id": str(uuid4()),
+        "timestamp": datetime.now().isoformat(),
+        "level": level.upper(),
+        "event": event,
+        "message": message,
+        "details": redact_value(details),
+    }
+    LOG_BUFFER.appendleft(entry)
+    log_method = getattr(logger, level.lower(), logger.info)
+    log_method("%s | %s | %s", event, message, json.dumps(entry["details"], default=str))
+    return entry
+
+
+def chunk_text(value: str, chunk_size: int = MODEL_CHUNK_CHARS) -> List[str]:
+    text = compact_text(value)
+    if not text:
+        return []
+    return [text[index : index + chunk_size] for index in range(0, len(text), chunk_size)]
+
+
+def model_safe_value(value: Any, chunk_size: int = MODEL_CHUNK_CHARS, max_chunks: int = MODEL_MAX_CHUNKS) -> Any:
+    if isinstance(value, dict):
+        return {key: model_safe_value(item, chunk_size, max_chunks) for key, item in value.items()}
+
+    if isinstance(value, list):
+        return [model_safe_value(item, chunk_size, max_chunks) for item in value[:40]]
+
+    if isinstance(value, str):
+        chunks = chunk_text(value, chunk_size)
+        if len(chunks) <= 1:
+            return value
+        return {
+            "_chunked": True,
+            "chunkSize": chunk_size,
+            "totalChunks": len(chunks),
+            "includedChunks": min(len(chunks), max_chunks),
+            "omittedChunks": max(0, len(chunks) - max_chunks),
+            "chunks": chunks[:max_chunks],
+        }
+
+    return value
+
+
+def model_safe_json(value: Any) -> str:
+    return json.dumps(model_safe_value(value), default=str)
+
+
+def provider_env_status() -> Dict[str, Any]:
+    providers: Dict[str, Any] = {}
+    for provider, names in REQUIRED_PROVIDER_ENV.items():
+        checks = []
+        for name in names:
+            value = os.getenv(name)
+            is_placeholder = bool(value and re.search(r"(replace|your_|example|placeholder)", value, re.IGNORECASE))
+            checks.append(
+                {
+                    "name": name,
+                    "configured": bool(value) and not is_placeholder,
+                    "maskedValue": mask_secret(value),
+                    "issue": "missing" if not value else "placeholder" if is_placeholder else None,
+                }
+            )
+        providers[provider] = {
+            "configured": all(check["configured"] for check in checks),
+            "checks": checks,
+        }
+    return providers
+
+
+@app.middleware("http")
+async def request_logger(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid4())
+    start = time.perf_counter()
+    log_event(
+        "info",
+        "request.start",
+        f"{request.method} {request.url.path}",
+        requestId=request_id,
+        method=request.method,
+        path=request.url.path,
+    )
+
+    try:
+        response = await call_next(request)
+    except Exception as error:
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_event(
+            "error",
+            "request.error",
+            str(error),
+            requestId=request_id,
+            method=request.method,
+            path=request.url.path,
+            durationMs=duration_ms,
+        )
+        raise
+
+    duration_ms = round((time.perf_counter() - start) * 1000, 2)
+    response.headers["X-Request-ID"] = request_id
+    log_event(
+        "info",
+        "request.finish",
+        f"{request.method} {request.url.path} -> {response.status_code}",
+        requestId=request_id,
+        method=request.method,
+        path=request.url.path,
+        statusCode=response.status_code,
+        durationMs=duration_ms,
+    )
+    return response
+
+
 LEADS_DB: Dict[str, dict] = {}
 CONTENT_DB: Dict[str, dict] = {}
 PREVIEW_DB: Dict[str, dict] = {}
+DISCOVERY_DB: Dict[str, dict] = {}
+PIPELINE_DB: Dict[str, dict] = {}
+
+
+LEAD_PRESETS = [
+    {
+        "id": "restaurants",
+        "label": "Restaurants",
+        "industry": "Restaurant",
+        "query": "restaurants",
+        "description": "Local restaurants, cafes, takeaways, and food venues.",
+    },
+    {
+        "id": "plumbers",
+        "label": "Plumbers",
+        "industry": "Plumbing",
+        "query": "plumbers",
+        "description": "Emergency plumbing, repairs, leak detection, and maintenance.",
+    },
+    {
+        "id": "dentists",
+        "label": "Dentists",
+        "industry": "Dental",
+        "query": "dentists",
+        "description": "Dental practices, cosmetic dentistry, and oral care providers.",
+    },
+    {
+        "id": "beauty-salons",
+        "label": "Beauty Salons",
+        "industry": "Beauty",
+        "query": "beauty salons",
+        "description": "Beauty salons, spas, nail bars, and personal care studios.",
+    },
+    {
+        "id": "gyms-fitness",
+        "label": "Gyms/Fitness",
+        "industry": "Fitness",
+        "query": "gyms fitness studios",
+        "description": "Gyms, personal trainers, wellness studios, and fitness centers.",
+    },
+]
+
+
+SITE_TEMPLATES = [
+    {
+        "id": "default-service",
+        "name": "Default Service",
+        "description": "Clean landing page with hero, four service cards, about, contact, and footer.",
+        "accent": "#0f766e",
+        "background": "#f7faf9",
+    },
+    {
+        "id": "bold-local",
+        "name": "Bold Local",
+        "description": "High-contrast local-business page with strong calls to action.",
+        "accent": "#c2410c",
+        "background": "#fff8f3",
+    },
+    {
+        "id": "premium-trust",
+        "name": "Premium Trust",
+        "description": "Polished trust-led page for professional service businesses.",
+        "accent": "#1d4ed8",
+        "background": "#f7f9ff",
+    },
+]
 
 
 class ScrapeRequest(BaseModel):
@@ -154,7 +407,88 @@ class OutreachSendRequest(BaseModel):
     subject: str
     body: str
     recipientEmail: EmailStr
-   
+
+
+class DiscoverLeadsRequest(BaseModel):
+    presetId: str
+    location: str = "South Africa"
+    query: Optional[str] = None
+    limit: int = 10
+
+
+class DiscoveredLead(BaseModel):
+    leadKey: str
+    businessName: str
+    email: Optional[str] = None
+    phone: Optional[str] = None
+    website: Optional[str] = None
+    domain: Optional[str] = None
+    category: str = "General Services"
+    address: Optional[str] = None
+    location: str = "South Africa"
+    rating: Optional[float] = None
+    reviewsCount: Optional[int] = None
+    source: str = "apify-google-maps"
+    sourceUrl: Optional[str] = None
+    notes: Optional[str] = None
+    raw: Dict[str, Any] = Field(default_factory=dict)
+
+
+class DiscoverLeadsResponse(BaseModel):
+    batchId: str
+    preset: Dict[str, Any]
+    location: str
+    query: str
+    leads: List[DiscoveredLead]
+    sourceStatus: str
+    warnings: List[str]
+
+
+class PipelineRunRequest(BaseModel):
+    leads: List[DiscoveredLead]
+    templateId: str = "default-service"
+    sourceBatchId: Optional[str] = None
+
+
+class PipelineLeadResult(BaseModel):
+    leadKey: str
+    businessName: str
+    status: str
+    cleanedLead: Optional[Dict[str, Any]] = None
+    siteContent: Optional[Dict[str, Any]] = None
+    outreachDraft: Optional[Dict[str, Any]] = None
+    deployment: Optional[Dict[str, Any]] = None
+    zendesk: Optional[Dict[str, Any]] = None
+    errors: List[str] = Field(default_factory=list)
+
+
+class PipelineRunResponse(BaseModel):
+    pipelineId: str
+    status: str
+    templateId: str
+    createdAt: str
+    results: List[PipelineLeadResult]
+    warnings: List[str] = Field(default_factory=list)
+
+
+class ApiProbeRequest(BaseModel):
+    includeExternal: bool = False
+    checks: List[str] = Field(default_factory=list)
+
+
+class ApiProbeCheck(BaseModel):
+    name: str
+    status: str
+    message: str
+    durationMs: float
+    details: Dict[str, Any] = Field(default_factory=dict)
+
+
+class ApiProbeResponse(BaseModel):
+    status: str
+    generatedAt: str
+    checks: List[ApiProbeCheck]
+
 
 def fetch_page_text(url: str) -> str:
     try:
@@ -211,10 +545,1417 @@ def detect_location_from_text(text: str, domain: str, base_url: str) -> str:
     return "Not provided"
 
 
+def get_preset_or_404(preset_id: str) -> Dict[str, Any]:
+    for preset in LEAD_PRESETS:
+        if preset["id"] == preset_id:
+            return preset
+    raise HTTPException(status_code=404, detail="Lead preset not found.")
+
+
+def get_template_or_404(template_id: str) -> Dict[str, Any]:
+    for template in SITE_TEMPLATES:
+        if template["id"] == template_id:
+            return template
+    raise HTTPException(status_code=404, detail="Site template not found.")
+
+
+def require_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value:
+        raise RuntimeError(f"{name} environment variable is missing.")
+    return value
+
+
+def compact_text(value: Any, fallback: str = "") -> str:
+    if value is None:
+        return fallback
+    return re.sub(r"\s+", " ", str(value)).strip() or fallback
+
+
+def slugify(value: str, max_length: int = 42) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return (slug[:max_length].strip("-") or "site").lower()
+
+
+def stable_lead_key(*parts: Any) -> str:
+    raw = "|".join(compact_text(part).lower() for part in parts if compact_text(part))
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16] if raw else str(uuid4())
+
+
+def normalize_url(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+
+    url = compact_text(value)
+    if not url or url.lower().startswith(("mailto:", "tel:")):
+        return None
+
+    if not url.startswith(("http://", "https://")):
+        url = "https://" + url
+
+    parsed = urlparse(url)
+    if not parsed.netloc or "." not in parsed.netloc:
+        return None
+
+    return url
+
+
+def domain_from_url(value: Optional[str]) -> Optional[str]:
+    url = normalize_url(value)
+    if not url:
+        return None
+    return urlparse(url).netloc.replace("www.", "")
+
+
+def first_present(data: Dict[str, Any], keys: List[str], fallback: Optional[str] = None) -> Optional[str]:
+    for key in keys:
+        value = data.get(key)
+        if isinstance(value, list) and value:
+            value = value[0]
+        value = compact_text(value)
+        if value:
+            return value
+    return fallback
+
+
+def extract_emails_from_text(text: str) -> List[str]:
+    matches = re.findall(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text or "")
+    seen = set()
+    emails = []
+    for match in matches:
+        email = match.lower()
+        if email not in seen:
+            seen.add(email)
+            emails.append(email)
+    return emails
+
+
+def extract_phone_from_text(text: str) -> Optional[str]:
+    match = re.search(r"(?:\+?\d[\d\s().-]{7,}\d)", text or "")
+    return compact_text(match.group(0)) if match else None
+
+
+def extract_email_from_item(item: Dict[str, Any]) -> Optional[str]:
+    direct = first_present(item, ["email", "contactEmail", "mail"])
+    if direct:
+        return direct.lower()
+
+    emails = item.get("emails") or item.get("emailAddresses")
+    if isinstance(emails, list):
+        for email in emails:
+            normalized = compact_text(email).lower()
+            if normalized:
+                return normalized
+    if isinstance(emails, str):
+        found = extract_emails_from_text(emails)
+        if found:
+            return found[0]
+
+    found = extract_emails_from_text(json.dumps(item, default=str))
+    return found[0] if found else None
+
+
+def build_google_maps_query(preset: Dict[str, Any], location: str, custom_query: Optional[str] = None) -> str:
+    base_query = compact_text(custom_query) or preset["query"]
+    resolved_location = compact_text(location, "South Africa")
+    return f"{base_query} in {resolved_location}"
+
+
+def run_apify_google_maps(query: str, limit: int) -> List[Dict[str, Any]]:
+    token = require_env("APIFY_API_TOKEN")
+    actor_id = os.getenv("APIFY_GOOGLE_MAPS_ACTOR_ID", "compass~crawler-google-places").replace("/", "~")
+    max_items = max(limit, 10)
+    log_event("info", "provider.apify.start", "Starting Apify Google Maps discovery.", query=query, limit=max_items, actorId=actor_id)
+
+    url = (
+        f"https://api.apify.com/v2/actors/{actor_id}/run-sync-get-dataset-items"
+        f"?clean=true&format=json&timeout=180&maxItems={max_items}"
+    )
+
+    payload = {
+        "queries": query,
+        "language": "en",
+        "maxCrawledPlaces": max_items,
+        "maxCrawledPlacesPerSearch": max_items,
+        "includeWebResults": True,
+    }
+
+    response = requests.post(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+        json=payload,
+        timeout=210,
+    )
+    response.raise_for_status()
+    log_event("info", "provider.apify.finish", "Apify returned Google Maps items.", statusCode=response.status_code)
+
+    data = response.json()
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict) and isinstance(data.get("data"), list):
+        return data["data"]
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        return data["items"]
+    return []
+
+
+def normalize_apify_items(
+    items: List[Dict[str, Any]],
+    fallback_category: str,
+    location: str,
+    limit: int,
+) -> List[DiscoveredLead]:
+    leads: List[DiscoveredLead] = []
+    seen = set()
+
+    for item in items:
+        business_name = first_present(
+            item,
+            ["title", "name", "businessName", "placeName", "companyName"],
+        )
+        if not business_name:
+            continue
+
+        website = normalize_url(first_present(item, ["website", "url", "site", "homepage"]))
+        domain = domain_from_url(website)
+        address = first_present(item, ["address", "street", "fullAddress", "formattedAddress"])
+        phone = first_present(item, ["phone", "phoneUnformatted", "contactPhone", "telephone"])
+        email = extract_email_from_item(item)
+        category = first_present(
+            item,
+            ["categoryName", "category", "primaryCategory", "type"],
+            fallback_category,
+        ) or fallback_category
+        source_url = first_present(item, ["googleMapsUrl", "searchPageUrl", "placeUrl", "url"])
+        raw_location = first_present(item, ["city", "neighborhood", "state", "country"], location) or location
+        notes = first_present(item, ["description", "about", "reviewsTags", "popularTimesLiveText"])
+
+        lead_key = stable_lead_key(business_name, website, phone, address)
+        if lead_key in seen:
+            continue
+        seen.add(lead_key)
+
+        rating = item.get("rating") or item.get("stars")
+        reviews_count = item.get("reviewsCount") or item.get("numberOfReviews")
+
+        try:
+            rating = float(rating) if rating is not None else None
+        except (TypeError, ValueError):
+            rating = None
+
+        try:
+            reviews_count = int(reviews_count) if reviews_count is not None else None
+        except (TypeError, ValueError):
+            reviews_count = None
+
+        leads.append(
+            DiscoveredLead(
+                leadKey=lead_key,
+                businessName=business_name,
+                email=email,
+                phone=phone,
+                website=website,
+                domain=domain,
+                category=category,
+                address=address,
+                location=raw_location,
+                rating=rating,
+                reviewsCount=reviews_count,
+                sourceUrl=source_url,
+                notes=notes,
+                raw=item,
+            )
+        )
+
+        if len(leads) >= limit:
+            break
+
+    return leads
+
+
+def scrape_contact_details(lead: DiscoveredLead) -> Dict[str, Any]:
+    website = normalize_url(lead.website)
+    details = {
+        "email": lead.email,
+        "phone": lead.phone,
+        "website": website,
+        "notes": lead.notes,
+    }
+
+    if not website:
+        return details
+
+    pages = [website, website.rstrip("/") + "/contact", website.rstrip("/") + "/contact-us", website.rstrip("/") + "/about"]
+    collected_text = []
+
+    for page in pages:
+        try:
+            response = requests.get(
+                page,
+                timeout=8,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            response.raise_for_status()
+        except requests.RequestException:
+            continue
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        collected_text.append(soup.get_text(" ", strip=True))
+
+    text = " ".join(collected_text)
+    emails = extract_emails_from_text(text)
+    phone = extract_phone_from_text(text)
+
+    if emails and not details["email"]:
+        details["email"] = emails[0]
+    if phone and not details["phone"]:
+        details["phone"] = phone
+    if text and not details["notes"]:
+        details["notes"] = compact_text(text[:500])
+
+    return details
+
+
+def parse_json_response(text: str) -> Dict[str, Any]:
+    cleaned = compact_text(text)
+    cleaned = re.sub(r"^```(?:json)?", "", cleaned).strip()
+    cleaned = re.sub(r"```$", "", cleaned).strip()
+    return json.loads(cleaned)
+
+
+def gemini_text_json(prompt: str, model: Optional[str] = None) -> Dict[str, Any]:
+    api_key = require_env("GEMINI_API_KEY")
+    model_name = model or os.getenv("GEMINI_TEXT_MODEL", "gemini-2.0-flash")
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+    log_event("info", "provider.gemini_text.start", "Sending chunked text prompt to Gemini.", model=model_name, promptChars=len(prompt))
+
+    try:
+        response = requests.post(
+            url,
+            headers={"Content-Type": "application/json"},
+            json={
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "responseMimeType": "application/json",
+                    "temperature": 0.35,
+                },
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        log_event("error", "provider.gemini_text.error", "Gemini text request failed.", model=model_name, reason=str(error))
+        raise
+
+    data = response.json()
+    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+    text = "".join(part.get("text", "") for part in parts)
+    if not text:
+        raise RuntimeError("Gemini returned an empty response.")
+    log_event("info", "provider.gemini_text.finish", "Gemini returned text JSON.", model=model_name, responseChars=len(text))
+    return parse_json_response(text)
+
+
+def groq_chat_json(prompt: str, system_prompt: str) -> Dict[str, Any]:
+    api_key = require_env("GROQ_API_KEY")
+    model = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    log_event("info", "provider.groq.start", "Sending chunked chat prompt to GroqCloud.", model=model, promptChars=len(prompt))
+
+    try:
+        response = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.55,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+    except requests.RequestException as error:
+        log_event("error", "provider.groq.error", "GroqCloud request failed.", model=model, reason=str(error))
+        raise
+
+    data = response.json()
+    text = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+    if not text:
+        raise RuntimeError("GroqCloud returned an empty response.")
+    log_event("info", "provider.groq.finish", "GroqCloud returned JSON.", model=model, responseChars=len(text))
+    return parse_json_response(text)
+
+
+def enrich_lead_with_gemini(lead: DiscoveredLead, contact_details: Dict[str, Any]) -> Dict[str, Any]:
+    lead_payload = lead.model_dump()
+    lead_payload.update(contact_details)
+
+    prompt = (
+        "Clean and enrich this Google Maps lead for a web design outreach pipeline. "
+        "Return strict JSON with keys: businessName, industry, location, email, phone, "
+        "website, summary, targetCustomers, differentiators, serviceKeywords, imagePrompts, sourceNote. "
+        "differentiators and serviceKeywords must be arrays. imagePrompts must contain exactly five "
+        "business-appropriate text-to-image prompts for a landing page hero image and four service-card images. "
+        "Do not invent private information; use public lead context only.\n\n"
+        f"Lead JSON: {model_safe_json(lead_payload)}"
+    )
+
+    enriched = gemini_text_json(prompt)
+    enriched.setdefault("businessName", lead.businessName)
+    enriched.setdefault("industry", lead.category)
+    enriched.setdefault("location", lead.location)
+    enriched.setdefault("email", contact_details.get("email") or lead.email)
+    enriched.setdefault("phone", contact_details.get("phone") or lead.phone)
+    enriched.setdefault("website", contact_details.get("website") or lead.website)
+    enriched.setdefault("summary", contact_details.get("notes") or lead.notes or f"{lead.businessName} is a local {lead.category} business.")
+    enriched.setdefault("targetCustomers", "Local customers")
+    enriched.setdefault("differentiators", [])
+    enriched.setdefault("serviceKeywords", [lead.category])
+    enriched.setdefault("sourceNote", "Public Google Maps and website context.")
+
+    prompts = enriched.get("imagePrompts")
+    if not isinstance(prompts, list) or len(prompts) < 5:
+        industry = enriched.get("industry", lead.category)
+        location = enriched.get("location", lead.location)
+        enriched["imagePrompts"] = [
+            f"Modern realistic landing page hero image for a {industry} business in {location}, no text",
+            f"Professional service detail image for {industry}, clean composition, no text",
+            f"Friendly customer experience image for {industry}, authentic local business setting, no text",
+            f"Trust and quality image for {industry}, polished commercial photography, no text",
+            f"Contact and booking themed image for {industry}, bright approachable scene, no text",
+        ]
+
+    return enriched
+
+
+def generate_site_content_with_groq(context: Dict[str, Any], template: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = (
+        "Create conversion-focused website copy for a static landing page. Return strict JSON with keys: "
+        "headline, subheadline, about, services, ctaLabel, contactIntro, footerText. "
+        "services must contain exactly four objects with title and description. "
+        "Do not claim awards, guarantees, prices, or unavailable services unless present in the lead context.\n\n"
+        f"Template: {model_safe_json(template)}\n"
+        f"Lead context: {model_safe_json(context)}"
+    )
+
+    content = groq_chat_json(
+        prompt,
+        "You write concise, polished website copy for small business landing pages and return valid JSON only.",
+    )
+
+    services = content.get("services")
+    if not isinstance(services, list):
+        services = []
+    keywords = context.get("serviceKeywords")
+    if not isinstance(keywords, list) or not keywords:
+        keywords = [context.get("industry", "service")]
+    while len(services) < 4:
+        keyword = keywords[len(services) % len(keywords)]
+        services.append(
+            {
+                "title": f"{compact_text(keyword, 'Professional Service').title()} Support",
+                "description": f"Reliable {compact_text(keyword, 'service').lower()} support tailored to local customer needs.",
+            }
+        )
+
+    content["services"] = services[:4]
+    content.setdefault("headline", f"{context.get('businessName')} - {context.get('industry')} in {context.get('location')}")
+    content.setdefault("subheadline", context.get("summary", "A local business ready to serve customers."))
+    content.setdefault("about", context.get("summary", "Built from public business context."))
+    content.setdefault("ctaLabel", "Get in touch")
+    content.setdefault("contactIntro", "Reach out to learn more or request a booking.")
+    content.setdefault("footerText", f"{context.get('businessName')} | {context.get('location')}")
+
+    return content
+
+
+def generate_outreach_with_groq(context: Dict[str, Any], site_url: str) -> Dict[str, Any]:
+    prompt = (
+        "Create a concise outreach email draft for a business owner. Return strict JSON with keys subject and body. "
+        "Mention that the business was found through public Google Maps/business listing research, include the live "
+        "preview website URL, and position the offer as web design and marketing support. Keep it professional and "
+        "do not imply an existing relationship.\n\n"
+        f"Live site URL: {site_url}\n"
+        f"Lead context: {model_safe_json(context)}"
+    )
+
+    outreach = groq_chat_json(
+        prompt,
+        "You write ethical B2B outreach drafts. Return valid JSON only.",
+    )
+    outreach.setdefault("subject", f"Website preview for {context.get('businessName')}")
+    outreach.setdefault(
+        "body",
+        (
+            f"Hi {context.get('businessName')} Team,\n\n"
+            f"We found your business through public Google Maps research and created a website preview here: {site_url}\n\n"
+            "We help local businesses with web design and marketing support.\n\n"
+            "Kind regards,\nAI Site Factory Team"
+        ),
+    )
+    outreach["recipientEmail"] = context.get("email")
+    outreach["siteUrl"] = site_url
+    return outreach
+
+
+def fallback_image_data_uri(label: str, accent: str) -> str:
+    safe_label = html.escape(compact_text(label, "Business"))
+    svg = (
+        f"<svg xmlns='http://www.w3.org/2000/svg' width='1200' height='800' viewBox='0 0 1200 800'>"
+        f"<rect width='1200' height='800' fill='#f8fafc'/>"
+        f"<rect x='80' y='80' width='1040' height='640' rx='36' fill='{accent}' opacity='0.12'/>"
+        f"<circle cx='920' cy='230' r='150' fill='{accent}' opacity='0.18'/>"
+        f"<path d='M160 560 C320 430 460 630 650 490 C790 390 910 430 1040 300' "
+        f"fill='none' stroke='{accent}' stroke-width='28' stroke-linecap='round' opacity='0.52'/>"
+        f"<text x='120' y='190' font-family='Arial, sans-serif' font-size='54' font-weight='700' fill='#111827'>{safe_label}</text>"
+        f"</svg>"
+    )
+    encoded = base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    return f"data:image/svg+xml;base64,{encoded}"
+
+
+def generate_gemini_images(prompts: List[str], accent: str) -> List[str]:
+    api_key = require_env("GEMINI_API_KEY")
+    model_name = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
+    images: List[str] = []
+    safe_prompts = [compact_text(prompt) for prompt in prompts[:5]]
+    log_event("info", "provider.gemini_image.start", "Generating landing-page image assets.", model=model_name, imageCount=len(safe_prompts))
+
+    for prompt in safe_prompts:
+        try:
+            response = requests.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent",
+                headers={
+                    "x-goog-api-key": api_key,
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "contents": [{"parts": [{"text": prompt[:MODEL_CHUNK_CHARS]}]}],
+                },
+                timeout=90,
+            )
+            response.raise_for_status()
+        except requests.RequestException as error:
+            log_event("error", "provider.gemini_image.error", "Gemini image request failed.", model=model_name, reason=str(error))
+            raise
+
+        data = response.json()
+        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        image_data = None
+        mime_type = "image/png"
+        for part in parts:
+            inline_data = part.get("inlineData") or part.get("inline_data")
+            if inline_data:
+                image_data = inline_data.get("data")
+                mime_type = inline_data.get("mimeType") or inline_data.get("mime_type") or mime_type
+                break
+
+        if image_data:
+            images.append(f"data:{mime_type};base64,{image_data}")
+
+    while len(images) < 5:
+        images.append(fallback_image_data_uri(f"Generated asset {len(images) + 1}", accent))
+
+    log_event("info", "provider.gemini_image.finish", "Image asset generation finished.", model=model_name, generated=len(images))
+    return images[:5]
+
+
+def render_site_html(
+    context: Dict[str, Any],
+    site_content: Dict[str, Any],
+    template: Dict[str, Any],
+    images: List[str],
+) -> str:
+    accent = template.get("accent", "#0f766e")
+    background = template.get("background", "#f8fafc")
+    business_name = html.escape(compact_text(context.get("businessName"), "Local Business"))
+    location = html.escape(compact_text(context.get("location"), "Local Area"))
+    industry = html.escape(compact_text(context.get("industry"), "Services"))
+    headline = html.escape(compact_text(site_content.get("headline"), business_name))
+    subheadline = html.escape(compact_text(site_content.get("subheadline"), context.get("summary", "")))
+    about = html.escape(compact_text(site_content.get("about"), context.get("summary", "")))
+    cta_label = html.escape(compact_text(site_content.get("ctaLabel"), "Get in touch"))
+    contact_intro = html.escape(compact_text(site_content.get("contactIntro"), "Reach out to learn more."))
+    footer_text = html.escape(compact_text(site_content.get("footerText"), business_name))
+    email = compact_text(context.get("email"))
+    phone = compact_text(context.get("phone"))
+    website = normalize_url(context.get("website"))
+
+    services_html = []
+    services = site_content.get("services") or []
+    for index, service in enumerate(services[:4]):
+        title = html.escape(compact_text(service.get("title"), f"{industry} Service"))
+        description = html.escape(compact_text(service.get("description"), "Practical support for local customers."))
+        image = images[(index + 1) % len(images)]
+        services_html.append(
+            f"""
+            <article class="service-card">
+              <img src="{image}" alt="">
+              <span>0{index + 1}</span>
+              <h3>{title}</h3>
+              <p>{description}</p>
+            </article>
+            """
+        )
+
+    contact_links = []
+    if email:
+        contact_links.append(f"<a href=\"mailto:{html.escape(email)}\">{html.escape(email)}</a>")
+    if phone:
+        contact_links.append(f"<a href=\"tel:{html.escape(phone)}\">{html.escape(phone)}</a>")
+    if website:
+        contact_links.append(f"<a href=\"{html.escape(website)}\" target=\"_blank\" rel=\"noreferrer\">Website</a>")
+    contact_html = " ".join(contact_links) or "<span>Contact details available on request</span>"
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{business_name}</title>
+  <meta name="description" content="{subheadline}">
+  <style>
+    :root {{
+      --accent: {accent};
+      --background: {background};
+      --ink: #111827;
+      --muted: #5b6472;
+      --line: #d9dee7;
+      --surface: #ffffff;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      font-family: Arial, Helvetica, sans-serif;
+      color: var(--ink);
+      background: var(--background);
+      line-height: 1.55;
+    }}
+    a {{ color: inherit; }}
+    header {{
+      min-height: 78vh;
+      display: grid;
+      grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
+      align-items: center;
+      gap: 44px;
+      padding: clamp(28px, 5vw, 72px);
+    }}
+    .eyebrow {{
+      color: var(--accent);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0;
+      font-size: 0.82rem;
+    }}
+    h1 {{
+      margin: 14px 0 18px;
+      font-size: clamp(2.3rem, 5vw, 5.4rem);
+      line-height: 0.96;
+      letter-spacing: 0;
+    }}
+    .hero-copy p {{
+      max-width: 680px;
+      font-size: clamp(1.02rem, 1.6vw, 1.32rem);
+      color: var(--muted);
+    }}
+    .hero-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 28px;
+    }}
+    .button {{
+      display: inline-flex;
+      min-height: 48px;
+      align-items: center;
+      justify-content: center;
+      padding: 0 18px;
+      border: 1px solid var(--accent);
+      border-radius: 8px;
+      background: var(--accent);
+      color: #fff;
+      text-decoration: none;
+      font-weight: 700;
+    }}
+    .button.secondary {{
+      background: transparent;
+      color: var(--accent);
+    }}
+    .hero-image {{
+      min-height: 420px;
+      border-radius: 8px;
+      overflow: hidden;
+      box-shadow: 0 24px 70px rgba(17, 24, 39, 0.16);
+      animation: lift 0.7s ease both;
+    }}
+    .hero-image img {{
+      width: 100%;
+      height: 100%;
+      min-height: 420px;
+      object-fit: cover;
+      display: block;
+    }}
+    main {{ padding-bottom: 48px; }}
+    section {{
+      padding: 56px clamp(20px, 5vw, 72px);
+    }}
+    .section-head {{
+      max-width: 760px;
+      margin-bottom: 26px;
+    }}
+    .section-head h2 {{
+      font-size: clamp(1.8rem, 3vw, 3rem);
+      margin: 0 0 10px;
+      letter-spacing: 0;
+    }}
+    .services {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 18px;
+    }}
+    .service-card {{
+      min-height: 100%;
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+      animation: rise 0.55s ease both;
+    }}
+    .service-card img {{
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      object-fit: cover;
+      display: block;
+    }}
+    .service-card span {{
+      display: block;
+      color: var(--accent);
+      font-weight: 700;
+      padding: 18px 18px 0;
+    }}
+    .service-card h3 {{
+      margin: 8px 18px;
+      font-size: 1.08rem;
+    }}
+    .service-card p {{
+      margin: 0;
+      padding: 0 18px 20px;
+      color: var(--muted);
+    }}
+    .about-band {{
+      background: #fff;
+      border-top: 1px solid var(--line);
+      border-bottom: 1px solid var(--line);
+    }}
+    .about-grid {{
+      display: grid;
+      grid-template-columns: 0.8fr 1.2fr;
+      gap: 36px;
+      align-items: start;
+    }}
+    .facts {{
+      display: grid;
+      gap: 10px;
+    }}
+    .fact {{
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--background);
+      font-weight: 700;
+    }}
+    .contact {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      background: var(--ink);
+      color: #fff;
+      border-radius: 8px;
+      margin: 0 clamp(20px, 5vw, 72px) 48px;
+      padding: clamp(24px, 4vw, 48px);
+    }}
+    .contact p {{ color: #d1d5db; }}
+    .contact-links {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }}
+    .contact-links a,
+    .contact-links span {{
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 8px;
+      padding: 10px 12px;
+      text-decoration: none;
+    }}
+    footer {{
+      padding: 28px clamp(20px, 5vw, 72px);
+      color: var(--muted);
+      border-top: 1px solid var(--line);
+    }}
+    @keyframes lift {{
+      from {{ opacity: 0; transform: translateY(18px); }}
+      to {{ opacity: 1; transform: translateY(0); }}
+    }}
+    @keyframes rise {{
+      from {{ opacity: 0; transform: translateY(10px); }}
+      to {{ opacity: 1; transform: translateY(0); }}
+    }}
+    @media (max-width: 980px) {{
+      header,
+      .about-grid {{
+        grid-template-columns: 1fr;
+      }}
+      .services {{
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }}
+      .contact {{
+        align-items: flex-start;
+        flex-direction: column;
+      }}
+    }}
+    @media (max-width: 620px) {{
+      header {{
+        min-height: auto;
+      }}
+      .hero-image,
+      .hero-image img {{
+        min-height: 280px;
+      }}
+      .services {{
+        grid-template-columns: 1fr;
+      }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="hero-copy">
+      <div class="eyebrow">{industry} in {location}</div>
+      <h1>{headline}</h1>
+      <p>{subheadline}</p>
+      <div class="hero-actions">
+        <a class="button" href="#contact">{cta_label}</a>
+        <a class="button secondary" href="#services">View services</a>
+      </div>
+    </div>
+    <div class="hero-image">
+      <img src="{images[0]}" alt="">
+    </div>
+  </header>
+  <main>
+    <section id="services">
+      <div class="section-head">
+        <h2>Services</h2>
+        <p>{business_name} presents a practical, customer-focused service experience for local customers.</p>
+      </div>
+      <div class="services">
+        {''.join(services_html)}
+      </div>
+    </section>
+    <section class="about-band">
+      <div class="about-grid">
+        <div class="section-head">
+          <h2>About {business_name}</h2>
+        </div>
+        <div>
+          <p>{about}</p>
+          <div class="facts">
+            <div class="fact">{industry}</div>
+            <div class="fact">{location}</div>
+            <div class="fact">Built from public business information</div>
+          </div>
+        </div>
+      </div>
+    </section>
+    <section id="contact" class="contact">
+      <div>
+        <h2>{cta_label}</h2>
+        <p>{contact_intro}</p>
+      </div>
+      <div class="contact-links">{contact_html}</div>
+    </section>
+  </main>
+  <footer>{footer_text}</footer>
+</body>
+</html>"""
+
+
+def zip_site_html(site_html: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("index.html", site_html)
+    return buffer.getvalue()
+
+
+def deploy_site_to_netlify(business_name: str, site_html: str) -> Dict[str, Any]:
+    token = require_env("NETLIFY_AUTH_TOKEN")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "AI-Site-Factory",
+    }
+    site_name = f"ai-site-{slugify(business_name, 32)}-{str(uuid4())[:8]}"
+    log_event("info", "provider.netlify.start", "Creating Netlify site deployment.", siteName=site_name, htmlChars=len(site_html))
+
+    create_response = requests.post(
+        "https://api.netlify.com/api/v1/sites",
+        headers={**headers, "Content-Type": "application/json"},
+        json={
+            "name": site_name,
+            "processing_settings": {"html": {"pretty_urls": True}},
+        },
+        timeout=45,
+    )
+    try:
+        create_response.raise_for_status()
+    except requests.RequestException as error:
+        log_event("error", "provider.netlify.error", "Netlify site creation failed.", siteName=site_name, reason=str(error))
+        raise
+    site = create_response.json()
+    site_id = site.get("id") or site.get("name")
+    if not site_id:
+        raise RuntimeError("Netlify did not return a site id.")
+
+    deploy_response = requests.post(
+        f"https://api.netlify.com/api/v1/sites/{site_id}/deploys",
+        headers={**headers, "Content-Type": "application/zip"},
+        data=zip_site_html(site_html),
+        timeout=90,
+    )
+    try:
+        deploy_response.raise_for_status()
+    except requests.RequestException as error:
+        log_event("error", "provider.netlify.error", "Netlify deploy upload failed.", siteName=site_name, reason=str(error))
+        raise
+    deploy = deploy_response.json()
+
+    deploy_id = deploy.get("id")
+    state = deploy.get("state")
+    poll_until = time.time() + int(os.getenv("NETLIFY_DEPLOY_POLL_SECONDS", "45"))
+
+    while deploy_id and state not in {"ready", "error"} and time.time() < poll_until:
+        time.sleep(2)
+        poll_response = requests.get(
+            f"https://api.netlify.com/api/v1/deploys/{deploy_id}",
+            headers=headers,
+            timeout=30,
+        )
+        try:
+            poll_response.raise_for_status()
+        except requests.RequestException as error:
+            log_event("error", "provider.netlify.error", "Netlify deploy poll failed.", siteName=site_name, deployId=deploy_id, reason=str(error))
+            raise
+        deploy = poll_response.json()
+        state = deploy.get("state")
+
+    site_url = (
+        deploy.get("deploy_ssl_url")
+        or deploy.get("ssl_url")
+        or deploy.get("url")
+        or site.get("ssl_url")
+        or site.get("url")
+    )
+
+    result = {
+        "siteId": site_id,
+        "siteName": site.get("name", site_name),
+        "deployId": deploy_id,
+        "state": state or "unknown",
+        "url": site_url,
+        "adminUrl": site.get("admin_url"),
+        "deployedAt": datetime.now().isoformat(),
+        "mode": "production",
+    }
+    log_event("info", "provider.netlify.finish", "Netlify deployment finished.", siteName=result["siteName"], state=result["state"], url=result["url"])
+    return result
+
+
+def create_zendesk_outreach_ticket(
+    context: Dict[str, Any],
+    deployment: Dict[str, Any],
+    outreach: Dict[str, Any],
+    pipeline_id: str,
+) -> Dict[str, Any]:
+    zendesk_subdomain = require_env("ZENDESK_SUBDOMAIN")
+    zendesk_email = require_env("ZENDESK_EMAIL")
+    zendesk_token = require_env("ZENDESK_API_TOKEN")
+
+    auth = (f"{zendesk_email}/token", zendesk_token)
+    base_url = f"https://{zendesk_subdomain}.zendesk.com/api/v2"
+    headers = {"Content-Type": "application/json"}
+    business_name = compact_text(context.get("businessName"), "AI Site Factory Lead")
+    lead_email = compact_text(context.get("email"))
+    if not lead_email:
+        domain = domain_from_url(context.get("website")) or "example.com"
+        lead_email = f"info@{domain}"
+    log_event("info", "provider.zendesk.start", "Creating Zendesk outreach ticket.", businessName=business_name, pipelineId=pipeline_id, email=lead_email)
+
+    org_response = requests.post(
+        f"{base_url}/organizations.json",
+        json={
+            "organization": {
+                "name": business_name,
+                "notes": (
+                    f"Created from AI Site Factory pipeline.\n"
+                    f"Pipeline ID: {pipeline_id}\n"
+                    f"Industry: {context.get('industry')}\n"
+                    f"Website: {deployment.get('url')}"
+                ),
+                "tags": ["ai_site_factory", "pipeline_lead"],
+            }
+        },
+        auth=auth,
+        headers=headers,
+        timeout=30,
+    )
+
+    organization = {}
+    if org_response.status_code == 422:
+        search_response = requests.get(
+            f"{base_url}/organizations/search.json",
+            params={"name": business_name},
+            auth=auth,
+            headers=headers,
+            timeout=30,
+        )
+        search_response.raise_for_status()
+        organizations = search_response.json().get("organizations", [])
+        organization = organizations[0] if organizations else {}
+    else:
+        org_response.raise_for_status()
+        organization = org_response.json().get("organization", {})
+
+    organization_id = organization.get("id")
+
+    user_search_response = requests.get(
+        f"{base_url}/users/search.json",
+        params={"query": lead_email},
+        auth=auth,
+        headers=headers,
+        timeout=30,
+    )
+    user_search_response.raise_for_status()
+    users = user_search_response.json().get("users", [])
+
+    if users:
+        user = users[0]
+    else:
+        user_create_response = requests.post(
+            f"{base_url}/users.json",
+            json={
+                "user": {
+                    "name": business_name,
+                    "email": lead_email,
+                    "organization_id": organization_id,
+                    "role": "end-user",
+                    "tags": ["ai_site_factory", "lead_contact"],
+                }
+            },
+            auth=auth,
+            headers=headers,
+            timeout=30,
+        )
+        user_create_response.raise_for_status()
+        user = user_create_response.json().get("user", {})
+
+    ticket_response = requests.post(
+        f"{base_url}/tickets.json",
+        json={
+            "ticket": {
+                "subject": outreach.get("subject") or f"Website preview for {business_name}",
+                "comment": {
+                    "body": (
+                        f"AI Site Factory pipeline result\n\n"
+                        f"Pipeline ID: {pipeline_id}\n"
+                        f"Business: {business_name}\n"
+                        f"Industry: {context.get('industry')}\n"
+                        f"Location: {context.get('location')}\n"
+                        f"Live Netlify URL: {deployment.get('url')}\n\n"
+                        f"Outreach Draft:\n{outreach.get('body')}"
+                    ),
+                    "public": False,
+                },
+                "requester_id": user.get("id"),
+                "organization_id": organization_id,
+                "priority": "normal",
+                "type": "task",
+                "tags": [
+                    "ai_site_factory",
+                    "outreach_draft",
+                    "netlify_production_site",
+                ],
+            }
+        },
+        auth=auth,
+        headers=headers,
+        timeout=30,
+    )
+    try:
+        ticket_response.raise_for_status()
+    except requests.RequestException as error:
+        log_event("error", "provider.zendesk.error", "Zendesk ticket creation failed.", businessName=business_name, reason=str(error))
+        raise
+    ticket = ticket_response.json().get("ticket", {})
+
+    result = {
+        "syncStatus": "TICKET_CREATED",
+        "ticketId": ticket.get("id"),
+        "ticketUrl": f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket.get('id')}",
+        "organizationId": organization_id,
+        "userId": user.get("id"),
+        "userEmail": user.get("email"),
+        "syncedAt": datetime.now().isoformat(),
+    }
+    log_event("info", "provider.zendesk.finish", "Zendesk ticket created.", businessName=business_name, ticketId=result["ticketId"])
+    return result
+
+
+def run_probe_check(name: str, callback) -> ApiProbeCheck:
+    started = time.perf_counter()
+    try:
+        details = callback() or {}
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        return ApiProbeCheck(
+            name=name,
+            status="VALID",
+            message=f"{name} check passed.",
+            durationMs=duration_ms,
+            details=redact_value(details),
+        )
+    except Exception as error:
+        duration_ms = round((time.perf_counter() - started) * 1000, 2)
+        log_event("error", "debug.probe.failed", f"{name} check failed.", check=name, reason=str(error))
+        return ApiProbeCheck(
+            name=name,
+            status="INVALID",
+            message=str(error),
+            durationMs=duration_ms,
+            details={},
+        )
+
+
+def probe_environment() -> Dict[str, Any]:
+    providers = provider_env_status()
+    missing = [
+        f"{provider}:{check['name']}"
+        for provider, provider_status in providers.items()
+        for check in provider_status["checks"]
+        if not check["configured"]
+    ]
+    if missing:
+        raise RuntimeError(f"Missing or placeholder environment values: {', '.join(missing)}")
+    return {"providers": providers}
+
+
+def probe_apify() -> Dict[str, Any]:
+    token = require_env("APIFY_API_TOKEN")
+    response = requests.get(
+        "https://api.apify.com/v2/users/me",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    data = response.json().get("data", {})
+    return {"username": data.get("username"), "id": data.get("id")}
+
+
+def probe_gemini() -> Dict[str, Any]:
+    api_key = require_env("GEMINI_API_KEY")
+    model_name = os.getenv("GEMINI_TEXT_MODEL", "gemini-2.0-flash")
+    response = requests.get(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}?key={api_key}",
+        timeout=20,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return {"model": data.get("name") or model_name, "supportedMethods": data.get("supportedGenerationMethods", [])}
+
+
+def probe_groq() -> Dict[str, Any]:
+    api_key = require_env("GROQ_API_KEY")
+    response = requests.get(
+        "https://api.groq.com/openai/v1/models",
+        headers={"Authorization": f"Bearer {api_key}"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return {"modelCount": len(data.get("data", []))}
+
+
+def probe_netlify() -> Dict[str, Any]:
+    token = require_env("NETLIFY_AUTH_TOKEN")
+    response = requests.get(
+        "https://api.netlify.com/api/v1/user",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=20,
+    )
+    response.raise_for_status()
+    data = response.json()
+    return {"id": data.get("id"), "fullName": data.get("full_name")}
+
+
+def probe_zendesk() -> Dict[str, Any]:
+    zendesk_subdomain = require_env("ZENDESK_SUBDOMAIN")
+    zendesk_email = require_env("ZENDESK_EMAIL")
+    zendesk_token = require_env("ZENDESK_API_TOKEN")
+    response = requests.get(
+        f"https://{zendesk_subdomain}.zendesk.com/api/v2/users/me.json",
+        auth=(f"{zendesk_email}/token", zendesk_token),
+        timeout=20,
+    )
+    response.raise_for_status()
+    user = response.json().get("user", {})
+    return {"id": user.get("id"), "role": user.get("role"), "email": user.get("email")}
+
+
+@app.get("/api/debug/status")
+def get_debug_status():
+    providers = provider_env_status()
+    configured_count = sum(1 for provider in providers.values() if provider["configured"])
+    total_count = len(providers)
+    status = "READY" if configured_count == total_count else "ACTION_REQUIRED"
+    return {
+        "status": status,
+        "startedAt": STARTED_AT.isoformat(),
+        "uptimeSeconds": int((datetime.now() - STARTED_AT).total_seconds()),
+        "providers": providers,
+        "chunking": {
+            "modelChunkChars": MODEL_CHUNK_CHARS,
+            "modelMaxChunks": MODEL_MAX_CHUNKS,
+        },
+        "counts": {
+            "leads": len(LEADS_DB),
+            "discoveries": len(DISCOVERY_DB),
+            "pipelines": len(PIPELINE_DB),
+            "logsBuffered": len(LOG_BUFFER),
+        },
+    }
+
+
+@app.get("/api/debug/logs")
+def get_debug_logs(limit: int = 80):
+    safe_limit = max(1, min(limit, 250))
+    return {"logs": list(LOG_BUFFER)[:safe_limit], "count": len(LOG_BUFFER)}
+
+
+@app.post("/api/debug/probe", response_model=ApiProbeResponse)
+def run_debug_probe(request: ApiProbeRequest):
+    requested = set(request.checks or [])
+    checks: List[ApiProbeCheck] = [
+        run_probe_check("environment", probe_environment),
+        run_probe_check("backend", lambda: {"message": "Backend process is accepting API requests."}),
+    ]
+
+    external_checks = {
+        "apify": probe_apify,
+        "gemini": probe_gemini,
+        "groq": probe_groq,
+        "netlify": probe_netlify,
+        "zendesk": probe_zendesk,
+    }
+
+    if request.includeExternal:
+        for name, callback in external_checks.items():
+            if not requested or name in requested:
+                checks.append(run_probe_check(name, callback))
+
+    overall = "VALID" if all(check.status == "VALID" for check in checks) else "INVALID"
+    response = ApiProbeResponse(
+        status=overall,
+        generatedAt=datetime.now().isoformat(),
+        checks=checks,
+    )
+    log_event("info", "debug.probe.finished", "API probe finished.", status=overall, external=request.includeExternal)
+    return response
+
+
+@app.get("/api/presets")
+def get_lead_presets():
+    return {"presets": LEAD_PRESETS}
+
+
+@app.get("/api/templates")
+def get_site_templates():
+    return {"templates": SITE_TEMPLATES}
+
+
+@app.post("/api/leads/discover", response_model=DiscoverLeadsResponse)
+def discover_leads(request: DiscoverLeadsRequest):
+    preset = get_preset_or_404(request.presetId)
+    location = compact_text(request.location, "South Africa")
+    limit = max(10, min(request.limit, 25))
+    query = build_google_maps_query(preset, location, request.query)
+    warnings: List[str] = []
+    log_event("info", "leads.discover.start", "Lead discovery started.", presetId=request.presetId, location=location, query=query, limit=limit)
+
+    try:
+        raw_items = run_apify_google_maps(query, limit * 2)
+    except requests.RequestException as error:
+        log_event("error", "leads.discover.failed", "Apify lead discovery request failed.", presetId=request.presetId, reason=str(error))
+        raise HTTPException(
+            status_code=502,
+            detail=f"Apify lead discovery failed: {str(error)}",
+        )
+    except RuntimeError as error:
+        log_event("error", "leads.discover.failed", "Lead discovery configuration failed.", presetId=request.presetId, reason=str(error))
+        raise HTTPException(status_code=500, detail=str(error))
+
+    leads = normalize_apify_items(raw_items, preset["industry"], location, limit)
+
+    if len(leads) < 10:
+        broader_query = build_google_maps_query(preset, location)
+        if broader_query != query:
+            try:
+                retry_items = run_apify_google_maps(broader_query, limit * 2)
+                retry_leads = normalize_apify_items(
+                    retry_items,
+                    preset["industry"],
+                    location,
+                    limit,
+                )
+                existing_keys = {lead.leadKey for lead in leads}
+                for lead in retry_leads:
+                    if lead.leadKey not in existing_keys:
+                        leads.append(lead)
+                        existing_keys.add(lead.leadKey)
+                    if len(leads) >= limit:
+                        break
+            except (requests.RequestException, RuntimeError) as error:
+                warnings.append(f"Broader retry failed: {str(error)}")
+                log_event("warning", "leads.discover.retry_failed", "Broader lead discovery retry failed.", presetId=request.presetId, reason=str(error))
+
+    if len(leads) < 10:
+        warnings.append(f"Only {len(leads)} valid leads were returned for this search.")
+
+    batch_id = str(uuid4())
+    response = DiscoverLeadsResponse(
+        batchId=batch_id,
+        preset=preset,
+        location=location,
+        query=query,
+        leads=leads[:limit],
+        sourceStatus="READY" if leads else "NO_RESULTS",
+        warnings=warnings,
+    )
+    DISCOVERY_DB[batch_id] = response.model_dump()
+    log_event("info", "leads.discover.finish", "Lead discovery finished.", batchId=batch_id, leadCount=len(response.leads), warningCount=len(warnings), status=response.sourceStatus)
+    return response
+
+
+@app.post("/api/pipeline/run", response_model=PipelineRunResponse)
+def run_pipeline(request: PipelineRunRequest):
+    template = get_template_or_404(request.templateId)
+    if not request.leads:
+        raise HTTPException(status_code=400, detail="Select at least one lead.")
+
+    pipeline_id = str(uuid4())
+    results: List[PipelineLeadResult] = []
+    pipeline_warnings: List[str] = []
+    log_event("info", "pipeline.start", "Pipeline run started.", pipelineId=pipeline_id, templateId=request.templateId, leadCount=len(request.leads))
+
+    for lead in request.leads:
+        errors: List[str] = []
+        cleaned_context: Optional[Dict[str, Any]] = None
+        site_content: Optional[Dict[str, Any]] = None
+        deployment: Optional[Dict[str, Any]] = None
+        outreach: Optional[Dict[str, Any]] = None
+        zendesk: Optional[Dict[str, Any]] = None
+        status = "PROCESSING"
+
+        try:
+            log_event("info", "pipeline.lead.start", "Processing pipeline lead.", pipelineId=pipeline_id, leadKey=lead.leadKey, businessName=lead.businessName)
+            contact_details = scrape_contact_details(lead)
+            log_event("info", "pipeline.lead.scraped", "Contact details scraped.", pipelineId=pipeline_id, leadKey=lead.leadKey, hasEmail=bool(contact_details.get("email")), hasWebsite=bool(contact_details.get("website")))
+            cleaned_context = enrich_lead_with_gemini(lead, contact_details)
+            log_event("info", "pipeline.lead.enriched", "Lead context enriched.", pipelineId=pipeline_id, leadKey=lead.leadKey)
+            site_content = generate_site_content_with_groq(cleaned_context, template)
+            log_event("info", "pipeline.lead.copy_generated", "Website copy generated.", pipelineId=pipeline_id, leadKey=lead.leadKey)
+
+            try:
+                images = generate_gemini_images(
+                    cleaned_context.get("imagePrompts") or [],
+                    template.get("accent", "#0f766e"),
+                )
+            except Exception as image_error:
+                errors.append(f"Gemini image generation failed; fallback visuals used: {str(image_error)}")
+                log_event("warning", "pipeline.lead.images_fallback", "Image generation failed; using fallback visuals.", pipelineId=pipeline_id, leadKey=lead.leadKey, reason=str(image_error))
+                images = [
+                    fallback_image_data_uri(cleaned_context.get("businessName", lead.businessName), template.get("accent", "#0f766e"))
+                    for _ in range(5)
+                ]
+
+            site_html = render_site_html(cleaned_context, site_content, template, images)
+            deployment = deploy_site_to_netlify(
+                cleaned_context.get("businessName", lead.businessName),
+                site_html,
+            )
+            log_event("info", "pipeline.lead.deployed", "Lead site deployed.", pipelineId=pipeline_id, leadKey=lead.leadKey, url=deployment.get("url"), state=deployment.get("state"))
+            outreach = generate_outreach_with_groq(cleaned_context, deployment.get("url", ""))
+            zendesk = create_zendesk_outreach_ticket(
+                cleaned_context,
+                deployment,
+                outreach,
+                pipeline_id,
+            )
+            status = "COMPLETED" if not errors else "COMPLETED_WITH_WARNINGS"
+            log_event("info", "pipeline.lead.finish", "Pipeline lead finished.", pipelineId=pipeline_id, leadKey=lead.leadKey, status=status)
+
+        except requests.RequestException as error:
+            status = "FAILED"
+            errors.append(str(error))
+            log_event("error", "pipeline.lead.failed", "Pipeline lead failed during provider request.", pipelineId=pipeline_id, leadKey=lead.leadKey, reason=str(error))
+        except RuntimeError as error:
+            status = "FAILED"
+            errors.append(str(error))
+            log_event("error", "pipeline.lead.failed", "Pipeline lead failed at runtime.", pipelineId=pipeline_id, leadKey=lead.leadKey, reason=str(error))
+        except Exception as error:
+            status = "FAILED"
+            errors.append(f"Unexpected pipeline error: {str(error)}")
+            log_event("error", "pipeline.lead.failed", "Unexpected pipeline lead failure.", pipelineId=pipeline_id, leadKey=lead.leadKey, reason=str(error))
+
+        results.append(
+            PipelineLeadResult(
+                leadKey=lead.leadKey,
+                businessName=lead.businessName,
+                status=status,
+                cleanedLead=cleaned_context,
+                siteContent=site_content,
+                outreachDraft=outreach,
+                deployment=deployment,
+                zendesk=zendesk,
+                errors=errors,
+            )
+        )
+
+    completed_count = sum(1 for result in results if result.status.startswith("COMPLETED"))
+    response_status = "COMPLETED" if completed_count == len(results) else "PARTIAL_FAILURE" if completed_count else "FAILED"
+    response = PipelineRunResponse(
+        pipelineId=pipeline_id,
+        status=response_status,
+        templateId=request.templateId,
+        createdAt=datetime.now().isoformat(),
+        results=results,
+        warnings=pipeline_warnings,
+    )
+    PIPELINE_DB[pipeline_id] = response.model_dump()
+    log_event("info", "pipeline.finish", "Pipeline run finished.", pipelineId=pipeline_id, status=response_status, completedCount=completed_count, leadCount=len(results))
+    return response
+
+
 @app.get("/")
 def health_check():
     return {
-        "message": "AI Site Factory Backend Phase 1 is running",
+        "message": "AI Site Factory Backend is running",
         "status": "online",
     }
 
@@ -222,6 +1963,7 @@ def health_check():
 @app.post("/api/scrape/lead")
 def scrape_lead(request: ScrapeRequest):
     url = request.url.strip()
+    log_event("info", "scrape.start", "Scrape lead request started.", url=url)
 
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
@@ -237,7 +1979,7 @@ def scrape_lead(request: ScrapeRequest):
         domain = urlparse(url).netloc.replace("www.", "")
         business_name = domain.split(".")[0].title()
 
-        return {
+        result = {
             "businessName": business_name,
             "email": f"info@{domain}" if domain else "info@example.com",
             "domain": domain,
@@ -246,6 +1988,8 @@ def scrape_lead(request: ScrapeRequest):
             "notes": f"Could not fully scrape website. Lead created from domain {domain}.",
             "sourceType": "scraper-fallback",
         }
+        log_event("warning", "scrape.fallback", "Scrape failed; returning fallback lead.", url=url, domain=domain)
+        return result
 
     soup = BeautifulSoup(response.text, "html.parser")
 
@@ -271,7 +2015,7 @@ def scrape_lead(request: ScrapeRequest):
 
     email = email_match.group(0) if email_match else f"info@{domain}"
 
-    return {
+    result = {
         "businessName": business_name,
         "email": email,
         "domain": domain,
@@ -280,6 +2024,8 @@ def scrape_lead(request: ScrapeRequest):
         "notes": description or f"Lead generated from {domain}",
         "sourceType": "real-scraper",
     }
+    log_event("info", "scrape.finish", "Scrape lead request finished.", url=url, domain=domain, businessName=business_name)
+    return result
 
 
 @app.post("/api/leads/intake", response_model=IntakeResponse)
@@ -304,6 +2050,7 @@ def intake_lead(request: IntakeRequest):
         "validationIssues": validation_issues,
     }
 
+    log_event("info", "lead.intake", "Lead intake created.", leadId=lead_id, businessName=raw.businessName, status="FLAGGED" if validation_issues else "INTAKE_CREATED", validationIssues=validation_issues)
     return IntakeResponse(
         leadId=lead_id,
         intakeStatus="FLAGGED" if validation_issues else "INTAKE_CREATED",
@@ -314,6 +2061,7 @@ def intake_lead(request: IntakeRequest):
 @app.post("/api/leads/{lead_id}/clean", response_model=CleanedLead)
 def clean_lead(lead_id: str):
     if lead_id not in LEADS_DB:
+        log_event("warning", "lead.clean.not_found", "Clean lead failed because lead was not found.", leadId=lead_id)
         raise HTTPException(status_code=404, detail="Lead not found.")
 
     raw = LEADS_DB[lead_id]["rawLeadRow"]
@@ -333,6 +2081,7 @@ def clean_lead(lead_id: str):
 
     LEADS_DB[lead_id]["cleanedLead"] = cleaned.model_dump()
 
+    log_event("info", "lead.clean", "Lead cleaned.", leadId=lead_id, businessName=cleaned.businessName)
     return cleaned
 
 
@@ -388,6 +2137,7 @@ def generate_content(request: GenerationRequest):
 
     CONTENT_DB[lead.leadId] = response.model_dump()
 
+    log_event("info", "content.generate", "Local content generated.", leadId=lead.leadId, businessName=lead.businessName, templateId=request.templateId)
     return response
 
 
@@ -409,12 +2159,14 @@ def build_preview(request: SiteBuildRequest):
 
     PREVIEW_DB[request.leadId] = response.model_dump()
 
+    log_event("info", "site.preview", "Local site preview reference created.", leadId=request.leadId, buildReference=build_reference)
     return response
 
 
 @app.get("/api/leads/{lead_id}")
 def get_lead(lead_id: str):
     if lead_id not in LEADS_DB:
+        log_event("warning", "lead.get.not_found", "Get lead failed because lead was not found.", leadId=lead_id)
         raise HTTPException(status_code=404, detail="Lead not found.")
 
     return LEADS_DB[lead_id]
@@ -422,11 +2174,13 @@ def get_lead(lead_id: str):
 
 @app.post("/api/zendesk/sync-lead")
 def sync_lead_to_zendesk(request: ZendeskSyncRequest):
+    log_event("info", "zendesk.sync.start", "Zendesk lead sync started.", leadId=request.leadId, businessName=request.businessName, email=request.email)
     zendesk_subdomain = os.getenv("ZENDESK_SUBDOMAIN")
     zendesk_email = os.getenv("ZENDESK_EMAIL")
     zendesk_token = os.getenv("ZENDESK_API_TOKEN")
 
     if not zendesk_subdomain or not zendesk_email or not zendesk_token:
+        log_event("error", "zendesk.sync.config_missing", "Zendesk sync failed because environment variables are missing.", leadId=request.leadId)
         raise HTTPException(
             status_code=500,
             detail="Zendesk environment variables are missing.",
@@ -579,6 +2333,7 @@ def sync_lead_to_zendesk(request: ZendeskSyncRequest):
         ticket_response.raise_for_status()
 
     except requests.RequestException as error:
+        log_event("error", "zendesk.sync.failed", "Zendesk sync failed.", leadId=request.leadId, reason=str(error))
         raise HTTPException(
             status_code=500,
             detail=f"Zendesk sync failed: {str(error)}",
@@ -586,7 +2341,7 @@ def sync_lead_to_zendesk(request: ZendeskSyncRequest):
 
     ticket_data = ticket_response.json().get("ticket", {})
 
-    return {
+    result = {
         "syncStatus": "SYNCED",
         "organizationId": organization_id,
         "organizationName": organization.get("name"),
@@ -602,7 +2357,11 @@ def sync_lead_to_zendesk(request: ZendeskSyncRequest):
             f"Lead {request.businessName} synced to Zendesk with organization, "
             f"user, and ticket."
         ),
-    }   
+    }
+    log_event("info", "zendesk.sync.finish", "Zendesk lead sync finished.", leadId=request.leadId, ticketId=result["zendeskRecordId"])
+    return result
+
+
 @app.post("/api/outreach/generate", response_model=OutreachDraftResponse)
 def generate_outreach(request: OutreachGenerateRequest):
     subject = f"Website preview for {request.businessName}"
@@ -617,6 +2376,7 @@ def generate_outreach(request: OutreachGenerateRequest):
         f"AI Site Factory Team"
     )
 
+    log_event("info", "outreach.generate", "Outreach draft generated.", leadId=request.leadId, businessName=request.businessName, email=request.email)
     return OutreachDraftResponse(
         subject=subject,
         body=body,
@@ -627,11 +2387,13 @@ def generate_outreach(request: OutreachGenerateRequest):
 
 @app.post("/api/outreach/send")
 def send_outreach(request: OutreachSendRequest):
+    log_event("info", "outreach.send.start", "Outreach send started.", zendeskTicketId=request.zendeskTicketId, recipientEmail=request.recipientEmail)
     zendesk_subdomain = os.getenv("ZENDESK_SUBDOMAIN")
     zendesk_email = os.getenv("ZENDESK_EMAIL")
     zendesk_token = os.getenv("ZENDESK_API_TOKEN")
 
     if not zendesk_subdomain or not zendesk_email or not zendesk_token:
+        log_event("error", "outreach.send.config_missing", "Outreach send failed because Zendesk environment variables are missing.", zendeskTicketId=request.zendeskTicketId)
         raise HTTPException(
             status_code=500,
             detail="Zendesk environment variables are missing.",
@@ -670,15 +2432,18 @@ def send_outreach(request: OutreachSendRequest):
         response.raise_for_status()
 
     except requests.RequestException as error:
+        log_event("error", "outreach.send.failed", "Outreach send failed.", zendeskTicketId=request.zendeskTicketId, reason=str(error))
         raise HTTPException(
             status_code=500,
             detail=f"Outreach send failed: {str(error)}",
         )
 
-    return {
+    result = {
         "sendStatus": "SENT",
         "zendeskTicketId": request.zendeskTicketId,
         "recipientEmail": request.recipientEmail,
         "sentAt": datetime.now().isoformat(),
         "message": "Outreach message added to Zendesk ticket as a private comment.",
     }
+    log_event("info", "outreach.send.finish", "Outreach send finished.", zendeskTicketId=request.zendeskTicketId, recipientEmail=request.recipientEmail)
+    return result

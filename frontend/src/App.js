@@ -1,590 +1,1009 @@
-import { useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
+import { Tooltip } from "bootstrap";
+import { gsap } from "gsap";
 import "./App.css";
 
+const FALLBACK_PRESETS = [
+  {
+    id: "restaurants",
+    label: "Restaurants",
+    industry: "Restaurant",
+    description: "Local restaurants, cafes, takeaways, and food venues.",
+  },
+  {
+    id: "plumbers",
+    label: "Plumbers",
+    industry: "Plumbing",
+    description: "Emergency plumbing, repairs, leak detection, and maintenance.",
+  },
+  {
+    id: "dentists",
+    label: "Dentists",
+    industry: "Dental",
+    description: "Dental practices, cosmetic dentistry, and oral care providers.",
+  },
+  {
+    id: "beauty-salons",
+    label: "Beauty Salons",
+    industry: "Beauty",
+    description: "Beauty salons, spas, nail bars, and personal care studios.",
+  },
+  {
+    id: "gyms-fitness",
+    label: "Gyms/Fitness",
+    industry: "Fitness",
+    description: "Gyms, personal trainers, wellness studios, and fitness centers.",
+  },
+];
+
+const FALLBACK_TEMPLATES = [
+  {
+    id: "default-service",
+    name: "Default Service",
+    description: "Clean landing page with hero, four services, about, contact, and footer.",
+  },
+  {
+    id: "bold-local",
+    name: "Bold Local",
+    description: "High-contrast local-business page with strong calls to action.",
+  },
+  {
+    id: "premium-trust",
+    name: "Premium Trust",
+    description: "Polished trust-led page for professional service businesses.",
+  },
+];
+
+const MAX_UI_LOGS = 80;
+
 function App() {
-  const API_BASE =
-    process.env.REACT_APP_API_BASE || "http://127.0.0.1:8000";
+  const API_BASE = process.env.REACT_APP_API_BASE || "http://127.0.0.1:8000";
+  const shellRef = useRef(null);
+  const flowRef = useRef(null);
 
-  const [websiteUrl, setWebsiteUrl] = useState("");
-  const [lead, setLead] = useState({});
-  const [leadId, setLeadId] = useState(null);
-  const [cleaned, setCleaned] = useState(null);
-  const [generation, setGeneration] = useState(null);
-  const [previewBuild, setPreviewBuild] = useState(null);
-  const [reviewStatus, setReviewStatus] = useState("Pending Review");
-  const [zendeskResult, setZendeskResult] = useState(null);
-
-  const [loading, setLoading] = useState(false);
+  const [presets, setPresets] = useState(FALLBACK_PRESETS);
+  const [templates, setTemplates] = useState(FALLBACK_TEMPLATES);
+  const [selectedPresetId, setSelectedPresetId] = useState("restaurants");
+  const [selectedTemplateId, setSelectedTemplateId] = useState("default-service");
+  const [location, setLocation] = useState("South Africa");
+  const [customQuery, setCustomQuery] = useState("");
+  const [batchId, setBatchId] = useState(null);
+  const [leads, setLeads] = useState([]);
+  const [selectedLeadKeys, setSelectedLeadKeys] = useState([]);
+  const [warnings, setWarnings] = useState([]);
+  const [pipelineResult, setPipelineResult] = useState(null);
+  const [discovering, setDiscovering] = useState(false);
+  const [running, setRunning] = useState(false);
   const [message, setMessage] = useState("");
-  const [errors, setErrors] = useState({});
+  const [messageTone, setMessageTone] = useState("info");
+  const [debugStatus, setDebugStatus] = useState(null);
+  const [backendLogs, setBackendLogs] = useState([]);
+  const [uiLogs, setUiLogs] = useState([]);
+  const [apiProbe, setApiProbe] = useState(null);
+  const [manualFlow, setManualFlow] = useState(null);
+  const [debugBusy, setDebugBusy] = useState(null);
 
-  const contentPacket = generation?.contentPacket;
+  const addUiLog = useCallback((level, event, text, details = {}) => {
+    const entry = {
+      id: `${Date.now()}-${Math.random()}`,
+      timestamp: new Date().toISOString(),
+      level,
+      event,
+      message: text,
+      details,
+    };
+    setUiLogs((current) => [entry, ...current].slice(0, MAX_UI_LOGS));
+  }, []);
 
-  const handleChange = (e) => {
-    setLead({ ...lead, [e.target.name]: e.target.value });
-    setMessage("");
-    setErrors({});
+  const formatApiError = useCallback((error) => {
+    const detail = error.response?.data?.detail;
+    return {
+      status: error.response?.status || "NETWORK",
+      requestId: error.response?.headers?.["x-request-id"],
+      message:
+        typeof detail === "string"
+          ? detail
+        : detail?.message || error.message || "Unknown API failure",
+    };
+  }, []);
+
+  const setNotice = useCallback((text, tone = "info") => {
+    setMessage(text);
+    setMessageTone(tone);
+  }, []);
+
+  const callApi = useCallback(
+    async (label, method, path, data, options = {}) => {
+      addUiLog("info", "api.start", `${label} started.`, { method, path });
+      try {
+        const response = await axios({
+          method,
+          url: `${API_BASE}${path}`,
+          data,
+          timeout: options.timeout || 180000,
+        });
+        addUiLog("success", "api.success", `${label} succeeded.`, {
+          method,
+          path,
+          status: response.status,
+          requestId: response.headers?.["x-request-id"],
+        });
+        return response.data;
+      } catch (error) {
+        const failure = formatApiError(error);
+        addUiLog("danger", "api.failure", `${label} failed: ${failure.message}`, {
+          method,
+          path,
+          ...failure,
+        });
+        throw error;
+      }
+    },
+    [API_BASE, addUiLog, formatApiError]
+  );
+
+  const refreshDiagnostics = useCallback(
+    async (silent = false) => {
+      try {
+        const [statusResponse, logsResponse] = await Promise.all([
+          axios.get(`${API_BASE}/api/debug/status`, { timeout: 15000 }),
+          axios.get(`${API_BASE}/api/debug/logs?limit=80`, { timeout: 15000 }),
+        ]);
+        setDebugStatus(statusResponse.data);
+        setBackendLogs(logsResponse.data.logs || []);
+        if (!silent) {
+          addUiLog("success", "debug.refresh", "Diagnostics refreshed.", {
+            status: statusResponse.data.status,
+          });
+        }
+      } catch (error) {
+        const failure = formatApiError(error);
+        if (!silent) {
+          addUiLog("danger", "debug.refresh_failed", `Diagnostics failed: ${failure.message}`, failure);
+        }
+      }
+    },
+    [API_BASE, addUiLog, formatApiError]
+  );
+
+  useEffect(() => {
+    const loadConfig = async () => {
+      try {
+        const [presetResponse, templateResponse] = await Promise.all([
+          callApi("Preset API", "get", "/api/presets", null, { timeout: 15000 }),
+          callApi("Template API", "get", "/api/templates", null, { timeout: 15000 }),
+        ]);
+
+        setPresets(presetResponse.presets || FALLBACK_PRESETS);
+        setTemplates(templateResponse.templates || FALLBACK_TEMPLATES);
+        setNotice("Backend configuration loaded.", "success");
+      } catch (error) {
+        setNotice("Backend configuration could not be loaded. Fallback presets are active.", "warning");
+      }
+    };
+
+    loadConfig();
+    refreshDiagnostics(true);
+  }, [callApi, refreshDiagnostics, setNotice]);
+
+  useEffect(() => {
+    const interval = setInterval(() => refreshDiagnostics(true), 7000);
+    return () => clearInterval(interval);
+  }, [refreshDiagnostics]);
+
+  useEffect(() => {
+    if (!shellRef.current) return undefined;
+    try {
+      gsap.fromTo(
+        shellRef.current.querySelectorAll(".entry-animate"),
+        { y: 14, opacity: 0 },
+        { y: 0, opacity: 1, duration: 0.55, ease: "power2.out", stagger: 0.05 }
+      );
+    } catch (error) {
+      addUiLog("warning", "animation.skipped", "Entry animation could not initialize.", { reason: error.message });
+    }
+    return undefined;
+  }, [addUiLog]);
+
+  const selectedPreset = useMemo(
+    () => presets.find((preset) => preset.id === selectedPresetId) || presets[0],
+    [presets, selectedPresetId]
+  );
+
+  const selectedTemplate = useMemo(
+    () =>
+      templates.find((template) => template.id === selectedTemplateId) ||
+      templates[0],
+    [templates, selectedTemplateId]
+  );
+
+  const selectedLeads = useMemo(
+    () => leads.filter((lead) => selectedLeadKeys.includes(lead.leadKey)),
+    [leads, selectedLeadKeys]
+  );
+
+  const completedCount =
+    pipelineResult?.results?.filter((result) =>
+      result.status?.startsWith("COMPLETED")
+    ).length || 0;
+
+  const failedCount =
+    pipelineResult?.results?.filter((result) => result.status === "FAILED").length || 0;
+
+  const flowSteps = useMemo(
+    () => [
+      {
+        key: "config",
+        label: "Config",
+        detail: debugStatus?.status === "READY" ? "Providers configured" : "Needs review",
+        state: debugStatus?.status === "READY" ? "complete" : "warning",
+      },
+      {
+        key: "discover",
+        label: "Discover",
+        detail: discovering ? "Searching maps" : leads.length ? `${leads.length} leads` : "Waiting",
+        state: discovering ? "active" : leads.length ? "complete" : "idle",
+      },
+      {
+        key: "select",
+        label: "Select",
+        detail: selectedLeads.length ? `${selectedLeads.length} queued` : "No leads",
+        state: selectedLeads.length ? "complete" : "idle",
+      },
+      {
+        key: "pipeline",
+        label: "Pipeline",
+        detail: running ? "Models active" : pipelineResult?.status || "Not run",
+        state: running ? "active" : pipelineResult ? (failedCount ? "danger" : "complete") : "idle",
+      },
+      {
+        key: "deploy",
+        label: "Deploy",
+        detail: completedCount ? "Sites created" : "Pending",
+        state: completedCount ? "complete" : running ? "active" : "idle",
+      },
+      {
+        key: "outreach",
+        label: "Outreach",
+        detail: completedCount ? "Tickets/drafts ready" : "Pending",
+        state: completedCount ? "complete" : running ? "active" : "idle",
+      },
+    ],
+    [completedCount, debugStatus, discovering, failedCount, leads.length, pipelineResult, running, selectedLeads.length]
+  );
+
+  useEffect(() => {
+    if (!flowRef.current) return undefined;
+    const activeNodes = flowRef.current.querySelectorAll(".flow-step.active");
+    const pulse = flowRef.current.querySelector(".flow-energy");
+
+    try {
+      gsap.killTweensOf(activeNodes);
+      gsap.killTweensOf(pulse);
+
+      if (activeNodes.length && pulse) {
+        gsap.to(activeNodes, {
+          y: -3,
+          duration: 0.7,
+          repeat: -1,
+          yoyo: true,
+          ease: "sine.inOut",
+        });
+        gsap.fromTo(
+          pulse,
+          { xPercent: -8, opacity: 0.25 },
+          { xPercent: 108, opacity: 1, duration: 1.45, repeat: -1, ease: "power1.inOut" }
+        );
+      }
+    } catch (error) {
+      addUiLog("warning", "animation.skipped", "Flow animation could not initialize.", { reason: error.message });
+    }
+
+    return () => {
+      try {
+        gsap.killTweensOf(activeNodes);
+        gsap.killTweensOf(pulse);
+      } catch (error) {
+        // Animation cleanup should never block app teardown.
+      }
+    };
+  }, [addUiLog, flowSteps]);
+
+  useEffect(() => {
+    let tooltips = [];
+    try {
+      const tooltipElements = Array.from(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
+      tooltips = tooltipElements.map((element) => new Tooltip(element));
+    } catch (error) {
+      addUiLog("warning", "tooltips.skipped", "Tooltips could not initialize.", { reason: error.message });
+    }
+    return () =>
+      tooltips.forEach((tooltip) => {
+        if (tooltip && typeof tooltip.dispose === "function") {
+          tooltip.dispose();
+        }
+      });
+  }, [addUiLog, debugStatus, flowSteps, leads, pipelineResult, uiLogs]);
+
+  const toggleLead = (leadKey) => {
+    setSelectedLeadKeys((current) =>
+      current.includes(leadKey)
+        ? current.filter((key) => key !== leadKey)
+        : [...current, leadKey]
+    );
   };
 
-  const validateLead = () => {
-    const newErrors = {};
-
-    if (!lead.businessName?.trim()) {
-      newErrors.businessName = "Business name is required.";
-    }
-
-    if (!lead.email?.trim()) {
-      newErrors.email = "Email address is required.";
-    } else if (!lead.email.includes("@")) {
-      newErrors.email = "Please enter a valid email address.";
-    }
-
-    if (!lead.category?.trim()) {
-      newErrors.category = "Category / industry is required.";
-    }
-
-    setErrors(newErrors);
-
-    if (Object.keys(newErrors).length > 0) {
-      setMessage("Please fix the highlighted fields.");
-      return false;
-    }
-
-    setMessage("Lead is valid.");
-    return true;
+  const selectAllLeads = () => {
+    setSelectedLeadKeys(leads.map((lead) => lead.leadKey));
+    addUiLog("info", "leads.select_all", "All loaded leads selected.", { count: leads.length });
   };
 
-  const loadSampleLead = () => {
-    setLead({
-      businessName: "FixIt Plumbing",
-      email: "info@fixitplumbing.co.za",
-      domain: "fixitplumbing.co.za",
-      category: "Plumbing",
-      location: "Durban",
-      notes:
-        "Provides emergency plumbing, pipe repairs, leak detection, and residential plumbing services.",
-    });
-
-    setWebsiteUrl("");
-    setLeadId(null);
-    setCleaned(null);
-    setGeneration(null);
-    setPreviewBuild(null);
-    setErrors({});
-    setMessage("Sample lead loaded.");
+  const clearSelectedLeads = () => {
+    setSelectedLeadKeys([]);
+    addUiLog("info", "leads.clear", "Lead selection cleared.");
   };
 
-  const fetchLeadFromWebsite = async () => {
-    if (!websiteUrl.trim()) {
-      setMessage("Please enter a website URL.");
+  const discoverLeads = async () => {
+    if (!selectedPreset?.id) {
+      setNotice("Select a business type first.", "warning");
       return;
     }
 
     try {
-      setLoading(true);
-      setMessage("Fetching lead data from website source...");
+      setDiscovering(true);
+      setPipelineResult(null);
+      setWarnings([]);
+      setSelectedLeadKeys([]);
+      setNotice("Searching Google Maps with Apify...", "info");
 
-      const response = await axios.post(`${API_BASE}/api/scrape/lead`, {
-        url: websiteUrl,
-      });
-
-      const data = response.data;
-
-      setLead({
-        businessName: data.businessName || "",
-        email: data.email || "",
-        domain: data.domain || websiteUrl,
-        category: data.category || "",
-        location: data.location || "",
-        notes: data.notes || "",
-      });
-
-      setLeadId(null);
-      setCleaned(null);
-      setGeneration(null);
-      setPreviewBuild(null);
-      setErrors({});
-      setMessage("Lead data fetched into intake form.");
-    } catch (error) {
-      console.error(error);
-      setMessage("Failed to fetch lead data from scraper API.");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const submitIntakeAndClean = async () => {
-    if (!validateLead()) return;
-
-    try {
-      setLoading(true);
-      setMessage("Creating lead intake record...");
-
-      const intakeResponse = await axios.post(`${API_BASE}/api/leads/intake`, {
-        rawLeadRow: {
-          businessName: lead.businessName,
-          email: lead.email,
-          domain: lead.domain || websiteUrl || "manual-entry",
-          category: lead.category,
-          location: lead.location || "Not provided",
-          notes: lead.notes || "No additional notes provided.",
+      const data = await callApi(
+        "Lead Discovery API",
+        "post",
+        "/api/leads/discover",
+        {
+          presetId: selectedPreset.id,
+          location,
+          query: customQuery || null,
+          limit: 10,
         },
-        sourceType: websiteUrl ? "scraper-demo" : "manual",
-        batchId: "phase-1-demo",
-      });
-
-      const newLeadId = intakeResponse.data.leadId;
-      setLeadId(newLeadId);
-
-      setMessage("Lead intake created. Cleaning lead record...");
-
-      const cleanResponse = await axios.post(
-        `${API_BASE}/api/leads/${newLeadId}/clean`
+        { timeout: 240000 }
       );
 
-      setCleaned(cleanResponse.data);
-      setGeneration(null);
-      setPreviewBuild(null);
-
-      setMessage("Lead intake and cleaning completed.");
+      setBatchId(data.batchId);
+      setLeads(data.leads || []);
+      setWarnings(data.warnings || []);
+      setNotice(`Fetched ${data.leads?.length || 0} leads.`, data.leads?.length ? "success" : "warning");
+      refreshDiagnostics(true);
     } catch (error) {
-      console.error(error);
-      setMessage("Lead intake or cleaning failed.");
+      const failure = formatApiError(error);
+      setLeads([]);
+      setBatchId(null);
+      setNotice(failure.message || "Lead discovery failed. Check backend provider settings.", "danger");
+      refreshDiagnostics(true);
     } finally {
-      setLoading(false);
+      setDiscovering(false);
     }
   };
 
-  const generateContent = async () => {
-    if (!cleaned) {
-      setMessage("Clean the lead before generating content.");
+  const runPipeline = async () => {
+    if (!selectedLeads.length) {
+      setNotice("Select one or more leads.", "warning");
       return;
     }
 
     try {
-      setLoading(true);
-      setMessage("Generating content packet...");
+      setRunning(true);
+      setPipelineResult(null);
+      setNotice("Running enrichment, image generation, Netlify deployment, and Zendesk sync...", "info");
 
-      const response = await axios.post(`${API_BASE}/api/content/generate`, {
-        leadRecord: cleaned,
-        generationProfile: "default",
-        templateId: "standard-service-template",
+      const data = await callApi(
+        "Full Pipeline API",
+        "post",
+        "/api/pipeline/run",
+        {
+          sourceBatchId: batchId,
+          templateId: selectedTemplate.id,
+          leads: selectedLeads,
+        },
+        { timeout: 420000 }
+      );
+
+      setPipelineResult(data);
+      setNotice(`Pipeline finished with status ${data.status}.`, data.status === "COMPLETED" ? "success" : "warning");
+      refreshDiagnostics(true);
+    } catch (error) {
+      const failure = formatApiError(error);
+      setNotice(failure.message || "Pipeline run failed. Check debug logs for the failed provider.", "danger");
+      refreshDiagnostics(true);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const runProbe = async (includeExternal) => {
+    try {
+      setDebugBusy(includeExternal ? "external-probe" : "local-probe");
+      setNotice(includeExternal ? "Validating provider APIs..." : "Checking local backend diagnostics...", "info");
+      const data = await callApi(
+        includeExternal ? "Provider Validation API" : "Local Probe API",
+        "post",
+        "/api/debug/probe",
+        { includeExternal },
+        { timeout: includeExternal ? 180000 : 30000 }
+      );
+      setApiProbe(data);
+      setNotice(
+        data.status === "VALID" ? "API validation passed." : "API validation found failures.",
+        data.status === "VALID" ? "success" : "danger"
+      );
+      refreshDiagnostics(true);
+    } catch (error) {
+      const failure = formatApiError(error);
+      setNotice(failure.message || "API validation failed.", "danger");
+    } finally {
+      setDebugBusy(null);
+    }
+  };
+
+  const runManualFlowTest = async () => {
+    try {
+      setDebugBusy("manual-flow");
+      setManualFlow(null);
+      setNotice("Running safe local API flow test...", "info");
+
+      const scrape = await callApi("Scrape API", "post", "/api/scrape/lead", {
+        url: "https://example.com",
+      });
+      const leadPayload = {
+        businessName: scrape.businessName || "Example Business",
+        email: scrape.email || "info@example.com",
+        domain: scrape.domain || "example.com",
+        category: scrape.category || "General Services",
+        location: scrape.location || "South Africa",
+        notes: scrape.notes || "Debugger generated sample lead.",
+      };
+      const intake = await callApi("Lead Intake API", "post", "/api/leads/intake", {
+        rawLeadRow: leadPayload,
+        sourceType: "ui-debugger",
+        batchId: `debug-${Date.now()}`,
+      });
+      const clean = await callApi("Lead Clean API", "post", `/api/leads/${intake.leadId}/clean`);
+      const content = await callApi("Content Generation API", "post", "/api/content/generate", {
+        leadRecord: clean,
+        generationProfile: "debug",
+        templateId: selectedTemplate.id,
         toneProfile: "professional",
       });
-
-      setGeneration(response.data);
-      setPreviewBuild(null);
-
-      setMessage("Content packet generated.");
-    } catch (error) {
-      console.error(error);
-      setMessage("Content generation failed.");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const buildPreview = async () => {
-    if (!leadId || !contentPacket) {
-      setMessage("Generate the content packet before building a preview.");
-      return;
-    }
-
-    try {
-      setLoading(true);
-      setMessage("Building preview website...");
-
-      const response = await axios.post(`${API_BASE}/api/site/build-preview`, {
-        leadId,
-        contentPacket,
-        templateId: "standard-service-template",
+      const preview = await callApi("Preview Build API", "post", "/api/site/build-preview", {
+        leadId: clean.leadId,
+        contentPacket: content.contentPacket,
+        templateId: selectedTemplate.id,
         deployMode: "preview",
       });
+      const leadRecord = await callApi("Lead Lookup API", "get", `/api/leads/${intake.leadId}`);
+      const outreach = await callApi("Outreach Draft API", "post", "/api/outreach/generate", {
+        leadId: clean.leadId,
+        businessName: clean.businessName,
+        email: clean.email,
+        category: clean.category,
+        previewReference: preview.previewUrl,
+      });
 
-      setPreviewBuild(response.data);
-      setMessage("Preview build completed.");
+      const result = {
+        status: "VALID",
+        leadId: intake.leadId,
+        steps: [
+          "scrape",
+          "intake",
+          "clean",
+          "content",
+          "preview",
+          "lookup",
+          "outreach",
+        ],
+        previewUrl: preview.previewUrl,
+        outreachSubject: outreach.subject,
+        storedLeadStatus: leadRecord.intakeStatus || "LOADED",
+      };
+      setManualFlow(result);
+      setNotice("Safe local API flow test passed.", "success");
+      refreshDiagnostics(true);
     } catch (error) {
-      console.error(error);
-      setMessage("Preview build failed.");
+      const failure = formatApiError(error);
+      const result = { status: "INVALID", message: failure.message, failure };
+      setManualFlow(result);
+      setNotice(`Safe local API flow failed: ${failure.message}`, "danger");
     } finally {
-      setLoading(false);
+      setDebugBusy(null);
     }
   };
 
-  const copyContentPacket = () => {
-    if (!generation) return;
-
-    navigator.clipboard.writeText(JSON.stringify(generation, null, 2));
-    setMessage("Generated content packet copied.");
+  const statusBadgeClass = (status) => {
+    if (status?.startsWith("COMPLETED") || status === "VALID" || status === "READY") return "text-bg-success";
+    if (status === "PROCESSING" || status === "ACTION_REQUIRED") return "text-bg-warning";
+    if (status === "FAILED" || status === "INVALID") return "text-bg-danger";
+    return "text-bg-secondary";
   };
 
-  const downloadPreview = () => {
-    if (!contentPacket) return;
-
-    const html = `
-<!DOCTYPE html>
-<html>
-<head>
-  <title>${contentPacket.headline}</title>
-</head>
-<body>
-  <h1>${contentPacket.headline}</h1>
-  <p>${contentPacket.summary}</p>
-
-  <h2>Services</h2>
-  <ul>
-    ${contentPacket.serviceBlocks
-      .map(
-        (service) =>
-          `<li><strong>${service.title}</strong>: ${service.description}</li>`
-      )
-      .join("")}
-  </ul>
-
-  <p><strong>${contentPacket.CTA}</strong></p>
-</body>
-</html>
-`;
-
-    const blob = new Blob([html], { type: "text/html" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-
-    link.href = url;
-    link.download = "phase-1-preview.html";
-    link.click();
-
-    URL.revokeObjectURL(url);
+  const logBadgeClass = (level) => {
+    if (level === "success" || level === "INFO") return "text-bg-success";
+    if (level === "warning" || level === "WARNING") return "text-bg-warning";
+    if (level === "danger" || level === "ERROR") return "text-bg-danger";
+    return "text-bg-secondary";
   };
-
-  const resetApp = () => {
-    setWebsiteUrl("");
-    setLead({});
-    setLeadId(null);
-    setCleaned(null);
-    setGeneration(null);
-    setPreviewBuild(null);
-    setZendeskResult(null);
-    setLoading(false);
-    setMessage("");
-    setErrors({});
-  };
-
- const approvePreview = async () => {
-  if (!previewBuild || !cleaned) {
-    setMessage("Build the preview before approving.");
-    return;
-  }
-
-  try {
-    setLoading(true);
-
- const response = await axios.post(
-      `${API_BASE}/api/zendesk/sync-lead`,
-      {
-        leadId: cleaned.leadId,
-        businessName: cleaned.businessName,
-        email: cleaned.email,
-        category: cleaned.category,
-        previewReference: previewBuild.previewUrl,
-        approvalStatus: "Approved",
-      }
-    );
-
-    setZendeskResult(response.data);
-    setReviewStatus("Approved");
-
-    setMessage(
-      "Preview approved and synced to Zendesk successfully."
-    );
-  } catch (error) {
-    console.error(error);
-
-    setMessage(
-      "Preview approved but Zendesk sync failed."
-    );
-  } finally {
-    setLoading(false);
-  }
-};
-
-const requestRegeneration = () => {
-  setReviewStatus("Regeneration Requested");
-  setGeneration(null);
-  setPreviewBuild(null);
-  setZendeskResult(null);
-  setMessage("Regeneration requested. Generate a new content packet.");
-};
 
   return (
-    <div className="app">
-      <header className="header">
-        <span className="badge">Phase 1 Lead-to-Preview Backbone</span>
-        <h1>AI Site Factory</h1>
-        <p>
-          Documentation-aligned workflow: lead source, intake, cleaning,
-          generation, and preview build.
-        </p>
-      </header>
-
-      {message && <div className="message">{message}</div>}
-
-      <div className="layout">
-        <div className="left-panel">
-          <div className="progress">
-            <div className={!leadId ? "step active" : "step done"}>
-              1. Intake
+    <div className="app-shell" ref={shellRef}>
+      <header className="app-hero entry-animate">
+        <div className="container-fluid py-4">
+          <div className="d-flex flex-column flex-xl-row gap-4 align-items-xl-center justify-content-between">
+            <div>
+              <span className="eyebrow">AI Site Factory</span>
+              <h1 className="display-title">Lead Pipeline Control Center</h1>
+              <p className="hero-copy">
+                Discover leads, generate sites, deploy to Netlify, sync Zendesk, and watch every API step with safe diagnostics.
+              </p>
             </div>
-            <div className={cleaned && !generation ? "step active" : cleaned ? "step done" : "step"}>
-              2. Clean
-            </div>
-            <div className={generation && !previewBuild ? "step active" : generation ? "step done" : "step"}>
-              3. Generate
-            </div>
-            <div className={previewBuild ? "step done" : "step"}>
-              4. Preview
+            <div className="metric-strip">
+              <div className="metric-card">
+                <span>{leads.length}</span>
+                <label>Leads</label>
+              </div>
+              <div className="metric-card">
+                <span>{selectedLeads.length}</span>
+                <label>Queued</label>
+              </div>
+              <div className="metric-card">
+                <span>{completedCount}</span>
+                <label>Complete</label>
+              </div>
+              <div className="metric-card">
+                <span>{backendLogs.length}</span>
+                <label>Logs</label>
+              </div>
             </div>
           </div>
+        </div>
+      </header>
 
-          <section className="card">
-            <div className="scraper-box">
-              <h3>Lead Source / Scraper</h3>
-              <p className="helper">
-                Enter a public website URL to fetch structured demo lead data.
-              </p>
+      <main className="container-fluid py-4">
+        {message && (
+          <div className={`alert alert-${messageTone} border-0 shadow-sm entry-animate`} role="alert">
+            {message}
+          </div>
+        )}
 
-              <input
-                type="text"
-                placeholder="Enter website URL"
-                value={websiteUrl}
-                onChange={(e) => setWebsiteUrl(e.target.value)}
-              />
+        <section className="flow-card entry-animate" ref={flowRef} aria-label="Active automation flow">
+          <div className="flow-track">
+            <span className="flow-energy" />
+            {flowSteps.map((step) => (
+              <div className={`flow-step ${step.state}`} key={step.key}>
+                <span className="flow-dot" />
+                <strong>{step.label}</strong>
+                <small>{step.detail}</small>
+              </div>
+            ))}
+          </div>
+        </section>
 
-              <button onClick={fetchLeadFromWebsite} disabled={loading}>
-                {loading ? "Fetching..." : "Fetch Lead From Website"}
-              </button>
-            </div>
+        <div className="row g-4">
+          <section className="col-12 col-xl-5">
+            <div className="card control-card h-100 entry-animate">
+              <div className="card-header bg-white border-0 pb-0">
+                <div className="d-flex align-items-start justify-content-between gap-3">
+                  <div>
+                    <h2 className="h5 mb-1">Lead Discovery</h2>
+                    <p className="text-secondary mb-0">{selectedPreset?.description}</p>
+                  </div>
+                  <button
+                    className="btn btn-primary"
+                    onClick={discoverLeads}
+                    disabled={discovering}
+                    data-bs-toggle="tooltip"
+                    title="Calls /api/leads/discover, normalizes leads, and records backend logs."
+                  >
+                    {discovering ? "Searching..." : "Search Leads"}
+                  </button>
+                </div>
+              </div>
+              <div className="card-body">
+                <div className="preset-grid">
+                  {presets.map((preset) => (
+                    <button
+                      type="button"
+                      key={preset.id}
+                      className={`preset-tile ${preset.id === selectedPresetId ? "selected" : ""}`}
+                      onClick={() => setSelectedPresetId(preset.id)}
+                      data-bs-toggle="tooltip"
+                      title={preset.description}
+                    >
+                      <strong>{preset.label}</strong>
+                      <span>{preset.industry}</span>
+                    </button>
+                  ))}
+                </div>
 
-            <h2>Lead Intake</h2>
-            <p className="helper">
-              Review or enter the raw lead before creating the intake record.
-            </p>
+                <div className="row g-3 mt-1">
+                  <div className="col-md-6">
+                    <label className="form-label">Location</label>
+                    <input
+                      className="form-control"
+                      value={location}
+                      onChange={(event) => setLocation(event.target.value)}
+                      placeholder="South Africa"
+                    />
+                  </div>
+                  <div className="col-md-6">
+                    <label className="form-label">Search text</label>
+                    <input
+                      className="form-control"
+                      value={customQuery}
+                      onChange={(event) => setCustomQuery(event.target.value)}
+                      placeholder={selectedPreset?.label || "Business type"}
+                      data-bs-toggle="tooltip"
+                      title="Optional override. Leave empty to use the selected preset query."
+                    />
+                  </div>
+                  <div className="col-12">
+                    <label className="form-label">Site template</label>
+                    <select
+                      className="form-select"
+                      value={selectedTemplateId}
+                      onChange={(event) => setSelectedTemplateId(event.target.value)}
+                    >
+                      {templates.map((template) => (
+                        <option key={template.id} value={template.id}>
+                          {template.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
 
-            <input
-              name="businessName"
-              placeholder="Business Name *"
-              value={lead.businessName || ""}
-              onChange={handleChange}
-            />
-            {errors.businessName && (
-              <p className="error">{errors.businessName}</p>
-            )}
+                <div className="template-callout mt-3">
+                  <strong>{selectedTemplate?.name}</strong>
+                  <span>{selectedTemplate?.description}</span>
+                </div>
 
-            <input
-              name="email"
-              placeholder="Email Address *"
-              value={lead.email || ""}
-              onChange={handleChange}
-            />
-            {errors.email && <p className="error">{errors.email}</p>}
-
-            <input
-              name="domain"
-              placeholder="Domain / Website"
-              value={lead.domain || ""}
-              onChange={handleChange}
-            />
-
-            <input
-              name="category"
-              placeholder="Category / Industry *"
-              value={lead.category || ""}
-              onChange={handleChange}
-            />
-            {errors.category && <p className="error">{errors.category}</p>}
-
-            <input
-              name="location"
-              placeholder="Location"
-              value={lead.location || ""}
-              onChange={handleChange}
-            />
-
-            <textarea
-              name="notes"
-              placeholder="Business Notes"
-              value={lead.notes || ""}
-              onChange={handleChange}
-            ></textarea>
-
-            <div className="button-row">
-              <button onClick={loadSampleLead} className="sample-btn">
-                Load Sample Lead
-              </button>
-
-              <button onClick={validateLead} className="secondary-btn">
-                Validate Lead
-              </button>
-
-              <button onClick={submitIntakeAndClean} disabled={loading}>
-                {loading ? "Processing..." : "Create Intake & Clean"}
-              </button>
+                {warnings.length > 0 && (
+                  <div className="alert alert-warning mt-3 mb-0">
+                    {warnings.map((warning) => (
+                      <div key={warning}>{warning}</div>
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           </section>
-        </div>
 
-        <div className="right-panel">
-          {cleaned ? (
-            <section className="card">
-              <h2>Cleaned Lead Record</h2>
-              <p className="helper">
-                Output from <strong>/api/leads/&#123;leadId&#125;/clean</strong>.
-              </p>
+          <section className="col-12 col-xl-7">
+            <div className="card control-card h-100 entry-animate">
+              <div className="card-header bg-white border-0 pb-0">
+                <div className="d-flex align-items-start justify-content-between gap-3">
+                  <div>
+                    <h2 className="h5 mb-1">API Safety Center</h2>
+                    <p className="text-secondary mb-0">
+                      Validate configuration, run safe endpoint tests, and review exact failure reasons.
+                    </p>
+                  </div>
+                  <span className={`badge rounded-pill ${statusBadgeClass(debugStatus?.status)}`}>
+                    {debugStatus?.status || "UNKNOWN"}
+                  </span>
+                </div>
+              </div>
+              <div className="card-body">
+                <div className="d-flex flex-wrap gap-2 mb-3">
+                  <button className="btn btn-outline-secondary" onClick={() => refreshDiagnostics(false)}>
+                    Refresh Diagnostics
+                  </button>
+                  <button
+                    className="btn btn-outline-primary"
+                    onClick={() => runProbe(false)}
+                    disabled={debugBusy === "local-probe"}
+                    data-bs-toggle="tooltip"
+                    title="Checks backend health and required env config without calling external providers."
+                  >
+                    {debugBusy === "local-probe" ? "Checking..." : "Local API Probe"}
+                  </button>
+                  <button
+                    className="btn btn-outline-success"
+                    onClick={runManualFlowTest}
+                    disabled={debugBusy === "manual-flow"}
+                    data-bs-toggle="tooltip"
+                    title="Runs scrape, intake, clean, content, preview, lookup, and outreach draft APIs with safe sample data."
+                  >
+                    {debugBusy === "manual-flow" ? "Testing..." : "Safe Flow Test"}
+                  </button>
+                  <button
+                    className="btn btn-outline-danger"
+                    onClick={() => runProbe(true)}
+                    disabled={debugBusy === "external-probe"}
+                    data-bs-toggle="tooltip"
+                    title="Calls provider auth/status APIs for Apify, Gemini, Groq, Netlify, and Zendesk. This does not create sites or tickets."
+                  >
+                    {debugBusy === "external-probe" ? "Validating..." : "Validate Providers"}
+                  </button>
+                </div>
 
-              <pre>{JSON.stringify(cleaned, null, 2)}</pre>
-
-              <button onClick={generateContent} disabled={loading}>
-                {loading ? "Generating..." : "Generate Content Packet"}
-              </button>
-            </section>
-          ) : (
-            <section className="card empty-state">
-              <h2>Cleaned Lead Record</h2>
-              <p>Create the lead intake and cleaning output to continue.</p>
-            </section>
-          )}
-
-          {generation ? (
-            <section className="card">
-              <h2>Generated Content Packet</h2>
-              <p className="helper">
-                Output from <strong>/api/content/generate</strong>.
-              </p>
-
-              <pre>{JSON.stringify(generation, null, 2)}</pre>
-
-              <button onClick={buildPreview} disabled={loading}>
-                {loading ? "Building..." : "Build Preview"}
-              </button>
-            </section>
-          ) : (
-            <section className="card empty-state">
-              <h2>Generated Content Packet</h2>
-              <p>Generate content after cleaning the lead.</p>
-            </section>
-          )}
-
-          {contentPacket && (
-            <section className="card">
-              <h2>Preview Website</h2>
-              <p className="helper">
-                Visual rendering from the generated content packet.
-              </p>
-
-              <div className="preview">
-                <h1>{contentPacket.headline}</h1>
-                <p>{contentPacket.summary}</p>
-
-                <div className="service-grid">
-                  {contentPacket.serviceBlocks.map((service, index) => (
-                    <div className="service-card" key={index}>
-                      <span>0{index + 1}</span>
-                      <h3>{service.title}</h3>
-                      <p>{service.description}</p>
+                <div className="row g-3">
+                  {Object.entries(debugStatus?.providers || {}).map(([provider, providerStatus]) => (
+                    <div className="col-md-6 col-xxl-4" key={provider}>
+                      <div className={`provider-card ${providerStatus.configured ? "ready" : "missing"}`}>
+                        <div className="d-flex align-items-center justify-content-between">
+                          <strong className="text-capitalize">{provider}</strong>
+                          <span className={`badge ${providerStatus.configured ? "text-bg-success" : "text-bg-danger"}`}>
+                            {providerStatus.configured ? "Ready" : "Needs key"}
+                          </span>
+                        </div>
+                        <small>
+                          {providerStatus.checks
+                            .map((check) => `${check.name}: ${check.configured ? "set" : check.issue}`)
+                            .join(" | ")}
+                        </small>
+                      </div>
                     </div>
                   ))}
                 </div>
 
-                <button>{contentPacket.CTA}</button>
+                {(apiProbe || manualFlow) && (
+                  <div className="debug-output mt-3">
+                    {apiProbe && (
+                      <div>
+                        <div className="d-flex align-items-center justify-content-between mb-2">
+                          <strong>Probe Result</strong>
+                          <span className={`badge ${statusBadgeClass(apiProbe.status)}`}>{apiProbe.status}</span>
+                        </div>
+                        <div className="probe-grid">
+                          {apiProbe.checks.map((check) => (
+                            <div className="probe-item" key={check.name}>
+                              <span className={`badge ${statusBadgeClass(check.status)}`}>{check.status}</span>
+                              <strong>{check.name}</strong>
+                              <small>{check.message}</small>
+                              <small>{check.durationMs} ms</small>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                    {manualFlow && (
+                      <div className="mt-3">
+                        <div className="d-flex align-items-center justify-content-between mb-2">
+                          <strong>Safe Flow Result</strong>
+                          <span className={`badge ${statusBadgeClass(manualFlow.status)}`}>{manualFlow.status}</span>
+                        </div>
+                        {manualFlow.status === "VALID" ? (
+                          <p className="mb-0">
+                            Lead {manualFlow.leadId} passed {manualFlow.steps.join(" -> ")}. Preview: {manualFlow.previewUrl}
+                          </p>
+                        ) : (
+                          <p className="mb-0 text-danger">{manualFlow.message}</p>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
-
-              {previewBuild && (
-                <div className="approval-box">
-                  <h3>Preview Build Result</h3>
-                  <p>
-                    <strong>Status:</strong>{" "}
-                    {previewBuild.deploymentStatus}
-                  </p>
-                  <p>
-                    <strong>Preview Reference:</strong>{" "}
-                    {previewBuild.previewUrl}
-                  </p>
-                  <p>
-                    <strong>Build Reference:</strong>{" "}
-                    {previewBuild.buildReference}
-                  </p>
-                  <p>
-  <strong>Review Status:</strong> {reviewStatus}
-  {zendeskResult && (
-  <div style={{ marginTop: "15px" }}>
-    <h4>Zendesk Sync Result</h4>
-
-    <p>
-      <strong>Status:</strong>{" "}
-      {zendeskResult.syncStatus}
-    </p>
-
-    <p>
-      <strong>Organization:</strong>{" "}
-      {zendeskResult.organizationName}
-    </p>
-
-    <p>
-      <strong>Ticket ID:</strong>{" "}
-      {zendeskResult.zendeskRecordId}
-    </p>
-
-    <p>
-      <strong>User Email:</strong>{" "}
-      {zendeskResult.userEmail}
-    </p>
-
-    <a
-      href={zendeskResult.ticketUrl}
-      target="_blank"
-      rel="noreferrer"
-    >
-      Open Zendesk Ticket
-    </a>
-  </div>
-)}
-</p>
-
-<p className="helper">{previewBuild.limitationNote}</p>
-
-<div className="button-row">
-  <button onClick={approvePreview}>
-    Approve Preview
-  </button>
-
-  <button
-    className="reject-btn"
-    onClick={requestRegeneration}
-  >
-    Request Regeneration
-  </button>
-</div>
-                </div>
-              )}
-
-              <div className="button-row">
-                <button onClick={copyContentPacket} className="secondary-btn">
-                  Copy Content Packet
-                </button>
-
-                <button onClick={downloadPreview}>
-                  Download Preview HTML
-                </button>
-
-                <button className="reset" onClick={resetApp}>
-                  Start New Lead
-                </button>
-              </div>
-            </section>
-          )}
+            </div>
+          </section>
         </div>
-      </div>
+
+        <section className="card control-card mt-4 entry-animate">
+          <div className="card-header bg-white border-0 pb-0">
+            <div className="d-flex flex-column flex-lg-row align-items-lg-start justify-content-between gap-3">
+              <div>
+                <h2 className="h5 mb-1">Leads</h2>
+                <p className="text-secondary mb-0">{batchId ? `Batch ${batchId}` : "No batch loaded"}</p>
+              </div>
+              <div className="d-flex flex-wrap gap-2">
+                <button className="btn btn-outline-secondary" type="button" onClick={selectAllLeads} disabled={!leads.length}>
+                  Select All
+                </button>
+                <button className="btn btn-outline-secondary" type="button" onClick={clearSelectedLeads} disabled={!selectedLeadKeys.length}>
+                  Clear
+                </button>
+                <button
+                  className="btn btn-primary"
+                  onClick={runPipeline}
+                  disabled={running || !selectedLeads.length}
+                  data-bs-toggle="tooltip"
+                  title="Runs enrichment, copy generation, image generation, Netlify deployment, Groq outreach, and Zendesk ticket creation."
+                >
+                  {running ? "Running..." : "Run Pipeline"}
+                </button>
+              </div>
+            </div>
+          </div>
+          <div className="card-body">
+            {leads.length > 0 ? (
+              <div className="table-responsive data-table-wrap">
+                <table className="table align-middle mb-0">
+                  <thead>
+                    <tr>
+                      <th>Select</th>
+                      <th>Business</th>
+                      <th>Contact</th>
+                      <th>Category</th>
+                      <th>Rating</th>
+                      <th>Source</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {leads.map((lead) => (
+                      <tr key={lead.leadKey}>
+                        <td>
+                          <input
+                            aria-label={`Select ${lead.businessName}`}
+                            className="form-check-input"
+                            type="checkbox"
+                            checked={selectedLeadKeys.includes(lead.leadKey)}
+                            onChange={() => toggleLead(lead.leadKey)}
+                          />
+                        </td>
+                        <td>
+                          <strong>{lead.businessName}</strong>
+                          <span className="d-block text-secondary small">{lead.address || lead.location}</span>
+                        </td>
+                        <td>
+                          <span>{lead.email || "No email yet"}</span>
+                          <span className="d-block text-secondary small">{lead.phone || lead.domain || "No phone yet"}</span>
+                        </td>
+                        <td>{lead.category}</td>
+                        <td>{lead.rating ? `${lead.rating} (${lead.reviewsCount || 0})` : "N/A"}</td>
+                        <td>
+                          {lead.sourceUrl ? (
+                            <a href={lead.sourceUrl} target="_blank" rel="noreferrer">
+                              Open
+                            </a>
+                          ) : (
+                            "Apify"
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            ) : (
+              <div className="empty-state">
+                <h3>No leads loaded</h3>
+                <p>Choose a preset and run a search.</p>
+              </div>
+            )}
+          </div>
+        </section>
+
+        <div className="row g-4 mt-1">
+          <section className="col-12 col-xl-7">
+            <div className="card control-card h-100 entry-animate">
+              <div className="card-header bg-white border-0 pb-0">
+                <div className="d-flex align-items-start justify-content-between gap-3">
+                  <div>
+                    <h2 className="h5 mb-1">Pipeline Results</h2>
+                    <p className="text-secondary mb-0">{pipelineResult?.pipelineId || "No run completed"}</p>
+                  </div>
+                  {pipelineResult && (
+                    <span className={`badge rounded-pill ${statusBadgeClass(pipelineResult.status)}`}>
+                      {pipelineResult.status}
+                    </span>
+                  )}
+                </div>
+              </div>
+              <div className="card-body">
+                {running && (
+                  <div className="result-grid">
+                    {selectedLeads.map((lead) => (
+                      <article className="result-card processing" key={lead.leadKey}>
+                        <span className="badge text-bg-primary">PROCESSING</span>
+                        <h3>{lead.businessName}</h3>
+                        <p>Queued for enrichment, deployment, outreach, and Zendesk sync.</p>
+                      </article>
+                    ))}
+                  </div>
+                )}
+
+                {pipelineResult?.results?.length > 0 ? (
+                  <div className="result-grid">
+                    {pipelineResult.results.map((result) => (
+                      <article className="result-card" key={result.leadKey}>
+                        <div className="d-flex align-items-start justify-content-between gap-2">
+                          <h3>{result.businessName}</h3>
+                          <span className={`badge ${statusBadgeClass(result.status)}`}>{result.status}</span>
+                        </div>
+
+                        <dl>
+                          <div>
+                            <dt>Netlify</dt>
+                            <dd>
+                              {result.deployment?.url ? (
+                                <a href={result.deployment.url} target="_blank" rel="noreferrer">
+                                  {result.deployment.url}
+                                </a>
+                              ) : (
+                                "No deployment"
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Zendesk</dt>
+                            <dd>
+                              {result.zendesk?.ticketUrl ? (
+                                <a href={result.zendesk.ticketUrl} target="_blank" rel="noreferrer">
+                                  Ticket {result.zendesk.ticketId}
+                                </a>
+                              ) : (
+                                "No ticket"
+                              )}
+                            </dd>
+                          </div>
+                        </dl>
+
+                        {result.outreachDraft && (
+                          <details>
+                            <summary>Outreach draft</summary>
+                            <strong>{result.outreachDraft.subject}</strong>
+                            <pre>{result.outreachDraft.body}</pre>
+                          </details>
+                        )}
+
+                        {result.errors?.length > 0 && (
+                          <div className="alert alert-danger mt-3 mb-0">
+                            {result.errors.map((error) => (
+                              <div key={error}>{error}</div>
+                            ))}
+                          </div>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  !running && (
+                    <div className="empty-state">
+                      <h3>No pipeline output</h3>
+                      <p>Select leads and run the pipeline.</p>
+                    </div>
+                  )
+                )}
+              </div>
+            </div>
+          </section>
+
+          <section className="col-12 col-xl-5">
+            <div className="card control-card h-100 entry-animate">
+              <div className="card-header bg-white border-0 pb-0">
+                <h2 className="h5 mb-1">Live Logs</h2>
+                <p className="text-secondary mb-0">Frontend confirmations plus backend background events.</p>
+              </div>
+              <div className="card-body">
+                <div className="log-pane mb-3">
+                  <h3>UI Actions</h3>
+                  {(uiLogs.length ? uiLogs : [{ id: "empty", level: "info", event: "idle", message: "No UI actions yet.", timestamp: new Date().toISOString() }]).map((log) => (
+                    <div className="log-row" key={log.id}>
+                      <span className={`badge ${logBadgeClass(log.level)}`}>{log.level}</span>
+                      <div>
+                        <strong>{log.event}</strong>
+                        <p>{log.message}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+                <div className="log-pane">
+                  <h3>Backend Background</h3>
+                  {(backendLogs.length ? backendLogs : [{ id: "empty-backend", level: "INFO", event: "idle", message: "No backend logs loaded.", timestamp: new Date().toISOString() }]).map((log) => (
+                    <div className="log-row" key={log.id}>
+                      <span className={`badge ${logBadgeClass(log.level)}`}>{log.level}</span>
+                      <div>
+                        <strong>{log.event}</strong>
+                        <p>{log.message}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </main>
     </div>
   );
 }

@@ -19,6 +19,15 @@ This project is an end-to-end automation system that collects business data, cle
 
 ## Deployment
 - Netlify
+
+## Lead Pipeline API
+- `GET /api/presets` returns the five Google Maps business examples.
+- `GET /api/templates` returns the three landing-page templates.
+- `POST /api/leads/discover` runs the Apify Google Maps actor and returns normalized leads.
+- `POST /api/pipeline/run` enriches selected leads with Gemini, generates copy with GroqCloud, creates Gemini image assets, deploys production static sites to Netlify, and creates Zendesk outreach tickets.
+
+## Environment
+Create `backend/.env` from `backend/.env.example`. Use rotated API tokens before production because the original tokens were shared outside a secret manager.
 ## CRM Tracking
 - Zendesk API
 
