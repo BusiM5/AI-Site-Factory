@@ -655,17 +655,73 @@ def extract_email_from_item(item: Dict[str, Any]) -> Optional[str]:
     return found[0] if found else None
 
 
+SOUTH_AFRICA_TERMS = [
+    "south africa",
+    "za",
+    "zaf",
+    ".co.za",
+    "gauteng",
+    "kwazulu-natal",
+    "kwazulu natal",
+    "kzn",
+    "western cape",
+    "eastern cape",
+    "free state",
+    "limpopo",
+    "mpumalanga",
+    "north west",
+    "northern cape",
+    "durban",
+    "johannesburg",
+    "cape town",
+    "pretoria",
+    "polokwane",
+    "bloemfontein",
+    "east london",
+    "port elizabeth",
+    "gqeberha",
+    "pietermaritzburg",
+    "umhlanga",
+    "ballito",
+    "sandton",
+    "centurion",
+    "midrand",
+]
+
+
+def infer_country_code(location: str) -> Optional[str]:
+    location_lower = compact_text(location).lower()
+    if "south africa" in location_lower or any(term in location_lower for term in SOUTH_AFRICA_TERMS):
+        return "za"
+    return None
+
+
 def build_google_maps_query(preset: Dict[str, Any], location: str, custom_query: Optional[str] = None) -> str:
-    base_query = compact_text(custom_query) or preset["query"]
-    resolved_location = compact_text(location, "South Africa")
-    return f"{base_query} in {resolved_location}"
+    """Build a Google Maps search query with clear geographic intent."""
+    query_term = compact_text(custom_query) or compact_text(preset.get("query", ""))
+    if not query_term:
+        query_term = preset.get("industry", "services")
+
+    location_term = compact_text(location, "South Africa")
+    return f"{query_term} in {location_term}"
 
 
-def run_apify_google_maps(query: str, limit: int) -> List[Dict[str, Any]]:
+def run_apify_google_maps(query: str, limit: int, location: str = "South Africa") -> List[Dict[str, Any]]:
     token = require_env("APIFY_API_TOKEN")
     actor_id = os.getenv("APIFY_GOOGLE_MAPS_ACTOR_ID", "compass/crawler-google-places").replace("/", "~")
     max_items = max(limit, 10)
-    log_event("info", "provider.apify.start", "Starting Apify Google Maps discovery.", query=query, limit=max_items, actorId=actor_id)
+    country_code = infer_country_code(location)
+
+    log_event(
+        "info",
+        "provider.apify.start",
+        "Starting Apify Google Maps discovery.",
+        query=query,
+        location=location,
+        limit=max_items,
+        actorId=actor_id,
+        countryCode=country_code,
+    )
 
     url = (
         f"https://api.apify.com/v2/actors/{actor_id}/run-sync-get-dataset-items"
@@ -673,11 +729,16 @@ def run_apify_google_maps(query: str, limit: int) -> List[Dict[str, Any]]:
     )
 
     payload = {
-    "searchStringsArray": [query],
-    "language": "en",
-    "maxCrawledPlacesPerSearch": max_items,
-    "includeWebResults": True,
-}
+        "searchStringsArray": [query],
+        "language": "en",
+        "maxCrawledPlacesPerSearch": max_items,
+        "includeWebResults": True,
+    }
+
+    # Some Google Maps actors support country/location fields; if unsupported, we retry safely below.
+    if country_code:
+        payload["countryCode"] = country_code
+        payload["locationQuery"] = location
 
     response = requests.post(
         url,
@@ -688,8 +749,40 @@ def run_apify_google_maps(query: str, limit: int) -> List[Dict[str, Any]]:
         json=payload,
         timeout=210,
     )
+
+    if response.status_code == 400:
+        log_event(
+            "warning",
+            "provider.apify.retry_minimal_payload",
+            "Apify rejected the extended payload. Retrying with minimal payload.",
+            query=query,
+            statusCode=response.status_code,
+            responseText=response.text[:500],
+        )
+        minimal_payload = {
+            "searchStringsArray": [query],
+            "language": "en",
+            "maxCrawledPlacesPerSearch": max_items,
+            "includeWebResults": True,
+        }
+        response = requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=minimal_payload,
+            timeout=210,
+        )
+
     response.raise_for_status()
-    log_event("info", "provider.apify.finish", "Apify returned Google Maps items.", statusCode=response.status_code)
+
+    log_event(
+        "info",
+        "provider.apify.finish",
+        "Apify returned Google Maps items.",
+        statusCode=response.status_code,
+    )
 
     data = response.json()
     if isinstance(data, list):
@@ -701,6 +794,65 @@ def run_apify_google_maps(query: str, limit: int) -> List[Dict[str, Any]]:
     return []
 
 
+def item_matches_requested_location(
+    item: Dict[str, Any],
+    requested_location: str,
+    address: Optional[str],
+    raw_location: Optional[str],
+    website: Optional[str],
+    domain: Optional[str],
+    source_url: Optional[str],
+) -> bool:
+    requested = compact_text(requested_location).lower()
+    if not requested:
+        return True
+
+    country_value = compact_text(
+        first_present(
+            item,
+            [
+                "country",
+                "countryCode",
+                "countryName",
+                "locatedIn",
+                "state",
+                "city",
+            ],
+        )
+    ).lower()
+
+    combined_text = " ".join(
+        [
+            compact_text(address),
+            compact_text(raw_location),
+            compact_text(website),
+            compact_text(domain),
+            compact_text(source_url),
+            compact_text(json.dumps(item, default=str)),
+        ]
+    ).lower()
+
+    if "south africa" in requested or any(term in requested for term in SOUTH_AFRICA_TERMS):
+        if country_value in ["za", "zaf", "south africa"]:
+            return True
+        if domain and ".co.za" in domain.lower():
+            return True
+        if website and ".co.za" in website.lower():
+            return True
+        return any(term in combined_text for term in SOUTH_AFRICA_TERMS)
+
+    requested_words = [
+        word
+        for word in re.split(r"[\s,]+", requested)
+        if len(word) >= 4 and word not in ["near", "with", "from"]
+    ]
+
+    if requested in combined_text:
+        return True
+
+    return any(word in combined_text for word in requested_words)
+
+
 def normalize_apify_items(
     items: List[Dict[str, Any]],
     fallback_category: str,
@@ -709,6 +861,7 @@ def normalize_apify_items(
 ) -> List[DiscoveredLead]:
     leads: List[DiscoveredLead] = []
     seen = set()
+    skipped_location = 0
 
     for item in items:
         business_name = first_present(
@@ -729,7 +882,28 @@ def normalize_apify_items(
             fallback_category,
         ) or fallback_category
         source_url = first_present(item, ["googleMapsUrl", "searchPageUrl", "placeUrl", "url"])
-        raw_location = first_present(item, ["city", "neighborhood", "state", "country"], location) or location
+
+        # Do not default to the requested location before filtering.
+        # Otherwise, UK/US results can be incorrectly marked as South Africa.
+        raw_location = first_present(
+            item,
+            ["city", "neighborhood", "state", "country", "countryCode", "countryName"],
+            None,
+        )
+
+        if not item_matches_requested_location(
+            item=item,
+            requested_location=location,
+            address=address,
+            raw_location=raw_location,
+            website=website,
+            domain=domain,
+            source_url=source_url,
+        ):
+            skipped_location += 1
+            continue
+
+        display_location = raw_location or location
         notes = first_present(item, ["description", "about", "reviewsTags", "popularTimesLiveText"])
 
         lead_key = stable_lead_key(business_name, website, phone, address)
@@ -760,7 +934,7 @@ def normalize_apify_items(
                 domain=domain,
                 category=category,
                 address=address,
-                location=raw_location,
+                location=display_location,
                 rating=rating,
                 reviewsCount=reviews_count,
                 sourceUrl=source_url,
@@ -771,6 +945,15 @@ def normalize_apify_items(
 
         if len(leads) >= limit:
             break
+
+    log_event(
+        "info",
+        "leads.normalize.finish",
+        "Lead normalization finished.",
+        returned=len(leads),
+        skippedLocation=skipped_location,
+        requestedLocation=location,
+    )
 
     return leads
 
@@ -1391,8 +1574,14 @@ def render_site_html(
 
 def zip_site_html(site_html: str) -> bytes:
     buffer = io.BytesIO()
+
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("index.html", site_html)
+        archive.writestr(
+            "_headers",
+            "/*\n  Content-Type: text/html; charset=utf-8\n"
+        )
+
     return buffer.getvalue()
 
 
@@ -1456,13 +1645,11 @@ def deploy_site_to_netlify(business_name: str, site_html: str) -> Dict[str, Any]
         deploy = poll_response.json()
         state = deploy.get("state")
 
-    site_url = (
-        deploy.get("deploy_ssl_url")
-        or deploy.get("ssl_url")
-        or deploy.get("url")
-        or site.get("ssl_url")
-        or site.get("url")
-    )
+        site_url = (
+    site.get("ssl_url")
+    or site.get("url")
+    or f"https://{site.get('name', site_name)}.netlify.app"
+)
 
     result = {
         "siteId": site_id,
@@ -1793,61 +1980,113 @@ def discover_leads(request: DiscoverLeadsRequest):
     preset = get_preset_or_404(request.presetId)
     location = compact_text(request.location, "South Africa")
     limit = max(10, min(request.limit, 25))
-    query = build_google_maps_query(preset, location, request.query)
+
+    primary_query = build_google_maps_query(preset, location, request.query)
+    query_term = compact_text(request.query) or compact_text(preset.get("query", ""))
+    if not query_term:
+        query_term = preset.get("industry", "services")
+
+    retry_queries = [
+        primary_query,
+        f"{query_term} near {location}",
+        f"{query_term} {location}",
+    ]
+
+    if "south africa" in location.lower():
+        retry_queries.append(f"{query_term} in South Africa")
+
+    retry_queries = list(dict.fromkeys(retry_queries))
     warnings: List[str] = []
-    log_event("info", "leads.discover.start", "Lead discovery started.", presetId=request.presetId, location=location, query=query, limit=limit)
+
+    log_event(
+        "info",
+        "leads.discover.start",
+        "Lead discovery started.",
+        presetId=request.presetId,
+        location=location,
+        query=primary_query,
+        limit=limit,
+        retryQueries=retry_queries,
+    )
+
+    raw_items: List[Dict[str, Any]] = []
+    seen_raw_keys = set()
 
     try:
-        raw_items = run_apify_google_maps(query, limit * 2)
+        for query in retry_queries:
+            if len(raw_items) >= limit * 4:
+                break
+
+            query_items = run_apify_google_maps(query, limit * 2, location)
+
+            for item in query_items:
+                key = stable_lead_key(
+                    first_present(item, ["title", "name", "businessName", "placeName", "companyName"]),
+                    first_present(item, ["website", "url", "site", "homepage"]),
+                    first_present(item, ["phone", "phoneUnformatted", "contactPhone", "telephone"]),
+                    first_present(item, ["address", "street", "fullAddress", "formattedAddress"]),
+                )
+
+                if key not in seen_raw_keys:
+                    raw_items.append(item)
+                    seen_raw_keys.add(key)
+
     except requests.RequestException as error:
-        log_event("error", "leads.discover.failed", "Apify lead discovery request failed.", presetId=request.presetId, reason=str(error))
+        log_event(
+            "error",
+            "leads.discover.failed",
+            "Apify lead discovery request failed.",
+            presetId=request.presetId,
+            reason=str(error),
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Apify lead discovery failed: {str(error)}",
         )
+
     except RuntimeError as error:
-        log_event("error", "leads.discover.failed", "Lead discovery configuration failed.", presetId=request.presetId, reason=str(error))
+        log_event(
+            "error",
+            "leads.discover.failed",
+            "Lead discovery configuration failed.",
+            presetId=request.presetId,
+            reason=str(error),
+        )
         raise HTTPException(status_code=500, detail=str(error))
 
     leads = normalize_apify_items(raw_items, preset["industry"], location, limit)
 
     if len(leads) < 10:
-        broader_query = build_google_maps_query(preset, location)
-        if broader_query != query:
-            try:
-                retry_items = run_apify_google_maps(broader_query, limit * 2)
-                retry_leads = normalize_apify_items(
-                    retry_items,
-                    preset["industry"],
-                    location,
-                    limit,
-                )
-                existing_keys = {lead.leadKey for lead in leads}
-                for lead in retry_leads:
-                    if lead.leadKey not in existing_keys:
-                        leads.append(lead)
-                        existing_keys.add(lead.leadKey)
-                    if len(leads) >= limit:
-                        break
-            except (requests.RequestException, RuntimeError) as error:
-                warnings.append(f"Broader retry failed: {str(error)}")
-                log_event("warning", "leads.discover.retry_failed", "Broader lead discovery retry failed.", presetId=request.presetId, reason=str(error))
-
-    if len(leads) < 10:
-        warnings.append(f"Only {len(leads)} valid leads were returned for this search.")
+        warnings.append(
+            f"Only {len(leads)} valid leads were returned for {location}. "
+            "Some Apify results were removed because they did not match the requested location."
+        )
 
     batch_id = str(uuid4())
     response = DiscoverLeadsResponse(
         batchId=batch_id,
         preset=preset,
         location=location,
-        query=query,
+        query=primary_query,
         leads=leads[:limit],
         sourceStatus="READY" if leads else "NO_RESULTS",
         warnings=warnings,
     )
+
     DISCOVERY_DB[batch_id] = response.model_dump()
-    log_event("info", "leads.discover.finish", "Lead discovery finished.", batchId=batch_id, leadCount=len(response.leads), warningCount=len(warnings), status=response.sourceStatus)
+
+    log_event(
+        "info",
+        "leads.discover.finish",
+        "Lead discovery finished.",
+        batchId=batch_id,
+        leadCount=len(response.leads),
+        rawItemCount=len(raw_items),
+        warningCount=len(warnings),
+        status=response.sourceStatus,
+        location=location,
+    )
+
     return response
 
 
@@ -1875,16 +2114,32 @@ def run_pipeline(request: PipelineRunRequest):
             log_event("info", "pipeline.lead.start", "Processing pipeline lead.", pipelineId=pipeline_id, leadKey=lead.leadKey, businessName=lead.businessName)
             contact_details = scrape_contact_details(lead)
             log_event("info", "pipeline.lead.scraped", "Contact details scraped.", pipelineId=pipeline_id, leadKey=lead.leadKey, hasEmail=bool(contact_details.get("email")), hasWebsite=bool(contact_details.get("website")))
-            cleaned_context = enrich_lead_with_gemini(lead, contact_details)
+            cleaned_context = {
+    "businessName": lead.businessName,
+    "industry": lead.category,
+    "location": lead.location,
+    "email": contact_details.get("email") or lead.email,
+    "phone": contact_details.get("phone") or lead.phone,
+    "website": contact_details.get("website") or lead.website,
+    "summary": contact_details.get("notes") or lead.notes or f"{lead.businessName} is a local {lead.category} business.",
+    "targetCustomers": "Local customers",
+    "differentiators": [],
+    "serviceKeywords": [lead.category],
+    "imagePrompts": [],
+    "sourceNote": "Public Google Maps and website context. Gemini enrichment temporarily bypassed.",
+}
             log_event("info", "pipeline.lead.enriched", "Lead context enriched.", pipelineId=pipeline_id, leadKey=lead.leadKey)
             site_content = generate_site_content_with_groq(cleaned_context, template)
             log_event("info", "pipeline.lead.copy_generated", "Website copy generated.", pipelineId=pipeline_id, leadKey=lead.leadKey)
 
             try:
-                images = generate_gemini_images(
-                    cleaned_context.get("imagePrompts") or [],
-                    template.get("accent", "#0f766e"),
-                )
+                images = [
+    fallback_image_data_uri(
+        cleaned_context.get("businessName", lead.businessName),
+        template.get("accent", "#0f766e"),
+    )
+    for _ in range(5)
+]
             except Exception as image_error:
                 errors.append(f"Gemini image generation failed; fallback visuals used: {str(image_error)}")
                 log_event("warning", "pipeline.lead.images_fallback", "Image generation failed; using fallback visuals.", pipelineId=pipeline_id, leadKey=lead.leadKey, reason=str(image_error))
