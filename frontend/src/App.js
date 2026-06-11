@@ -58,7 +58,7 @@ const FALLBACK_TEMPLATES = [
 const MAX_UI_LOGS = 80;
 
 function App() {
-  const API_BASE = process.env.REACT_APP_API_BASE || "http://127.0.0.1:8000";
+  const API_BASE = process.env.REACT_APP_API_BASE || "http://127.0.0.1:8001";
   const shellRef = useRef(null);
   const flowRef = useRef(null);
 
