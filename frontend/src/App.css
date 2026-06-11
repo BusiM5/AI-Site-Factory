@@ -395,6 +395,14 @@ a:hover {
   font-size: 1rem;
 }
 
+.approval-preview {
+  width: 100%;
+  min-height: 340px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
 .approval-item small,
 .deployment-item span,
 .owner-row span,

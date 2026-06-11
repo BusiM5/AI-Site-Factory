@@ -275,6 +275,58 @@ def test_approval_deploys_existing_pipeline_output_and_syncs_zendesk(monkeypatch
     assert payload["deployment"]["url"] == "https://alpha.netlify.app"
     assert payload["zendesk"]["ticketUrl"].endswith("/123")
 
+    detail = client.get(f"/api/approvals/{approval_id}?includeHtml=true")
+    assert detail.status_code == 200
+    assert "<html>" in detail.json()["pendingPreviewHtml"]
+
+    run_detail = client.get(f"/api/pipeline/runs/{pipeline_response.json()['pipelineId']}")
+    assert run_detail.status_code == 200
+    steps = [step["step"] for step in run_detail.json()["steps"]]
+    assert "netlify_deploy" in steps
+    assert "groq_outreach" in steps
+    assert "zendesk_ticket" in steps
+
+    runs = client.get("/api/pipeline/runs").json()["runs"]
+    assert runs[0]["status"] == "COMPLETED"
+
+
+def test_update_lead_owner_updates_registry_and_pending_approval_context():
+    lead = main.DiscoveredLead(
+        leadKey="lead-owner",
+        canonicalLeadKey="canonical-owner",
+        businessName="Owner Test",
+        email="owner-test@example.com",
+        category="Restaurant",
+        location="Gauteng, South Africa",
+        province="Gauteng",
+    )
+    main.upsert_lead_registry(lead)
+    approval_id = main.create_approval_record(
+        pipeline_id="pipeline-owner",
+        canonical_key="canonical-owner",
+        lead_key="lead-owner",
+        business_name="Owner Test",
+        site_html="<!doctype html><html><body>Owner Test</body></html>",
+        context={"businessName": "Owner Test"},
+        site_content={"finalHtmlChecksum": "checksum"},
+        template={"id": "default-service"},
+    )
+
+    response = client.post(
+        "/api/leads/canonical-owner/owner",
+        json={"ownerName": "Ops Lead", "ownerEmail": "ops@example.com", "ownerStatus": "working"},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["ownerName"] == "Ops Lead"
+    assert payload["ownerEmail"] == "ops@example.com"
+    assert payload["ownerStatus"] == "working"
+
+    approval = client.get(f"/api/approvals/{approval_id}").json()
+    assert approval["context"]["ownerName"] == "Ops Lead"
+    assert approval["context"]["ownerEmail"] == "ops@example.com"
+
 
 def test_model_safe_value_chunks_large_text():
     payload = {"notes": "a" * 45}

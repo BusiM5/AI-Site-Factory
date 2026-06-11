@@ -515,6 +515,12 @@ class ApprovalActionResponse(BaseModel):
     errors: List[Dict[str, Any]] = Field(default_factory=list)
 
 
+class LeadOwnerUpdateRequest(BaseModel):
+    ownerName: Optional[str] = None
+    ownerEmail: Optional[str] = None
+    ownerStatus: Optional[str] = "assigned"
+
+
 class ApiProbeRequest(BaseModel):
     includeExternal: bool = False
     checks: List[str] = Field(default_factory=list)
@@ -1095,6 +1101,55 @@ def save_pipeline_run(
         )
 
 
+def refresh_pipeline_run_status_from_approvals(pipeline_id: str) -> None:
+    with get_pipeline_db() as db:
+        run = db.execute(
+            "SELECT * FROM pipeline_runs WHERE pipeline_id = ?",
+            (pipeline_id,),
+        ).fetchone()
+        if not run:
+            return
+
+        rows = db.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM approval_records
+            WHERE pipeline_id = ?
+            GROUP BY status
+            """,
+            (pipeline_id,),
+        ).fetchall()
+        counts = {row["status"]: row["count"] for row in rows}
+        pending_count = counts.get("PENDING", 0)
+        completed_count = counts.get("APPROVED", 0)
+        failed_count = (
+            counts.get("REJECTED", 0)
+            + counts.get("DEPLOY_FAILED", 0)
+            + counts.get("DEPLOYED_ZENDESK_FAILED", 0)
+        )
+        total = sum(counts.values())
+
+        if pending_count:
+            status = "PENDING_APPROVAL" if not completed_count and not failed_count else "PARTIAL_PENDING"
+        elif total and completed_count == total:
+            status = "COMPLETED"
+        elif completed_count:
+            status = "PARTIAL_FAILURE"
+        elif counts.get("SUPERSEDED", 0) == total and total:
+            status = "SUPERSEDED"
+        else:
+            status = "FAILED" if failed_count else run["status"]
+
+        db.execute(
+            """
+            UPDATE pipeline_runs
+            SET status = ?, updated_at = ?, completed_count = ?, pending_count = ?, failed_count = ?
+            WHERE pipeline_id = ?
+            """,
+            (status, now_iso(), completed_count, pending_count, failed_count, pipeline_id),
+        )
+
+
 def record_pipeline_step(
     pipeline_id: str,
     canonical_key: Optional[str],
@@ -1211,8 +1266,8 @@ def create_approval_record(
     return approval_id
 
 
-def approval_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
-    return {
+def approval_row_to_dict(row: sqlite3.Row, include_html: bool = False) -> Dict[str, Any]:
+    approval = {
         "approvalId": row["id"],
         "pipelineId": row["pipeline_id"],
         "canonicalLeadKey": row["canonical_lead_key"],
@@ -1220,6 +1275,7 @@ def approval_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "businessName": row["business_name"],
         "status": row["status"],
         "htmlChecksum": row["html_checksum"],
+        "previewAvailable": bool(row["html"]),
         "context": safe_json_loads(row["context_json"], {}),
         "siteContent": safe_json_loads(row["site_content_json"], {}),
         "outreachDraft": safe_json_loads(row["outreach_json"], None),
@@ -1232,6 +1288,9 @@ def approval_row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
         "zendesk": safe_json_loads(row["zendesk_json"], None),
         "errors": safe_json_loads(row["errors_json"], []),
     }
+    if include_html:
+        approval["pendingPreviewHtml"] = row["html"]
+    return approval
 
 
 def get_approval_or_404(approval_id: str) -> sqlite3.Row:
@@ -1306,7 +1365,7 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=210,
+        timeout=540,
     )
 
     if response.status_code == 400:
@@ -1331,7 +1390,7 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
                 "Content-Type": "application/json",
             },
             json=minimal_payload,
-            timeout=210,
+            timeout=540,
         )
 
     response.raise_for_status()
@@ -3252,6 +3311,141 @@ def list_approvals(status: Optional[str] = "PENDING", limit: int = 50):
     return {"approvals": [approval_row_to_dict(row) for row in rows], "count": len(rows)}
 
 
+@app.get("/api/approvals/{approval_id}")
+def get_approval_detail(approval_id: str, includeHtml: bool = True):
+    row = get_approval_or_404(approval_id)
+    return approval_row_to_dict(row, include_html=includeHtml)
+
+
+@app.post("/api/leads/{canonical_lead_key}/owner")
+def update_lead_owner(canonical_lead_key: str, request: LeadOwnerUpdateRequest):
+    owner_name = compact_text(request.ownerName) or None
+    owner_email = compact_text(request.ownerEmail).lower() or None
+    owner_status = compact_text(request.ownerStatus, "assigned")
+    assigned_at = now_iso() if owner_name or owner_email else None
+
+    with get_pipeline_db() as db:
+        existing = db.execute(
+            "SELECT canonical_lead_key FROM lead_registry WHERE canonical_lead_key = ?",
+            (canonical_lead_key,),
+        ).fetchone()
+        if not existing:
+            raise HTTPException(status_code=404, detail="Lead was not found in the registry.")
+
+        db.execute(
+            """
+            UPDATE lead_registry
+            SET owner_name = ?, owner_email = ?, owner_status = ?, assigned_at = ?, last_seen_at = ?
+            WHERE canonical_lead_key = ?
+            """,
+            (owner_name, owner_email, owner_status, assigned_at, now_iso(), canonical_lead_key),
+        )
+
+        approval_rows = db.execute(
+            """
+            SELECT id, context_json
+            FROM approval_records
+            WHERE canonical_lead_key = ? AND status = 'PENDING'
+            """,
+            (canonical_lead_key,),
+        ).fetchall()
+        for approval in approval_rows:
+            context = safe_json_loads(approval["context_json"], {})
+            context.update(
+                {
+                    "ownerName": owner_name,
+                    "ownerEmail": owner_email,
+                    "ownerStatus": owner_status,
+                }
+            )
+            db.execute(
+                "UPDATE approval_records SET context_json = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(context, default=str), now_iso(), approval["id"]),
+            )
+
+        updated = db.execute(
+            "SELECT * FROM lead_registry WHERE canonical_lead_key = ?",
+            (canonical_lead_key,),
+        ).fetchone()
+
+    log_event("info", "lead.owner.update", "Lead owner metadata updated.", canonicalLeadKey=canonical_lead_key, ownerEmail=owner_email, ownerStatus=owner_status)
+    return {
+        "canonicalLeadKey": updated["canonical_lead_key"],
+        "businessName": updated["business_name"],
+        "ownerName": updated["owner_name"],
+        "ownerEmail": updated["owner_email"],
+        "ownerStatus": updated["owner_status"],
+        "assignedAt": updated["assigned_at"],
+    }
+
+
+@app.get("/api/pipeline/runs")
+def list_pipeline_runs(limit: int = 30):
+    safe_limit = max(1, min(limit, 100))
+    with get_pipeline_db() as db:
+        rows = db.execute(
+            """
+            SELECT *
+            FROM pipeline_runs
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (safe_limit,),
+        ).fetchall()
+    return {
+        "runs": [
+            {
+                **dict(row),
+                "warnings": safe_json_loads(row["warnings_json"], []),
+            }
+            for row in rows
+        ],
+        "count": len(rows),
+    }
+
+
+@app.get("/api/pipeline/runs/{pipeline_id}")
+def get_pipeline_run_detail(pipeline_id: str):
+    with get_pipeline_db() as db:
+        run = db.execute(
+            "SELECT * FROM pipeline_runs WHERE pipeline_id = ?",
+            (pipeline_id,),
+        ).fetchone()
+        if not run:
+            raise HTTPException(status_code=404, detail="Pipeline run not found.")
+
+        steps = db.execute(
+            """
+            SELECT *
+            FROM pipeline_steps
+            WHERE pipeline_id = ?
+            ORDER BY started_at ASC
+            """,
+            (pipeline_id,),
+        ).fetchall()
+        approvals = db.execute(
+            """
+            SELECT *
+            FROM approval_records
+            WHERE pipeline_id = ?
+            ORDER BY created_at DESC
+            """,
+            (pipeline_id,),
+        ).fetchall()
+
+    return {
+        "run": {**dict(run), "warnings": safe_json_loads(run["warnings_json"], [])},
+        "steps": [
+            {
+                **dict(step),
+                "details": safe_json_loads(step["details_json"], {}),
+            }
+            for step in steps
+        ],
+        "approvals": [approval_row_to_dict(approval) for approval in approvals],
+    }
+
+
 @app.post("/api/approvals/{approval_id}/approve", response_model=ApprovalActionResponse)
 def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
     row = get_approval_or_404(approval_id)
@@ -3272,15 +3466,52 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
     if not site_html:
         raise HTTPException(status_code=409, detail="Approval record does not contain generated HTML.")
 
-    try:
-        deployment = deploy_site_to_netlify_for_lead(
-            canonical_key=row["canonical_lead_key"],
-            business_name=row["business_name"],
-            site_html=site_html,
+    def run_approval_step(step: str, provider: str, callback, retryable: bool = True):
+        started = now_iso()
+        try:
+            result = callback()
+        except Exception as step_error:
+            record_pipeline_step(
+                pipeline_id=row["pipeline_id"],
+                canonical_key=row["canonical_lead_key"],
+                step=step,
+                status="FAILED",
+                provider=provider,
+                message=str(step_error),
+                started_at=started,
+                finished_at=now_iso(),
+                retryable=retryable,
+                details={"approvalId": approval_id, "errorType": step_error.__class__.__name__},
+            )
+            raise
+
+        record_pipeline_step(
             pipeline_id=row["pipeline_id"],
-            approval_id=approval_id,
-            approved_by=approved_by,
-            regenerate_existing_site=request.regenerateExistingSite,
+            canonical_key=row["canonical_lead_key"],
+            step=step,
+            status="COMPLETED",
+            provider=provider,
+            message=f"{step} completed.",
+            started_at=started,
+            finished_at=now_iso(),
+            retryable=False,
+            details={"approvalId": approval_id},
+        )
+        return result
+
+    try:
+        deployment = run_approval_step(
+            "netlify_deploy",
+            "netlify",
+            lambda: deploy_site_to_netlify_for_lead(
+                canonical_key=row["canonical_lead_key"],
+                business_name=row["business_name"],
+                site_html=site_html,
+                pipeline_id=row["pipeline_id"],
+                approval_id=approval_id,
+                approved_by=approved_by,
+                regenerate_existing_site=request.regenerateExistingSite,
+            ),
         )
         with get_pipeline_db() as db:
             deployment_row = db.execute(
@@ -3302,15 +3533,24 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
                 """,
                 (status, now_iso(), approved_by, request.notes, json.dumps(errors, default=str), approval_id),
             )
+        refresh_pipeline_run_status_from_approvals(row["pipeline_id"])
         raise HTTPException(status_code=502, detail=f"Netlify deployment failed: {str(error)}")
 
     try:
-        outreach = generate_outreach_with_groq(context, deployment.get("url", ""))
-        zendesk = create_zendesk_outreach_ticket(
-            context,
-            deployment,
-            outreach,
-            row["pipeline_id"],
+        outreach = run_approval_step(
+            "groq_outreach",
+            "groq",
+            lambda: generate_outreach_with_groq(context, deployment.get("url", "")),
+        )
+        zendesk = run_approval_step(
+            "zendesk_ticket",
+            "zendesk",
+            lambda: create_zendesk_outreach_ticket(
+                context,
+                deployment,
+                outreach,
+                row["pipeline_id"],
+            ),
         )
     except Exception as error:
         status = "DEPLOYED_ZENDESK_FAILED"
@@ -3338,6 +3578,7 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
             ),
         )
 
+    refresh_pipeline_run_status_from_approvals(row["pipeline_id"])
     log_event(
         "info",
         "approval.approve.finish",
@@ -3380,6 +3621,7 @@ def reject_generated_site(approval_id: str, request: ApprovalActionRequest):
             (now_iso(), rejected_by, notes, approval_id),
         )
 
+    refresh_pipeline_run_status_from_approvals(row["pipeline_id"])
     log_event("info", "approval.reject.finish", "Approval rejected.", approvalId=approval_id, rejectedBy=rejected_by)
     return ApprovalActionResponse(
         approvalId=approval_id,
@@ -3413,10 +3655,55 @@ def regenerate_generated_site(approval_id: str, request: ApprovalActionRequest):
         created_at=created_at,
     )
 
+    def run_regenerate_step(step: str, provider: str, callback):
+        started = now_iso()
+        try:
+            result = callback()
+        except Exception as step_error:
+            record_pipeline_step(
+                pipeline_id=pipeline_id,
+                canonical_key=row["canonical_lead_key"],
+                step=step,
+                status="FAILED",
+                provider=provider,
+                message=str(step_error),
+                started_at=started,
+                finished_at=now_iso(),
+                retryable=True,
+                details={"sourceApprovalId": approval_id, "errorType": step_error.__class__.__name__},
+            )
+            raise
+
+        record_pipeline_step(
+            pipeline_id=pipeline_id,
+            canonical_key=row["canonical_lead_key"],
+            step=step,
+            status="COMPLETED",
+            provider=provider,
+            message=f"{step} completed.",
+            started_at=started,
+            finished_at=now_iso(),
+            retryable=False,
+            details={"sourceApprovalId": approval_id},
+        )
+        return result
+
     try:
-        page_prompt = generate_page_prompt_with_gemini(context, template)
-        groq_draft = generate_draft_html_with_groq(context, template, page_prompt)
-        final_html_result = finalize_html_with_gemini(context, template, page_prompt, groq_draft["html"])
+        page_prompt = run_regenerate_step(
+            "gemini_page_prompt",
+            "gemini",
+            lambda: generate_page_prompt_with_gemini(context, template),
+        )
+        groq_draft = run_regenerate_step(
+            "groq_draft_html",
+            "groq",
+            lambda: generate_draft_html_with_groq(context, template, page_prompt),
+        )
+        final_html_result = run_regenerate_step(
+            "gemini_final_html",
+            "gemini",
+            lambda: finalize_html_with_gemini(context, template, page_prompt, groq_draft["html"]),
+        )
         final_html = final_html_result["html"]
         site_content = {
             "pagePrompt": page_prompt,
@@ -3446,6 +3733,7 @@ def regenerate_generated_site(approval_id: str, request: ApprovalActionRequest):
                 """,
                 (now_iso(), f"Regenerated by {requested_by}. New approval: {new_approval_id}", approval_id),
             )
+        refresh_pipeline_run_status_from_approvals(row["pipeline_id"])
         save_pipeline_run(
             pipeline_id=pipeline_id,
             status="PENDING_APPROVAL",
@@ -3458,6 +3746,7 @@ def regenerate_generated_site(approval_id: str, request: ApprovalActionRequest):
             warnings=[],
             created_at=created_at,
         )
+        refresh_pipeline_run_status_from_approvals(pipeline_id)
     except Exception as error:
         step_errors.append(structured_pipeline_error("regenerate_html", error, provider=None, retryable=True))
         save_pipeline_run(
@@ -3514,6 +3803,10 @@ def get_reporting_summary():
         approved_deployments = db.execute("SELECT COUNT(*) AS count FROM deployment_history").fetchone()["count"]
         failed_steps = db.execute("SELECT COUNT(*) AS count FROM pipeline_steps WHERE status = 'FAILED'").fetchone()["count"]
         zendesk_tickets = db.execute("SELECT COUNT(*) AS count FROM approval_records WHERE zendesk_json IS NOT NULL").fetchone()["count"]
+        pipeline_runs = db.execute("SELECT COUNT(*) AS count FROM pipeline_runs").fetchone()["count"]
+        active_pipeline_runs = db.execute(
+            "SELECT COUNT(*) AS count FROM pipeline_runs WHERE status IN ('PROCESSING', 'PENDING_APPROVAL', 'PARTIAL_PENDING')"
+        ).fetchone()["count"]
         owner_rows = db.execute(
             """
             SELECT
@@ -3542,6 +3835,8 @@ def get_reporting_summary():
             "approvedDeployments": approved_deployments,
             "failedSteps": failed_steps,
             "zendeskTickets": zendesk_tickets,
+            "pipelineRuns": pipeline_runs,
+            "activePipelineRuns": active_pipeline_runs,
         },
         "ownerPerformance": [dict(row) for row in owner_rows],
         "approvalStatus": {row["status"]: row["count"] for row in status_rows},

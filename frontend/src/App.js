@@ -81,10 +81,13 @@ function App() {
   const [pipelineResult, setPipelineResult] = useState(null);
   const [reportingSummary, setReportingSummary] = useState(null);
   const [approvals, setApprovals] = useState([]);
+  const [approvalPreviews, setApprovalPreviews] = useState({});
   const [deployments, setDeployments] = useState([]);
+  const [pipelineRuns, setPipelineRuns] = useState([]);
   const [discovering, setDiscovering] = useState(false);
   const [running, setRunning] = useState(false);
   const [approvalBusy, setApprovalBusy] = useState(null);
+  const [ownerBusy, setOwnerBusy] = useState(null);
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState("info");
   const [debugStatus, setDebugStatus] = useState(null);
@@ -180,14 +183,16 @@ function App() {
   const refreshOperations = useCallback(
     async (silent = false) => {
       try {
-        const [summaryResponse, approvalsResponse, deploymentsResponse] = await Promise.all([
+        const [summaryResponse, approvalsResponse, deploymentsResponse, runsResponse] = await Promise.all([
           axios.get(`${API_BASE}/api/reporting/summary`, { timeout: 15000 }),
           axios.get(`${API_BASE}/api/approvals?status=ALL&limit=50`, { timeout: 15000 }),
           axios.get(`${API_BASE}/api/deployments/history?limit=50`, { timeout: 15000 }),
+          axios.get(`${API_BASE}/api/pipeline/runs?limit=20`, { timeout: 15000 }),
         ]);
         setReportingSummary(summaryResponse.data);
         setApprovals(approvalsResponse.data.approvals || []);
         setDeployments(deploymentsResponse.data.deployments || []);
+        setPipelineRuns(runsResponse.data.runs || []);
         if (!silent) {
           addUiLog("success", "operations.refresh", "Pipeline reporting refreshed.", {
             pendingApprovals: summaryResponse.data.metrics?.pendingApprovals || 0,
@@ -443,7 +448,7 @@ useEffect(() => {
           ownerEmail: ownerEmail || null,
           ownerStatus,
         },
-        { timeout: 240000 }
+        { timeout: 600000 }
       );
 
       setBatchId(data.batchId);
@@ -491,7 +496,7 @@ useEffect(() => {
           leads: selectedLeads,
           regenerateExistingSites: true,
         },
-        { timeout: 420000 }
+        { timeout: 600000 }
       );
 
       setPipelineResult(data);
@@ -589,6 +594,75 @@ useEffect(() => {
       refreshDiagnostics(true);
     } finally {
       setApprovalBusy(null);
+    }
+  };
+
+  const previewApproval = async (approvalId) => {
+    if (approvalPreviews[approvalId]) {
+      setApprovalPreviews((current) => {
+        const next = { ...current };
+        delete next[approvalId];
+        return next;
+      });
+      return;
+    }
+
+    try {
+      setApprovalBusy(approvalId);
+      const data = await callApi(
+        "Approval Preview API",
+        "get",
+        `/api/approvals/${approvalId}?includeHtml=true`,
+        null,
+        { timeout: 60000 }
+      );
+      setApprovalPreviews((current) => ({
+        ...current,
+        [approvalId]: data.pendingPreviewHtml || "",
+      }));
+    } catch (error) {
+      const failure = formatApiError(error);
+      setNotice(failure.message || "Could not load approval preview.", "danger");
+    } finally {
+      setApprovalBusy(null);
+    }
+  };
+
+  const updateLeadOwner = async (lead) => {
+    const canonicalKey = lead.canonicalLeadKey || lead.leadKey;
+    try {
+      setOwnerBusy(canonicalKey);
+      const data = await callApi(
+        "Lead Owner API",
+        "post",
+        `/api/leads/${canonicalKey}/owner`,
+        {
+          ownerName: ownerName || null,
+          ownerEmail: ownerEmail || null,
+          ownerStatus,
+        },
+        { timeout: 60000 }
+      );
+      setLeads((current) =>
+        current.map((item) =>
+          (item.canonicalLeadKey || item.leadKey) === canonicalKey
+            ? {
+                ...item,
+                ownerName: data.ownerName,
+                ownerEmail: data.ownerEmail,
+                ownerStatus: data.ownerStatus,
+                assignedAt: data.assignedAt,
+              }
+            : item
+        )
+      );
+      setNotice(`Owner updated for ${data.businessName}.`, "success");
+      refreshOperations(true);
+    } catch (error) {
+      const failure = formatApiError(error);
+      setNotice(failure.message || "Owner update failed.", "danger");
+    } finally {
+      setOwnerBusy(null);
     }
   };
 
@@ -1002,6 +1076,14 @@ useEffect(() => {
                       <span>{reportingSummary.metrics.failedSteps || 0}</span>
                       <strong>Failed Steps</strong>
                     </div>
+                    <div className="report-card">
+                      <span>{reportingSummary.metrics.pipelineRuns || 0}</span>
+                      <strong>Pipeline Runs</strong>
+                    </div>
+                    <div className="report-card">
+                      <span>{reportingSummary.metrics.activePipelineRuns || 0}</span>
+                      <strong>Active Runs</strong>
+                    </div>
                   </div>
                 )}
 
@@ -1129,6 +1211,14 @@ useEffect(() => {
                         <td>
                           <span>{lead.ownerName || "Unassigned"}</span>
                           <span className="d-block text-secondary small">{lead.ownerStatus || lead.ownerEmail || "No owner status"}</span>
+                          <button
+                            className="btn btn-link btn-sm p-0"
+                            type="button"
+                            onClick={() => updateLeadOwner(lead)}
+                            disabled={ownerBusy === (lead.canonicalLeadKey || lead.leadKey)}
+                          >
+                            {ownerBusy === (lead.canonicalLeadKey || lead.leadKey) ? "Saving..." : "Assign"}
+                          </button>
                         </td>
                         <td>{lead.category}</td>
                         <td>{lead.rating ? `${lead.rating} (${lead.reviewsCount || 0})` : "N/A"}</td>
@@ -1319,6 +1409,14 @@ useEffect(() => {
                         {approval.status === "PENDING" && (
                           <div className="d-flex flex-wrap gap-2">
                             <button
+                              className="btn btn-outline-secondary btn-sm"
+                              type="button"
+                              onClick={() => previewApproval(approval.approvalId)}
+                              disabled={approvalBusy === approval.approvalId || !approval.previewAvailable}
+                            >
+                              {approvalPreviews[approval.approvalId] ? "Hide Preview" : "Preview"}
+                            </button>
+                            <button
                               className="btn btn-success btn-sm"
                               type="button"
                               onClick={() => approveSite(approval.approvalId)}
@@ -1343,6 +1441,13 @@ useEffect(() => {
                               Reject
                             </button>
                           </div>
+                        )}
+                        {approvalPreviews[approval.approvalId] && (
+                          <iframe
+                            className="approval-preview"
+                            title={`Preview ${approval.businessName}`}
+                            srcDoc={approvalPreviews[approval.approvalId]}
+                          />
                         )}
                         {approval.zendesk?.ticketUrl && (
                           <a href={approval.zendesk.ticketUrl} target="_blank" rel="noreferrer">
@@ -1387,6 +1492,30 @@ useEffect(() => {
                   <div className="empty-state compact">
                     <h3>No deployments</h3>
                     <p>Approvals create or redeploy lead-owned Netlify sites.</p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="card control-card mb-4 entry-animate">
+              <div className="card-header bg-white border-0 pb-0">
+                <h2 className="h5 mb-1">Recent Pipeline Runs</h2>
+                <p className="text-secondary mb-0">Generation and approval status over time.</p>
+              </div>
+              <div className="card-body">
+                {pipelineRuns.length > 0 ? (
+                  <div className="owner-list">
+                    {pipelineRuns.slice(0, 8).map((run) => (
+                      <div className="owner-row" key={run.pipeline_id}>
+                        <strong>{run.status}</strong>
+                        <span>{run.pending_count || 0} pending | {run.completed_count || 0} complete | {run.failed_count || 0} failed</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="empty-state compact">
+                    <h3>No pipeline runs</h3>
+                    <p>Generated pages will appear here after the first run.</p>
                   </div>
                 )}
               </div>

@@ -25,7 +25,10 @@ This project is an end-to-end automation system that collects business data, cle
 - `GET /api/templates` returns the three landing-page templates.
 - `POST /api/leads/discover` searches Apify Google Maps across all nine South African provinces, normalizes leads, stores canonical lead keys, and skips previously seen leads.
 - `POST /api/pipeline/run` generates final HTML through Gemini -> Groq -> Gemini and stores the result as `PENDING_APPROVAL`.
+- `GET /api/pipeline/runs` and `GET /api/pipeline/runs/{pipeline_id}` expose recent run status and step history.
+- `POST /api/leads/{canonical_lead_key}/owner` updates lead ownership metadata without adding auth.
 - `GET /api/approvals` lists generated sites waiting for review.
+- `GET /api/approvals/{approval_id}` returns approval details and optional preview HTML.
 - `POST /api/approvals/{approval_id}/approve` deploys or redeploys the lead-owned Netlify site, records deployment history, and creates the current Zendesk outreach ticket.
 - `POST /api/approvals/{approval_id}/reject` rejects a generated site without deployment.
 - `POST /api/approvals/{approval_id}/regenerate` creates a fresh generated page for manual approval.

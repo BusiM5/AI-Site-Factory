@@ -69,6 +69,8 @@ const reportingSummary = {
     approvedDeployments: 1,
     failedSteps: 0,
     zendeskTickets: 1,
+    pipelineRuns: 1,
+    activePipelineRuns: 1,
   },
   ownerPerformance: [
     {
@@ -91,6 +93,7 @@ const approvalsPayload = {
       businessName: "Alpha Plumbing",
       status: "PENDING",
       htmlChecksum: "abc123",
+      previewAvailable: true,
       context: {
         province: "KwaZulu-Natal",
         location: "KwaZulu-Natal, South Africa",
@@ -108,6 +111,18 @@ const deploymentsPayload = {
       deploy_action: "CREATED",
       state: "ready",
       url: "https://alpha.netlify.app",
+    },
+  ],
+};
+
+const pipelineRunsPayload = {
+  runs: [
+    {
+      pipeline_id: "pipeline-1",
+      status: "PENDING_APPROVAL",
+      pending_count: 1,
+      completed_count: 0,
+      failed_count: 0,
     },
   ],
 };
@@ -133,6 +148,7 @@ beforeEach(() => {
     if (url.includes("/api/reporting/summary")) return response(reportingSummary);
     if (url.includes("/api/approvals")) return response(approvalsPayload);
     if (url.includes("/api/deployments/history")) return response(deploymentsPayload);
+    if (url.includes("/api/pipeline/runs")) return response(pipelineRunsPayload);
     return response({});
   });
 
@@ -217,6 +233,24 @@ beforeEach(() => {
           ticketId: 123,
           ticketUrl: "https://example.zendesk.com/agent/tickets/123",
         },
+      });
+    }
+
+    if (method === "get" && url.includes("/api/approvals/approval-1")) {
+      return response({
+        ...approvalsPayload.approvals[0],
+        pendingPreviewHtml: "<!doctype html><html><body><h1>Alpha Plumbing</h1></body></html>",
+      });
+    }
+
+    if (method === "post" && url.includes("/api/leads/canonical-1/owner")) {
+      return response({
+        canonicalLeadKey: "canonical-1",
+        businessName: "Alpha Plumbing",
+        ownerName: "Ops",
+        ownerEmail: "ops@example.com",
+        ownerStatus: "working",
+        assignedAt: new Date().toISOString(),
       });
     }
 
@@ -333,6 +367,11 @@ test("discovers leads, selects one, runs pipeline, and approves deployment", asy
   expect(await screen.findByText("Alpha Plumbing")).toBeInTheDocument();
   expect(screen.getAllByText("KwaZulu-Natal").length).toBeGreaterThan(0);
 
+  fireEvent.click(screen.getByText("Assign"));
+  await waitFor(() => {
+    expect(screen.getByText(/Owner updated for Alpha Plumbing/i)).toBeInTheDocument();
+  });
+
   fireEvent.click(screen.getByLabelText("Select Alpha Plumbing"));
   fireEvent.click(screen.getByText("Run Pipeline"));
 
@@ -342,6 +381,11 @@ test("discovers leads, selects one, runs pipeline, and approves deployment", asy
 
   expect(screen.getAllByText("approval-1").length).toBeGreaterThan(0);
   expect(screen.getByText(/Step history/i)).toBeInTheDocument();
+
+  fireEvent.click(screen.getByText("Preview"));
+  await waitFor(() => {
+    expect(screen.getByTitle("Preview Alpha Plumbing")).toBeInTheDocument();
+  });
 
   fireEvent.click(screen.getByText("Approve"));
 
