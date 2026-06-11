@@ -267,6 +267,51 @@ a:hover {
   overflow-wrap: anywhere;
 }
 
+.province-grid,
+.report-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 0.65rem;
+}
+
+.province-card,
+.report-card {
+  display: grid;
+  gap: 0.25rem;
+  min-height: 82px;
+  padding: 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.province-card.total {
+  border-color: #fed7aa;
+  background: #fff7ed;
+}
+
+.province-card span,
+.report-card span {
+  color: var(--blue);
+  font-size: 1.3rem;
+  font-weight: 850;
+  line-height: 1;
+}
+
+.province-card small {
+  color: var(--muted);
+}
+
+.report-card strong {
+  color: var(--muted);
+  font-size: 0.76rem;
+  text-transform: uppercase;
+}
+
+.owner-filter {
+  min-width: 190px;
+}
+
 .probe-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
@@ -327,6 +372,65 @@ a:hover {
   font-size: 1rem;
 }
 
+.approval-list,
+.deployment-list,
+.owner-list,
+.step-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.approval-item,
+.deployment-item {
+  display: grid;
+  gap: 0.75rem;
+  padding: 0.9rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+}
+
+.approval-item h3 {
+  margin: 0;
+  font-size: 1rem;
+}
+
+.approval-item small,
+.deployment-item span,
+.owner-row span,
+.step-row small {
+  color: var(--muted);
+}
+
+.deployment-item {
+  grid-template-columns: 1fr;
+}
+
+.deployment-item a,
+.approval-item dd {
+  overflow-wrap: anywhere;
+}
+
+.owner-row,
+.step-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 0.65rem;
+  padding: 0.65rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.step-row {
+  grid-template-columns: auto 1fr;
+}
+
+.step-row small {
+  grid-column: 2;
+}
+
 dl {
   display: grid;
   gap: 0.65rem;
@@ -374,6 +478,10 @@ pre {
   border: 1px dashed #c7d2df;
   border-radius: 8px;
   background: #f8fafc;
+}
+
+.empty-state.compact {
+  min-height: 120px;
 }
 
 .empty-state h3 {

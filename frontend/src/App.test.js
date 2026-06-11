@@ -4,7 +4,10 @@ import App from "./App";
 
 jest.mock("axios");
 jest.mock("bootstrap", () => ({
-  Tooltip: jest.fn().mockImplementation(() => ({ dispose: jest.fn() })),
+  Tooltip: Object.assign(
+    jest.fn().mockImplementation(() => ({ dispose: jest.fn() })),
+    { getInstance: jest.fn(() => null) }
+  ),
 }));
 jest.mock("gsap", () => ({
   gsap: {
@@ -58,6 +61,57 @@ const debugLogs = {
   ],
 };
 
+const reportingSummary = {
+  metrics: {
+    leadsDiscovered: 1,
+    duplicatesSkipped: 0,
+    pendingApprovals: 1,
+    approvedDeployments: 1,
+    failedSteps: 0,
+    zendeskTickets: 1,
+  },
+  ownerPerformance: [
+    {
+      ownerName: "Ops",
+      ownerEmail: "ops@example.com",
+      ownerStatus: "assigned",
+      leadCount: 1,
+    },
+  ],
+  approvalStatus: { PENDING: 1 },
+};
+
+const approvalsPayload = {
+  approvals: [
+    {
+      approvalId: "approval-1",
+      pipelineId: "pipeline-1",
+      canonicalLeadKey: "canonical-1",
+      leadKey: "lead-1",
+      businessName: "Alpha Plumbing",
+      status: "PENDING",
+      htmlChecksum: "abc123",
+      context: {
+        province: "KwaZulu-Natal",
+        location: "KwaZulu-Natal, South Africa",
+        ownerName: "Ops",
+      },
+    },
+  ],
+};
+
+const deploymentsPayload = {
+  deployments: [
+    {
+      id: "history-1",
+      site_name: "ai-site-alpha",
+      deploy_action: "CREATED",
+      state: "ready",
+      url: "https://alpha.netlify.app",
+    },
+  ],
+};
+
 const response = (data, status = 200) =>
   Promise.resolve({
     data,
@@ -76,6 +130,9 @@ beforeEach(() => {
   axios.get.mockImplementation((url) => {
     if (url.includes("/api/debug/status")) return response(debugStatus);
     if (url.includes("/api/debug/logs")) return response(debugLogs);
+    if (url.includes("/api/reporting/summary")) return response(reportingSummary);
+    if (url.includes("/api/approvals")) return response(approvalsPayload);
+    if (url.includes("/api/deployments/history")) return response(deploymentsPayload);
     return response({});
   });
 
@@ -91,13 +148,21 @@ beforeEach(() => {
     if (method === "post" && url.includes("/api/leads/discover")) {
       return response({
         batchId: "batch-1",
+        duplicatesSkipped: 0,
+        provinceStats: {
+          "KwaZulu-Natal": { selected: 1, duplicatesSkipped: 0 },
+        },
         leads: [
           {
             leadKey: "lead-1",
+            canonicalLeadKey: "canonical-1",
             businessName: "Alpha Plumbing",
             email: "alpha@example.com",
             category: "Plumbing",
-            location: "Durban",
+            location: "KwaZulu-Natal, South Africa",
+            province: "KwaZulu-Natal",
+            ownerName: "Ops",
+            ownerStatus: "assigned",
             sourceUrl: "https://maps.example.com/1",
           },
         ],
@@ -108,24 +173,50 @@ beforeEach(() => {
     if (method === "post" && url.includes("/api/pipeline/run")) {
       return response({
         pipelineId: "pipeline-1",
-        status: "COMPLETED",
+        status: "PENDING_APPROVAL",
         results: [
           {
             leadKey: "lead-1",
+            canonicalLeadKey: "canonical-1",
             businessName: "Alpha Plumbing",
-            status: "COMPLETED",
-            deployment: { url: "https://alpha.netlify.app" },
-            zendesk: {
-              ticketId: 123,
-              ticketUrl: "https://example.zendesk.com/agent/tickets/123",
-            },
-            outreachDraft: {
-              subject: "Website preview for Alpha Plumbing",
-              body: "Please see https://alpha.netlify.app",
-            },
+            status: "PENDING_APPROVAL",
+            pipelineStatus: "PENDING_APPROVAL",
+            currentStep: "approval",
+            approvalStatus: "PENDING",
+            pendingApprovalId: "approval-1",
+            stepHistory: [
+              {
+                step: "gemini_page_prompt",
+                status: "COMPLETED",
+                provider: "gemini",
+                durationMs: 5,
+              },
+            ],
+            deployment: null,
+            zendesk: null,
             errors: [],
           },
         ],
+      });
+    }
+
+    if (method === "post" && url.includes("/api/approvals/approval-1/approve")) {
+      return response({
+        approvalId: "approval-1",
+        status: "APPROVED",
+        leadKey: "lead-1",
+        canonicalLeadKey: "canonical-1",
+        businessName: "Alpha Plumbing",
+        deployment: {
+          url: "https://alpha.netlify.app",
+          deployAction: "CREATED",
+          siteCreated: true,
+          siteReused: false,
+        },
+        zendesk: {
+          ticketId: 123,
+          ticketUrl: "https://example.zendesk.com/agent/tickets/123",
+        },
       });
     }
 
@@ -232,13 +323,15 @@ test("renders lead pipeline dashboard", async () => {
   expect(screen.getByText("Restaurants")).toBeInTheDocument();
   expect(screen.getAllByText("Default Service").length).toBeGreaterThan(0);
   expect(screen.getByText("API Safety Center")).toBeInTheDocument();
+  expect(screen.getByText("Approval Queue")).toBeInTheDocument();
 });
 
-test("discovers leads, selects one, and runs pipeline", async () => {
+test("discovers leads, selects one, runs pipeline, and approves deployment", async () => {
   renderApp();
 
   fireEvent.click(await screen.findByText("Search Leads"));
   expect(await screen.findByText("Alpha Plumbing")).toBeInTheDocument();
+  expect(screen.getAllByText("KwaZulu-Natal").length).toBeGreaterThan(0);
 
   fireEvent.click(screen.getByLabelText("Select Alpha Plumbing"));
   fireEvent.click(screen.getByText("Run Pipeline"));
@@ -247,8 +340,16 @@ test("discovers leads, selects one, and runs pipeline", async () => {
     expect(screen.getByText("pipeline-1")).toBeInTheDocument();
   });
 
+  expect(screen.getAllByText("approval-1").length).toBeGreaterThan(0);
+  expect(screen.getByText(/Step history/i)).toBeInTheDocument();
+
+  fireEvent.click(screen.getByText("Approve"));
+
+  await waitFor(() => {
+    expect(screen.getByText(/Approved and deployed Alpha Plumbing/i)).toBeInTheDocument();
+  });
+
   expect(screen.getByText("https://alpha.netlify.app")).toBeInTheDocument();
-  expect(screen.getByText("Ticket 123")).toBeInTheDocument();
 });
 
 test("runs safe local API flow debugger", async () => {

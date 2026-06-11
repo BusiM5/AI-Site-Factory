@@ -12,7 +12,7 @@ This project is an end-to-end automation system that collects business data, cle
 - Render(Deployment)
 - https://ai-site-factory-backend.onrender.com/docs
 ### Database
-- PostgreSQL(/SQLite)
+- SQLite-backed pipeline registry (`PIPELINE_DB_PATH`, defaults to `backend/data/pipeline.db`)
 
 ## AI Layer
 - Google GeminiAPI(Vertex AI)
@@ -23,11 +23,16 @@ This project is an end-to-end automation system that collects business data, cle
 ## Lead Pipeline API
 - `GET /api/presets` returns the five Google Maps business examples.
 - `GET /api/templates` returns the three landing-page templates.
-- `POST /api/leads/discover` runs the Apify Google Maps actor and returns normalized leads.
-- `POST /api/pipeline/run` enriches selected leads with Gemini, generates copy with GroqCloud, creates Gemini image assets, deploys production static sites to Netlify, and creates Zendesk outreach tickets.
+- `POST /api/leads/discover` searches Apify Google Maps across all nine South African provinces, normalizes leads, stores canonical lead keys, and skips previously seen leads.
+- `POST /api/pipeline/run` generates final HTML through Gemini -> Groq -> Gemini and stores the result as `PENDING_APPROVAL`.
+- `GET /api/approvals` lists generated sites waiting for review.
+- `POST /api/approvals/{approval_id}/approve` deploys or redeploys the lead-owned Netlify site, records deployment history, and creates the current Zendesk outreach ticket.
+- `POST /api/approvals/{approval_id}/reject` rejects a generated site without deployment.
+- `POST /api/approvals/{approval_id}/regenerate` creates a fresh generated page for manual approval.
+- `GET /api/reporting/summary` and `GET /api/deployments/history` power the dashboard metrics and audit views.
 
 ## Environment
-Create `backend/.env` from `backend/.env.example`. Use rotated API tokens before production because the original tokens were shared outside a secret manager.
+Configure provider credentials in `backend/.env`. The example env file is intentionally not included because this project uses real provider tokens locally; keep secrets out of source control and rotate any credential that was shared outside a secret manager.
 ## CRM Tracking
 - Zendesk API
 

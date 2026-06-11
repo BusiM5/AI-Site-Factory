@@ -66,15 +66,25 @@ function App() {
   const [templates, setTemplates] = useState(FALLBACK_TEMPLATES);
   const [selectedPresetId, setSelectedPresetId] = useState("restaurants");
   const [selectedTemplateId, setSelectedTemplateId] = useState("default-service");
-  const [location, setLocation] = useState("South Africa");
+  const [location] = useState("South Africa");
   const [customQuery, setCustomQuery] = useState("");
+  const [ownerName, setOwnerName] = useState("");
+  const [ownerEmail, setOwnerEmail] = useState("");
+  const [ownerStatus, setOwnerStatus] = useState("unassigned");
+  const [ownerFilter, setOwnerFilter] = useState("all");
   const [batchId, setBatchId] = useState(null);
   const [leads, setLeads] = useState([]);
   const [selectedLeadKeys, setSelectedLeadKeys] = useState([]);
   const [warnings, setWarnings] = useState([]);
+  const [provinceStats, setProvinceStats] = useState({});
+  const [duplicatesSkipped, setDuplicatesSkipped] = useState(0);
   const [pipelineResult, setPipelineResult] = useState(null);
+  const [reportingSummary, setReportingSummary] = useState(null);
+  const [approvals, setApprovals] = useState([]);
+  const [deployments, setDeployments] = useState([]);
   const [discovering, setDiscovering] = useState(false);
   const [running, setRunning] = useState(false);
+  const [approvalBusy, setApprovalBusy] = useState(null);
   const [message, setMessage] = useState("");
   const [messageTone, setMessageTone] = useState("info");
   const [debugStatus, setDebugStatus] = useState(null);
@@ -167,6 +177,32 @@ function App() {
     [API_BASE, addUiLog, formatApiError]
   );
 
+  const refreshOperations = useCallback(
+    async (silent = false) => {
+      try {
+        const [summaryResponse, approvalsResponse, deploymentsResponse] = await Promise.all([
+          axios.get(`${API_BASE}/api/reporting/summary`, { timeout: 15000 }),
+          axios.get(`${API_BASE}/api/approvals?status=ALL&limit=50`, { timeout: 15000 }),
+          axios.get(`${API_BASE}/api/deployments/history?limit=50`, { timeout: 15000 }),
+        ]);
+        setReportingSummary(summaryResponse.data);
+        setApprovals(approvalsResponse.data.approvals || []);
+        setDeployments(deploymentsResponse.data.deployments || []);
+        if (!silent) {
+          addUiLog("success", "operations.refresh", "Pipeline reporting refreshed.", {
+            pendingApprovals: summaryResponse.data.metrics?.pendingApprovals || 0,
+          });
+        }
+      } catch (error) {
+        const failure = formatApiError(error);
+        if (!silent) {
+          addUiLog("danger", "operations.refresh_failed", `Reporting refresh failed: ${failure.message}`, failure);
+        }
+      }
+    },
+    [API_BASE, addUiLog, formatApiError]
+  );
+
   useEffect(() => {
     const loadConfig = async () => {
       try {
@@ -185,12 +221,16 @@ function App() {
 
     loadConfig();
     refreshDiagnostics(true);
-  }, [callApi, refreshDiagnostics, setNotice]);
+    refreshOperations(true);
+  }, [callApi, refreshDiagnostics, refreshOperations, setNotice]);
 
   useEffect(() => {
-    const interval = setInterval(() => refreshDiagnostics(true), 7000);
+    const interval = setInterval(() => {
+      refreshDiagnostics(true);
+      refreshOperations(true);
+    }, 7000);
     return () => clearInterval(interval);
-  }, [refreshDiagnostics]);
+  }, [refreshDiagnostics, refreshOperations]);
 
   useEffect(() => {
     if (!shellRef.current) return undefined;
@@ -223,10 +263,29 @@ function App() {
     [leads, selectedLeadKeys]
   );
 
-  const completedCount =
-    pipelineResult?.results?.filter((result) =>
-      result.status?.startsWith("COMPLETED")
-    ).length || 0;
+  const filteredLeads = useMemo(() => {
+    if (ownerFilter === "all") return leads;
+    if (ownerFilter === "unassigned") {
+      return leads.filter((lead) => !lead.ownerName && !lead.ownerEmail);
+    }
+    return leads.filter((lead) => (lead.ownerEmail || lead.ownerName || "").toLowerCase() === ownerFilter);
+  }, [leads, ownerFilter]);
+
+  const ownerFilterOptions = useMemo(() => {
+    const owners = new Map();
+    leads.forEach((lead) => {
+      const value = (lead.ownerEmail || lead.ownerName || "").toLowerCase();
+      if (value) {
+        owners.set(value, lead.ownerName || lead.ownerEmail);
+      }
+    });
+    return Array.from(owners.entries()).map(([value, label]) => ({ value, label }));
+  }, [leads]);
+
+  const pendingApprovalCount =
+    pipelineResult?.results?.filter((result) => result.status === "PENDING_APPROVAL").length ||
+    approvals.filter((approval) => approval.status === "PENDING").length ||
+    0;
 
   const failedCount =
     pipelineResult?.results?.filter((result) => result.status === "FAILED").length || 0;
@@ -253,24 +312,24 @@ function App() {
       },
       {
         key: "pipeline",
-        label: "Pipeline",
+        label: "Generate",
         detail: running ? "Models active" : pipelineResult?.status || "Not run",
         state: running ? "active" : pipelineResult ? (failedCount ? "danger" : "complete") : "idle",
       },
       {
-        key: "deploy",
-        label: "Deploy",
-        detail: completedCount ? "Sites created" : "Pending",
-        state: completedCount ? "complete" : running ? "active" : "idle",
+        key: "approval",
+        label: "Approval",
+        detail: pendingApprovalCount ? `${pendingApprovalCount} pending` : "Waiting",
+        state: pendingApprovalCount ? "warning" : approvals.length ? "complete" : "idle",
       },
       {
-        key: "outreach",
-        label: "Outreach",
-        detail: completedCount ? "Tickets/drafts ready" : "Pending",
-        state: completedCount ? "complete" : running ? "active" : "idle",
+        key: "deploy",
+        label: "Deploy",
+        detail: deployments.length ? `${deployments.length} deploys` : "After approval",
+        state: deployments.length ? "complete" : approvalBusy ? "active" : "idle",
       },
     ],
-    [completedCount, debugStatus, discovering, failedCount, leads.length, pipelineResult, running, selectedLeads.length]
+    [approvalBusy, approvals.length, debugStatus, deployments.length, discovering, failedCount, leads.length, pendingApprovalCount, pipelineResult, running, selectedLeads.length]
   );
 
   useEffect(() => {
@@ -347,8 +406,8 @@ useEffect(() => {
   };
 
   const selectAllLeads = () => {
-    setSelectedLeadKeys(leads.map((lead) => lead.leadKey));
-    addUiLog("info", "leads.select_all", "All loaded leads selected.", { count: leads.length });
+    setSelectedLeadKeys(filteredLeads.map((lead) => lead.leadKey));
+    addUiLog("info", "leads.select_all", "Visible leads selected.", { count: filteredLeads.length });
   };
 
   const clearSelectedLeads = () => {
@@ -366,8 +425,10 @@ useEffect(() => {
       setDiscovering(true);
       setPipelineResult(null);
       setWarnings([]);
+      setProvinceStats({});
+      setDuplicatesSkipped(0);
       setSelectedLeadKeys([]);
-      setNotice("Searching Google Maps with Apify...", "info");
+      setNotice("Searching Google Maps with Apify across all South African provinces...", "info");
 
       const data = await callApi(
         "Lead Discovery API",
@@ -375,9 +436,12 @@ useEffect(() => {
         "/api/leads/discover",
         {
           presetId: selectedPreset.id,
-          location,
+          location: "South Africa",
           query: customQuery || null,
           limit: 10,
+          ownerName: ownerName || null,
+          ownerEmail: ownerEmail || null,
+          ownerStatus,
         },
         { timeout: 240000 }
       );
@@ -385,12 +449,20 @@ useEffect(() => {
       setBatchId(data.batchId);
       setLeads(data.leads || []);
       setWarnings(data.warnings || []);
-      setNotice(`Fetched ${data.leads?.length || 0} leads.`, data.leads?.length ? "success" : "warning");
+      setProvinceStats(data.provinceStats || {});
+      setDuplicatesSkipped(data.duplicatesSkipped || 0);
+      setNotice(
+        `Fetched ${data.leads?.length || 0} new South African leads. Skipped ${data.duplicatesSkipped || 0} duplicates.`,
+        data.leads?.length ? "success" : "warning"
+      );
       refreshDiagnostics(true);
+      refreshOperations(true);
     } catch (error) {
       const failure = formatApiError(error);
       setLeads([]);
       setBatchId(null);
+      setProvinceStats({});
+      setDuplicatesSkipped(0);
       setNotice(failure.message || "Lead discovery failed. Check backend provider settings.", "danger");
       refreshDiagnostics(true);
     } finally {
@@ -407,7 +479,7 @@ useEffect(() => {
     try {
       setRunning(true);
       setPipelineResult(null);
-      setNotice("Running enrichment, image generation, Netlify deployment, and Zendesk sync...", "info");
+      setNotice("Generating final HTML and preparing approvals. Deployment waits for manual approval.", "info");
 
       const data = await callApi(
         "Full Pipeline API",
@@ -417,19 +489,106 @@ useEffect(() => {
           sourceBatchId: batchId,
           templateId: selectedTemplate.id,
           leads: selectedLeads,
+          regenerateExistingSites: true,
         },
         { timeout: 420000 }
       );
 
       setPipelineResult(data);
-      setNotice(`Pipeline finished with status ${data.status}.`, data.status === "COMPLETED" ? "success" : "warning");
+      setNotice(
+        `Pipeline finished with status ${data.status}. Review pending approvals before deployment.`,
+        data.status === "PENDING_APPROVAL" ? "warning" : data.status === "COMPLETED" ? "success" : "warning"
+      );
       refreshDiagnostics(true);
+      refreshOperations(true);
     } catch (error) {
       const failure = formatApiError(error);
       setNotice(failure.message || "Pipeline run failed. Check debug logs for the failed provider.", "danger");
       refreshDiagnostics(true);
     } finally {
       setRunning(false);
+    }
+  };
+
+  const approveSite = async (approvalId) => {
+    try {
+      setApprovalBusy(approvalId);
+      setNotice("Approving site and deploying to Netlify...", "info");
+      const data = await callApi(
+        "Approval Deploy API",
+        "post",
+        `/api/approvals/${approvalId}/approve`,
+        {
+          approvedBy: ownerName || "Dashboard Operator",
+          notes: "Approved from dashboard.",
+          regenerateExistingSite: true,
+        },
+        { timeout: 420000 }
+      );
+      setNotice(
+        data.zendesk?.ticketUrl
+          ? `Approved and deployed ${data.businessName}. Zendesk ticket created.`
+          : `Approved and deployed ${data.businessName}. Zendesk needs review.`,
+        data.status === "APPROVED" ? "success" : "warning"
+      );
+      refreshDiagnostics(true);
+      refreshOperations(true);
+    } catch (error) {
+      const failure = formatApiError(error);
+      setNotice(failure.message || "Approval deployment failed.", "danger");
+      refreshDiagnostics(true);
+      refreshOperations(true);
+    } finally {
+      setApprovalBusy(null);
+    }
+  };
+
+  const rejectSite = async (approvalId) => {
+    try {
+      setApprovalBusy(approvalId);
+      const data = await callApi(
+        "Approval Reject API",
+        "post",
+        `/api/approvals/${approvalId}/reject`,
+        {
+          rejectedBy: ownerName || "Dashboard Operator",
+          reason: "Rejected from dashboard.",
+        },
+        { timeout: 60000 }
+      );
+      setNotice(`Rejected ${data.businessName}.`, "warning");
+      refreshOperations(true);
+    } catch (error) {
+      const failure = formatApiError(error);
+      setNotice(failure.message || "Approval rejection failed.", "danger");
+    } finally {
+      setApprovalBusy(null);
+    }
+  };
+
+  const regenerateSite = async (approvalId) => {
+    try {
+      setApprovalBusy(approvalId);
+      setNotice("Regenerating HTML for manual approval...", "info");
+      const data = await callApi(
+        "Approval Regenerate API",
+        "post",
+        `/api/approvals/${approvalId}/regenerate`,
+        {
+          requestedBy: ownerName || "Dashboard Operator",
+          notes: "Regenerated from dashboard.",
+        },
+        { timeout: 420000 }
+      );
+      setNotice(`Regenerated ${data.businessName}. New approval is pending.`, "warning");
+      refreshDiagnostics(true);
+      refreshOperations(true);
+    } catch (error) {
+      const failure = formatApiError(error);
+      setNotice(failure.message || "Regeneration failed.", "danger");
+      refreshDiagnostics(true);
+    } finally {
+      setApprovalBusy(null);
     }
   };
 
@@ -567,12 +726,12 @@ useEffect(() => {
                 <label>Queued</label>
               </div>
               <div className="metric-card">
-                <span>{completedCount}</span>
-                <label>Complete</label>
+                <span>{pendingApprovalCount}</span>
+                <label>Pending</label>
               </div>
               <div className="metric-card">
-                <span>{backendLogs.length}</span>
-                <label>Logs</label>
+                <span>{deployments.length || reportingSummary?.metrics?.approvedDeployments || 0}</span>
+                <label>Deploys</label>
               </div>
             </div>
           </div>
@@ -638,12 +797,13 @@ useEffect(() => {
 
                 <div className="row g-3 mt-1">
                   <div className="col-md-6">
-                    <label className="form-label">Location</label>
+                    <label className="form-label">Discovery region</label>
                     <input
                       className="form-control"
                       value={location}
-                      onChange={(event) => setLocation(event.target.value)}
-                      placeholder="South Africa"
+                      readOnly
+                      data-bs-toggle="tooltip"
+                      title="Searches all nine South African provinces and filters out non-South African results."
                     />
                   </div>
                   <div className="col-md-6">
@@ -671,12 +831,67 @@ useEffect(() => {
                       ))}
                     </select>
                   </div>
+                  <div className="col-md-4">
+                    <label className="form-label">Owner name</label>
+                    <input
+                      className="form-control"
+                      value={ownerName}
+                      onChange={(event) => setOwnerName(event.target.value)}
+                      placeholder="Optional owner"
+                    />
+                  </div>
+                  <div className="col-md-4">
+                    <label className="form-label">Owner email</label>
+                    <input
+                      className="form-control"
+                      value={ownerEmail}
+                      onChange={(event) => setOwnerEmail(event.target.value)}
+                      placeholder="owner@example.com"
+                    />
+                  </div>
+                  <div className="col-md-4">
+                    <label className="form-label">Owner status</label>
+                    <select
+                      className="form-select"
+                      value={ownerStatus}
+                      onChange={(event) => setOwnerStatus(event.target.value)}
+                    >
+                      <option value="unassigned">Unassigned</option>
+                      <option value="assigned">Assigned</option>
+                      <option value="working">Working</option>
+                      <option value="ready-for-review">Ready for review</option>
+                    </select>
+                  </div>
                 </div>
 
                 <div className="template-callout mt-3">
                   <strong>{selectedTemplate?.name}</strong>
                   <span>{selectedTemplate?.description}</span>
                 </div>
+
+                <div className="template-callout mt-3">
+                  <strong>All provinces active</strong>
+                  <span>
+                    Eastern Cape, Free State, Gauteng, KwaZulu-Natal, Limpopo, Mpumalanga, Northern Cape, North West, and Western Cape.
+                  </span>
+                </div>
+
+                {(Object.keys(provinceStats).length > 0 || duplicatesSkipped > 0) && (
+                  <div className="province-grid mt-3">
+                    {Object.entries(provinceStats).map(([province, stats]) => (
+                      <div className="province-card" key={province}>
+                        <strong>{province}</strong>
+                        <span>{stats.selected || 0} selected</span>
+                        <small>{stats.duplicatesSkipped || 0} duplicates skipped</small>
+                      </div>
+                    ))}
+                    <div className="province-card total">
+                      <strong>Duplicates</strong>
+                      <span>{duplicatesSkipped}</span>
+                      <small>Skipped across stored history</small>
+                    </div>
+                  </div>
+                )}
 
                 {warnings.length > 0 && (
                   <div className="alert alert-warning mt-3 mb-0">
@@ -708,6 +923,9 @@ useEffect(() => {
                 <div className="d-flex flex-wrap gap-2 mb-3">
                   <button className="btn btn-outline-secondary" onClick={() => refreshDiagnostics(false)}>
                     Refresh Diagnostics
+                  </button>
+                  <button className="btn btn-outline-secondary" onClick={() => refreshOperations(false)}>
+                    Refresh Reporting
                   </button>
                   <button
                     className="btn btn-outline-primary"
@@ -758,6 +976,35 @@ useEffect(() => {
                   ))}
                 </div>
 
+                {reportingSummary?.metrics && (
+                  <div className="report-grid mt-3">
+                    <div className="report-card">
+                      <span>{reportingSummary.metrics.leadsDiscovered || 0}</span>
+                      <strong>Stored Leads</strong>
+                    </div>
+                    <div className="report-card">
+                      <span>{reportingSummary.metrics.duplicatesSkipped || 0}</span>
+                      <strong>Duplicates Skipped</strong>
+                    </div>
+                    <div className="report-card">
+                      <span>{reportingSummary.metrics.pendingApprovals || 0}</span>
+                      <strong>Pending Approvals</strong>
+                    </div>
+                    <div className="report-card">
+                      <span>{reportingSummary.metrics.approvedDeployments || 0}</span>
+                      <strong>Deployments</strong>
+                    </div>
+                    <div className="report-card">
+                      <span>{reportingSummary.metrics.zendeskTickets || 0}</span>
+                      <strong>Zendesk Tickets</strong>
+                    </div>
+                    <div className="report-card">
+                      <span>{reportingSummary.metrics.failedSteps || 0}</span>
+                      <strong>Failed Steps</strong>
+                    </div>
+                  </div>
+                )}
+
                 {(apiProbe || manualFlow) && (
                   <div className="debug-output mt-3">
                     {apiProbe && (
@@ -805,9 +1052,25 @@ useEffect(() => {
             <div className="d-flex flex-column flex-lg-row align-items-lg-start justify-content-between gap-3">
               <div>
                 <h2 className="h5 mb-1">Leads</h2>
-                <p className="text-secondary mb-0">{batchId ? `Batch ${batchId}` : "No batch loaded"}</p>
+                <p className="text-secondary mb-0">
+                  {batchId ? `Batch ${batchId}` : "No batch loaded"} {duplicatesSkipped ? `| ${duplicatesSkipped} duplicates skipped` : ""}
+                </p>
               </div>
               <div className="d-flex flex-wrap gap-2">
+                <select
+                  className="form-select owner-filter"
+                  value={ownerFilter}
+                  onChange={(event) => setOwnerFilter(event.target.value)}
+                  aria-label="Filter leads by owner"
+                >
+                  <option value="all">All owners</option>
+                  <option value="unassigned">Unassigned</option>
+                  {ownerFilterOptions.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
                 <button className="btn btn-outline-secondary" type="button" onClick={selectAllLeads} disabled={!leads.length}>
                   Select All
                 </button>
@@ -819,7 +1082,7 @@ useEffect(() => {
                   onClick={runPipeline}
                   disabled={running || !selectedLeads.length}
                   data-bs-toggle="tooltip"
-                  title="Runs enrichment, copy generation, image generation, Netlify deployment, Groq outreach, and Zendesk ticket creation."
+                  title="Runs Gemini and Groq generation, then stores final HTML for manual approval before deployment."
                 >
                   {running ? "Running..." : "Run Pipeline"}
                 </button>
@@ -827,7 +1090,7 @@ useEffect(() => {
             </div>
           </div>
           <div className="card-body">
-            {leads.length > 0 ? (
+            {filteredLeads.length > 0 ? (
               <div className="table-responsive data-table-wrap">
                 <table className="table align-middle mb-0">
                   <thead>
@@ -835,13 +1098,15 @@ useEffect(() => {
                       <th>Select</th>
                       <th>Business</th>
                       <th>Contact</th>
+                      <th>Province</th>
+                      <th>Owner</th>
                       <th>Category</th>
                       <th>Rating</th>
                       <th>Source</th>
                     </tr>
                   </thead>
                   <tbody>
-                    {leads.map((lead) => (
+                    {filteredLeads.map((lead) => (
                       <tr key={lead.leadKey}>
                         <td>
                           <input
@@ -859,6 +1124,11 @@ useEffect(() => {
                         <td>
                           <span>{lead.email || "No email yet"}</span>
                           <span className="d-block text-secondary small">{lead.phone || lead.domain || "No phone yet"}</span>
+                        </td>
+                        <td>{lead.province || "South Africa"}</td>
+                        <td>
+                          <span>{lead.ownerName || "Unassigned"}</span>
+                          <span className="d-block text-secondary small">{lead.ownerStatus || lead.ownerEmail || "No owner status"}</span>
                         </td>
                         <td>{lead.category}</td>
                         <td>{lead.rating ? `${lead.rating} (${lead.reviewsCount || 0})` : "N/A"}</td>
@@ -908,7 +1178,7 @@ useEffect(() => {
                       <article className="result-card processing" key={lead.leadKey}>
                         <span className="badge text-bg-primary">PROCESSING</span>
                         <h3>{lead.businessName}</h3>
-                        <p>Queued for enrichment, deployment, outreach, and Zendesk sync.</p>
+                        <p>Queued for Gemini/Groq generation and manual approval.</p>
                       </article>
                     ))}
                   </div>
@@ -924,6 +1194,20 @@ useEffect(() => {
                         </div>
 
                         <dl>
+                          <div>
+                            <dt>Approval</dt>
+                            <dd>
+                              {result.pendingApprovalId ? (
+                                <span>{result.approvalStatus || "PENDING"} | {result.pendingApprovalId}</span>
+                              ) : (
+                                result.approvalStatus || "No approval"
+                              )}
+                            </dd>
+                          </div>
+                          <div>
+                            <dt>Current step</dt>
+                            <dd>{result.currentStep || result.pipelineStatus || result.status}</dd>
+                          </div>
                           <div>
                             <dt>Netlify</dt>
                             <dd>
@@ -949,6 +1233,21 @@ useEffect(() => {
                             </dd>
                           </div>
                         </dl>
+
+                        {result.stepHistory?.length > 0 && (
+                          <details>
+                            <summary>Step history</summary>
+                            <div className="step-list">
+                              {result.stepHistory.map((step, index) => (
+                                <div className="step-row" key={`${step.step}-${index}`}>
+                                  <span className={`badge ${statusBadgeClass(step.status)}`}>{step.status}</span>
+                                  <strong>{step.step}</strong>
+                                  <small>{step.provider || "local"} | {step.durationMs} ms</small>
+                                </div>
+                              ))}
+                            </div>
+                          </details>
+                        )}
 
                         {result.outreachDraft && (
                           <details>
@@ -981,7 +1280,138 @@ useEffect(() => {
           </section>
 
           <section className="col-12 col-xl-5">
-            <div className="card control-card h-100 entry-animate">
+            <div className="card control-card mb-4 entry-animate">
+              <div className="card-header bg-white border-0 pb-0">
+                <div className="d-flex align-items-start justify-content-between gap-3">
+                  <div>
+                    <h2 className="h5 mb-1">Approval Queue</h2>
+                    <p className="text-secondary mb-0">Generated pages wait here before Netlify and Zendesk.</p>
+                  </div>
+                  <span className="badge text-bg-warning">{approvals.filter((approval) => approval.status === "PENDING").length} pending</span>
+                </div>
+              </div>
+              <div className="card-body">
+                {approvals.length > 0 ? (
+                  <div className="approval-list">
+                    {approvals.map((approval) => (
+                      <article className="approval-item" key={approval.approvalId}>
+                        <div className="d-flex align-items-start justify-content-between gap-2">
+                          <div>
+                            <h3>{approval.businessName}</h3>
+                            <small>{approval.context?.province || approval.context?.location || "South Africa"}</small>
+                          </div>
+                          <span className={`badge ${statusBadgeClass(approval.status)}`}>{approval.status}</span>
+                        </div>
+                        <dl>
+                          <div>
+                            <dt>Approval ID</dt>
+                            <dd>{approval.approvalId}</dd>
+                          </div>
+                          <div>
+                            <dt>Owner</dt>
+                            <dd>{approval.context?.ownerName || approval.context?.ownerEmail || "Unassigned"}</dd>
+                          </div>
+                          <div>
+                            <dt>Checksum</dt>
+                            <dd>{approval.htmlChecksum}</dd>
+                          </div>
+                        </dl>
+                        {approval.status === "PENDING" && (
+                          <div className="d-flex flex-wrap gap-2">
+                            <button
+                              className="btn btn-success btn-sm"
+                              type="button"
+                              onClick={() => approveSite(approval.approvalId)}
+                              disabled={approvalBusy === approval.approvalId}
+                            >
+                              {approvalBusy === approval.approvalId ? "Working..." : "Approve"}
+                            </button>
+                            <button
+                              className="btn btn-outline-primary btn-sm"
+                              type="button"
+                              onClick={() => regenerateSite(approval.approvalId)}
+                              disabled={approvalBusy === approval.approvalId}
+                            >
+                              Regenerate
+                            </button>
+                            <button
+                              className="btn btn-outline-danger btn-sm"
+                              type="button"
+                              onClick={() => rejectSite(approval.approvalId)}
+                              disabled={approvalBusy === approval.approvalId}
+                            >
+                              Reject
+                            </button>
+                          </div>
+                        )}
+                        {approval.zendesk?.ticketUrl && (
+                          <a href={approval.zendesk.ticketUrl} target="_blank" rel="noreferrer">
+                            Zendesk ticket
+                          </a>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="empty-state compact">
+                    <h3>No approvals yet</h3>
+                    <p>Run the pipeline to generate pages for review.</p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            <div className="card control-card mb-4 entry-animate">
+              <div className="card-header bg-white border-0 pb-0">
+                <h2 className="h5 mb-1">Deployment History</h2>
+                <p className="text-secondary mb-0">Every approved Netlify deploy is recorded here.</p>
+              </div>
+              <div className="card-body">
+                {deployments.length > 0 ? (
+                  <div className="deployment-list">
+                    {deployments.slice(0, 8).map((deployment) => (
+                      <article className="deployment-item" key={deployment.id}>
+                        <div>
+                          <strong>{deployment.site_name || deployment.siteName || deployment.canonical_lead_key}</strong>
+                          <span>{deployment.deploy_action || deployment.deployAction} | {deployment.state}</span>
+                        </div>
+                        {deployment.url && (
+                          <a href={deployment.url} target="_blank" rel="noreferrer">
+                            {deployment.url}
+                          </a>
+                        )}
+                      </article>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="empty-state compact">
+                    <h3>No deployments</h3>
+                    <p>Approvals create or redeploy lead-owned Netlify sites.</p>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {reportingSummary?.ownerPerformance?.length > 0 && (
+              <div className="card control-card mb-4 entry-animate">
+                <div className="card-header bg-white border-0 pb-0">
+                  <h2 className="h5 mb-1">Owner Performance</h2>
+                  <p className="text-secondary mb-0">Lead ownership metadata summary.</p>
+                </div>
+                <div className="card-body">
+                  <div className="owner-list">
+                    {reportingSummary.ownerPerformance.map((owner) => (
+                      <div className="owner-row" key={`${owner.ownerName}-${owner.ownerEmail}-${owner.ownerStatus}`}>
+                        <strong>{owner.ownerName}</strong>
+                        <span>{owner.ownerStatus} | {owner.leadCount} leads</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+
+            <div className="card control-card entry-animate">
               <div className="card-header bg-white border-0 pb-0">
                 <h2 className="h5 mb-1">Live Logs</h2>
                 <p className="text-secondary mb-0">Frontend confirmations plus backend background events.</p>

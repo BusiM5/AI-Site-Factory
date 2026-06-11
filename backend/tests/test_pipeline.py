@@ -1,6 +1,7 @@
 import sys
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -11,27 +12,44 @@ import main
 client = TestClient(main.app)
 
 
-def apify_item(index, category="Restaurant"):
+@pytest.fixture(autouse=True)
+def isolated_pipeline_db(tmp_path, monkeypatch):
+    monkeypatch.setenv("PIPELINE_DB_PATH", str(tmp_path / "pipeline.db"))
+    main.init_pipeline_db()
+    main.LEADS_DB.clear()
+    main.CONTENT_DB.clear()
+    main.PREVIEW_DB.clear()
+    main.DISCOVERY_DB.clear()
+    main.PIPELINE_DB.clear()
+    main.LOG_BUFFER.clear()
+    yield
+
+
+def apify_item(index, category="Restaurant", province="Gauteng"):
     return {
         "title": f"Lead Business {index}",
         "website": f"https://lead-{index}.example.com",
         "phone": f"+27 11 000 {index:04d}",
         "categoryName": category,
-        "address": f"{index} Market Street",
+        "address": f"{index} Market Street, {province}, South Africa",
+        "countryCode": "ZA",
         "rating": 4.5,
         "reviewsCount": 20 + index,
         "googleMapsUrl": f"https://maps.example.com/{index}",
     }
 
 
-def test_discover_leads_retries_and_returns_ten(monkeypatch):
+def test_discover_leads_searches_all_provinces_and_returns_ten(monkeypatch):
     calls = []
 
-    def fake_apify(query, limit):
-        calls.append(query)
-        if len(calls) == 1:
-            return [apify_item(index) for index in range(5)]
-        return [apify_item(index) for index in range(12)]
+    def fake_apify(query, limit, location="South Africa"):
+        province = location.split(",")[0]
+        province_index = len(calls) + 1
+        calls.append((query, location))
+        return [
+            apify_item(province_index * 10, province=province),
+            apify_item(province_index * 10 + 1, province=province),
+        ]
 
     monkeypatch.setattr(main, "run_apify_google_maps", fake_apify)
 
@@ -49,22 +67,47 @@ def test_discover_leads_retries_and_returns_ten(monkeypatch):
     payload = response.json()
     assert payload["sourceStatus"] == "READY"
     assert len(payload["leads"]) == 10
-    assert len(calls) == 2
-    assert payload["leads"][0]["businessName"] == "Lead Business 0"
+    assert len(calls) == len(main.SOUTH_AFRICA_PROVINCES)
+    assert payload["leads"][0]["province"] == "Eastern Cape"
+    assert payload["provinceStats"]["Gauteng"]["rawItems"] == 2
+    assert payload["duplicatesSkipped"] == 0
+
+
+def test_discover_leads_skips_previously_seen_leads(monkeypatch):
+    def fake_apify(query, limit, location="South Africa"):
+        province = location.split(",")[0]
+        return [apify_item(1, province=province)]
+
+    monkeypatch.setattr(main, "run_apify_google_maps", fake_apify)
+
+    first = client.post(
+        "/api/leads/discover",
+        json={"presetId": "restaurants", "location": "South Africa", "limit": 10},
+    )
+    second = client.post(
+        "/api/leads/discover",
+        json={"presetId": "restaurants", "location": "South Africa", "limit": 10},
+    )
+
+    assert first.status_code == 200
+    assert len(first.json()["leads"]) == 1
+    assert second.status_code == 200
+    assert second.json()["leads"] == []
+    assert second.json()["duplicatesSkipped"] == len(main.SOUTH_AFRICA_PROVINCES)
 
 
 def test_normalize_apify_items_handles_missing_fields_and_duplicates():
     items = [
-        {"title": "Same Business", "website": "same.example.com"},
-        {"title": "Same Business", "website": "https://same.example.com"},
-        {"title": "No Contact Business", "categoryName": "Plumbing"},
-        {"website": "https://missing-name.example.com"},
+        {"title": "Same Business", "website": "same.example.com", "countryCode": "ZA"},
+        {"title": "Same Business", "website": "https://same.example.com", "countryCode": "ZA"},
+        {"title": "No Contact Business", "categoryName": "Plumbing", "countryCode": "ZA"},
+        {"website": "https://missing-name.example.com", "countryCode": "ZA"},
     ]
 
     leads = main.normalize_apify_items(
         items,
         fallback_category="General Services",
-        location="Durban",
+        location="South Africa",
         limit=10,
     )
 
@@ -75,71 +118,39 @@ def test_normalize_apify_items_handles_missing_fields_and_duplicates():
 
 
 def test_pipeline_run_processes_multiple_leads(monkeypatch):
-    def fake_context(lead, contact):
-        return {
-            "businessName": lead.businessName,
-            "industry": lead.category,
-            "location": lead.location,
-            "email": lead.email or "info@example.com",
-            "phone": lead.phone,
-            "website": lead.website,
-            "summary": "A useful local business.",
-            "serviceKeywords": [lead.category],
-            "imagePrompts": ["clean business image"] * 5,
-        }
+    model_calls = []
 
     monkeypatch.setattr(main, "scrape_contact_details", lambda lead: {"email": lead.email, "phone": lead.phone, "website": lead.website})
-    monkeypatch.setattr(main, "enrich_lead_with_gemini", fake_context)
     monkeypatch.setattr(
         main,
-        "generate_site_content_with_groq",
-        lambda context, template: {
-            "headline": f"{context['businessName']} Website",
-            "subheadline": "Modern local service landing page.",
-            "about": "A concise about section.",
-            "services": [
-                {"title": "Service One", "description": "Description one."},
-                {"title": "Service Two", "description": "Description two."},
-                {"title": "Service Three", "description": "Description three."},
-                {"title": "Service Four", "description": "Description four."},
-            ],
-            "ctaLabel": "Contact us",
-            "contactIntro": "Get in touch.",
-            "footerText": context["businessName"],
+        "generate_page_prompt_with_gemini",
+        lambda context, template: model_calls.append("gemini_prompt") or {"pagePrompt": "Build the page."},
+    )
+    monkeypatch.setattr(
+        main,
+        "generate_draft_html_with_groq",
+        lambda context, template, page_prompt: model_calls.append("groq_html") or {
+            "html": "<!doctype html><html><head><title>Draft</title></head><body><main><section>Draft</section></main></body></html>",
+            "notes": "Draft",
         },
     )
     monkeypatch.setattr(
         main,
-        "generate_gemini_images",
-        lambda prompts, accent: [main.fallback_image_data_uri("Mock", accent)] * 5,
-    )
-    monkeypatch.setattr(
-        main,
-        "deploy_site_to_netlify",
-        lambda name, site_html: {
-            "url": f"https://{main.slugify(name)}.netlify.app",
-            "state": "ready",
-            "mode": "production",
+        "finalize_html_with_gemini",
+        lambda context, template, page_prompt, draft_html: model_calls.append("gemini_final") or {
+            "html": "<!doctype html><html><head><title>Final</title></head><body><main><section id='hero'>Final</section></main></body></html>",
+            "qaNotes": "Final",
         },
     )
     monkeypatch.setattr(
         main,
-        "generate_outreach_with_groq",
-        lambda context, site_url: {
-            "subject": f"Website preview for {context['businessName']}",
-            "body": f"Please see {site_url}",
-            "siteUrl": site_url,
-            "recipientEmail": context["email"],
-        },
+        "deploy_site_to_netlify_for_lead",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("deployment must wait for approval")),
     )
     monkeypatch.setattr(
         main,
         "create_zendesk_outreach_ticket",
-        lambda context, deployment, outreach, pipeline_id: {
-            "syncStatus": "TICKET_CREATED",
-            "ticketId": 123,
-            "ticketUrl": "https://example.zendesk.com/agent/tickets/123",
-        },
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("zendesk must wait for approval")),
     )
 
     leads = [
@@ -166,10 +177,103 @@ def test_pipeline_run_processes_multiple_leads(monkeypatch):
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["status"] == "COMPLETED"
+    assert payload["status"] == "PENDING_APPROVAL"
     assert len(payload["results"]) == 2
-    assert payload["results"][0]["deployment"]["url"].endswith(".netlify.app")
-    assert payload["results"][1]["zendesk"]["ticketUrl"].endswith("/123")
+    assert payload["results"][0]["status"] == "PENDING_APPROVAL"
+    assert payload["results"][0]["pendingApprovalId"]
+    assert payload["results"][0]["deployment"] is None
+    assert payload["results"][0]["zendesk"] is None
+    assert model_calls == [
+        "gemini_prompt",
+        "groq_html",
+        "gemini_final",
+        "gemini_prompt",
+        "groq_html",
+        "gemini_final",
+    ]
+
+    approvals = client.get("/api/approvals?status=PENDING").json()["approvals"]
+    assert len(approvals) == 2
+
+
+def test_approval_deploys_existing_pipeline_output_and_syncs_zendesk(monkeypatch):
+    monkeypatch.setattr(main, "scrape_contact_details", lambda lead: {"email": lead.email, "phone": lead.phone, "website": lead.website})
+    monkeypatch.setattr(main, "generate_page_prompt_with_gemini", lambda context, template: {"pagePrompt": "Build the page."})
+    monkeypatch.setattr(
+        main,
+        "generate_draft_html_with_groq",
+        lambda context, template, page_prompt: {
+            "html": "<!doctype html><html><head><title>Draft</title></head><body>Draft</body></html>",
+            "notes": "Draft",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "finalize_html_with_gemini",
+        lambda context, template, page_prompt, draft_html: {
+            "html": "<!doctype html><html><head><title>Final</title></head><body>Final</body></html>",
+            "qaNotes": "Final",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "deploy_site_to_netlify_for_lead",
+        lambda canonical_key, business_name, site_html, pipeline_id, approval_id, approved_by, regenerate_existing_site=True: {
+            "deployAction": "CREATED",
+            "siteCreated": True,
+            "siteReused": False,
+            "siteId": "site-1",
+            "siteName": "ai-site-alpha",
+            "deployId": "deploy-1",
+            "state": "ready",
+            "url": "https://alpha.netlify.app",
+            "deploymentHistoryId": "history-1",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "generate_outreach_with_groq",
+        lambda context, site_url: {
+            "subject": f"Website preview for {context['businessName']}",
+            "body": f"Please see {site_url}",
+            "siteUrl": site_url,
+            "recipientEmail": context["email"],
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "create_zendesk_outreach_ticket",
+        lambda context, deployment, outreach, pipeline_id: {
+            "syncStatus": "TICKET_CREATED",
+            "ticketId": 123,
+            "ticketUrl": "https://example.zendesk.com/agent/tickets/123",
+        },
+    )
+
+    lead = main.DiscoveredLead(
+        leadKey="lead-1",
+        businessName="Alpha Plumbing",
+        email="alpha@example.com",
+        category="Plumbing",
+        location="Durban",
+    ).model_dump()
+
+    pipeline_response = client.post(
+        "/api/pipeline/run",
+        json={"templateId": "default-service", "sourceBatchId": "batch-1", "leads": [lead]},
+    )
+    approval_id = pipeline_response.json()["results"][0]["pendingApprovalId"]
+
+    approval_response = client.post(
+        f"/api/approvals/{approval_id}/approve",
+        json={"approvedBy": "Ops", "notes": "Approved"},
+    )
+
+    assert approval_response.status_code == 200
+    payload = approval_response.json()
+    assert payload["status"] == "APPROVED"
+    assert payload["deployment"]["url"] == "https://alpha.netlify.app"
+    assert payload["zendesk"]["ticketUrl"].endswith("/123")
 
 
 def test_model_safe_value_chunks_large_text():
