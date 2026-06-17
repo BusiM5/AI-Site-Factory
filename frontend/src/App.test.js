@@ -373,7 +373,7 @@ test("discovers leads, selects one, runs pipeline, and approves deployment", asy
   });
 
   fireEvent.click(screen.getByLabelText("Select Alpha Plumbing"));
-  fireEvent.click(screen.getByText("Run Pipeline"));
+  fireEvent.click(screen.getByText("Resume Pipeline"));
 
   await waitFor(() => {
     expect(screen.getByText("pipeline-1")).toBeInTheDocument();

@@ -26,6 +26,20 @@ from pydantic import BaseModel, EmailStr, Field
 
 app = FastAPI(title="AI Site Factory Backend - Phase 1")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "https://ai-site-factory-frontend.vercel.app",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 
@@ -55,21 +69,7 @@ REQUIRED_PROVIDER_ENV = {
     "zendesk": ["ZENDESK_SUBDOMAIN", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN"],
 }
 
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-        "https://ai-site-factory-frontend.vercel.app",
-    ],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+VALID_PUBLISH_MODES = {"direct-netlify", "github-netlify"}
 
 def redact_value(value: Any) -> Any:
     if isinstance(value, dict):
@@ -173,7 +173,7 @@ def provider_env_status() -> Dict[str, Any]:
         providers[provider] = {
             "configured": all(check["configured"] for check in checks),
             "checks": checks,
-        }
+            }
     return providers
 
 
@@ -414,7 +414,7 @@ class DiscoverLeadsRequest(BaseModel):
     presetId: str
     location: str = "South Africa"
     query: Optional[str] = None
-    limit: int = 10
+    limit: int = 5
     ownerName: Optional[str] = None
     ownerEmail: Optional[str] = None
     ownerStatus: Optional[str] = "unassigned"
@@ -461,6 +461,8 @@ class PipelineRunRequest(BaseModel):
     templateId: str = "default-service"
     sourceBatchId: Optional[str] = None
     regenerateExistingSites: bool = True
+    resumeExisting: bool = True
+    forceRegenerate: bool = False
 
 
 class PipelineLeadResult(BaseModel):
@@ -480,6 +482,8 @@ class PipelineLeadResult(BaseModel):
     deployment: Optional[Dict[str, Any]] = None
     deploymentHistory: Optional[Dict[str, Any]] = None
     zendesk: Optional[Dict[str, Any]] = None
+    publishMode: Optional[str] = None
+    githubExport: Optional[Dict[str, Any]] = None
     structuredErrors: List[Dict[str, Any]] = Field(default_factory=list)
     errors: List[str] = Field(default_factory=list)
 
@@ -500,6 +504,7 @@ class ApprovalActionRequest(BaseModel):
     notes: Optional[str] = None
     reason: Optional[str] = None
     regenerateExistingSite: bool = True
+    publishMode: str = "direct-netlify"
 
 
 class ApprovalActionResponse(BaseModel):
@@ -512,6 +517,8 @@ class ApprovalActionResponse(BaseModel):
     deploymentHistory: Optional[Dict[str, Any]] = None
     zendesk: Optional[Dict[str, Any]] = None
     outreachDraft: Optional[Dict[str, Any]] = None
+    publishMode: Optional[str] = None
+    githubExport: Optional[Dict[str, Any]] = None
     errors: List[Dict[str, Any]] = Field(default_factory=list)
 
 
@@ -620,6 +627,13 @@ def compact_text(value: Any, fallback: str = "") -> str:
     if value is None:
         return fallback
     return re.sub(r"\s+", " ", str(value)).strip() or fallback
+
+
+def normalize_publish_mode(value: Optional[str]) -> str:
+    publish_mode = compact_text(value, "direct-netlify")
+    if publish_mode not in VALID_PUBLISH_MODES:
+        raise HTTPException(status_code=400, detail=f"Unsupported publish mode: {publish_mode}")
+    return publish_mode
 
 
 def slugify(value: str, max_length: int = 42) -> str:
@@ -780,6 +794,13 @@ def get_pipeline_db() -> sqlite3.Connection:
     return connection
 
 
+def ensure_db_column(db: sqlite3.Connection, table_name: str, column_name: str, column_sql: str) -> None:
+    columns = db.execute(f"PRAGMA table_info({table_name})").fetchall()
+    if any(column["name"] == column_name for column in columns):
+        return
+    db.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_sql}")
+
+
 def init_pipeline_db() -> None:
     with get_pipeline_db() as db:
         db.executescript(
@@ -877,6 +898,8 @@ def init_pipeline_db() -> None:
                 html_checksum TEXT,
                 deployed_at TEXT NOT NULL,
                 approved_by TEXT,
+                publish_mode TEXT DEFAULT 'direct-netlify',
+                github_export_json TEXT,
                 raw_json TEXT
             );
 
@@ -900,11 +923,16 @@ def init_pipeline_db() -> None:
                 notes TEXT,
                 deployment_history_id TEXT,
                 zendesk_json TEXT,
+                publish_mode TEXT DEFAULT 'direct-netlify',
+                github_export_json TEXT,
                 errors_json TEXT
             );
             """
         )
-
+        ensure_db_column(db, "approval_records", "publish_mode", "publish_mode TEXT DEFAULT 'direct-netlify'")
+        ensure_db_column(db, "approval_records", "github_export_json", "github_export_json TEXT")
+        ensure_db_column(db, "deployment_history", "publish_mode", "publish_mode TEXT DEFAULT 'direct-netlify'")
+        ensure_db_column(db, "deployment_history", "github_export_json", "github_export_json TEXT")
 
 def canonical_lead_key_from_values(
     raw: Dict[str, Any],
@@ -1124,6 +1152,7 @@ def refresh_pipeline_run_status_from_approvals(pipeline_id: str) -> None:
         completed_count = counts.get("APPROVED", 0)
         failed_count = (
             counts.get("REJECTED", 0)
+            + counts.get("PUBLISH_FAILED", 0)
             + counts.get("DEPLOY_FAILED", 0)
             + counts.get("DEPLOYED_ZENDESK_FAILED", 0)
         )
@@ -1205,6 +1234,29 @@ def record_pipeline_step(
     return snapshot
 
 
+def record_skipped_pipeline_step(
+    pipeline_id: str,
+    canonical_key: Optional[str],
+    step: str,
+    message: str,
+    provider: Optional[str] = None,
+    details: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    timestamp = now_iso()
+    return record_pipeline_step(
+        pipeline_id=pipeline_id,
+        canonical_key=canonical_key,
+        step=step,
+        status="SKIPPED",
+        provider=provider,
+        message=message,
+        started_at=timestamp,
+        finished_at=timestamp,
+        retryable=False,
+        details=details,
+    )
+
+
 def structured_pipeline_error(
     step: str,
     error: Exception,
@@ -1243,9 +1295,9 @@ def create_approval_record(
             INSERT INTO approval_records (
                 id, pipeline_id, canonical_lead_key, lead_key, business_name, status,
                 html, html_checksum, context_json, site_content_json, template_json,
-                created_at, updated_at
+                created_at, updated_at, publish_mode
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 approval_id,
@@ -1261,6 +1313,7 @@ def create_approval_record(
                 json.dumps(template, default=str),
                 timestamp,
                 timestamp,
+                "direct-netlify",
             ),
         )
     return approval_id
@@ -1285,6 +1338,8 @@ def approval_row_to_dict(row: sqlite3.Row, include_html: bool = False) -> Dict[s
         "rejectedBy": row["rejected_by"],
         "notes": row["notes"],
         "deploymentHistoryId": row["deployment_history_id"],
+        "publishMode": row["publish_mode"] or "direct-netlify",
+        "githubExport": safe_json_loads(row["github_export_json"], None),
         "zendesk": safe_json_loads(row["zendesk_json"], None),
         "errors": safe_json_loads(row["errors_json"], []),
     }
@@ -1302,6 +1357,162 @@ def get_approval_or_404(approval_id: str) -> sqlite3.Row:
     if not row:
         raise HTTPException(status_code=404, detail="Approval record not found.")
     return row
+
+
+def latest_reusable_approval_for_lead(canonical_key: str) -> Optional[sqlite3.Row]:
+    with get_pipeline_db() as db:
+        return db.execute(
+            """
+            SELECT *
+            FROM approval_records
+            WHERE canonical_lead_key = ?
+              AND status IN ('PENDING', 'APPROVED', 'DEPLOYED_ZENDESK_FAILED')
+            ORDER BY created_at DESC
+            LIMIT 1
+            """,
+            (canonical_key,),
+        ).fetchone()
+
+
+def supersede_pending_approvals(canonical_key: str, except_approval_id: str, requested_by: str) -> None:
+    with get_pipeline_db() as db:
+        db.execute(
+            """
+            UPDATE approval_records
+            SET status = 'SUPERSEDED', updated_at = ?, notes = ?
+            WHERE canonical_lead_key = ? AND status = 'PENDING' AND id != ?
+            """,
+            (
+                now_iso(),
+                f"Superseded by force regenerate from {requested_by}. New approval: {except_approval_id}",
+                canonical_key,
+                except_approval_id,
+            ),
+        )
+
+
+def get_deployment_history_row(deployment_history_id: Optional[str]) -> Optional[sqlite3.Row]:
+    if not deployment_history_id:
+        return None
+    with get_pipeline_db() as db:
+        return db.execute(
+            "SELECT * FROM deployment_history WHERE id = ?",
+            (deployment_history_id,),
+        ).fetchone()
+
+
+def latest_deployment_history_for_lead(canonical_key: str) -> Optional[sqlite3.Row]:
+    with get_pipeline_db() as db:
+        return db.execute(
+            """
+            SELECT *
+            FROM deployment_history
+            WHERE canonical_lead_key = ?
+            ORDER BY deployed_at DESC
+            LIMIT 1
+            """,
+            (canonical_key,),
+        ).fetchone()
+
+
+def deployment_history_row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    item = dict(row)
+    item["raw"] = safe_json_loads(item.pop("raw_json", None), {})
+    item["githubExport"] = safe_json_loads(item.pop("github_export_json", None), None)
+    item["publishMode"] = item.pop("publish_mode", None) or "direct-netlify"
+    return item
+
+
+def deployment_from_history(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    history = deployment_history_row_to_dict(row)
+    if not history:
+        return None
+    raw = history.get("raw")
+    if isinstance(raw, dict) and raw:
+        raw.setdefault("deploymentHistoryId", history.get("id"))
+        raw.setdefault("publishMode", history.get("publishMode"))
+        if history.get("githubExport") and not raw.get("githubExport"):
+            raw["githubExport"] = history["githubExport"]
+        return raw
+    return {
+        "deploymentHistoryId": history.get("id"),
+        "siteId": history.get("site_id"),
+        "siteName": history.get("site_name"),
+        "deployId": history.get("deploy_id"),
+        "state": history.get("state"),
+        "url": history.get("url"),
+        "deployAction": history.get("deploy_action"),
+        "htmlChecksum": history.get("html_checksum"),
+        "deployedAt": history.get("deployed_at"),
+        "publishMode": history.get("publishMode"),
+        "githubExport": history.get("githubExport"),
+    }
+
+
+def pipeline_result_from_reused_approval(
+    lead: DiscoveredLead,
+    row: sqlite3.Row,
+    pipeline_id: str,
+) -> PipelineLeadResult:
+    canonical_key = row["canonical_lead_key"]
+    step_history = [
+        record_skipped_pipeline_step(
+            pipeline_id,
+            canonical_key,
+            "resume_existing",
+            f"Reused existing {row['status'].lower()} approval.",
+            details={"approvalId": row["id"], "status": row["status"]},
+        )
+    ]
+    context = safe_json_loads(row["context_json"], {})
+    site_content = safe_json_loads(row["site_content_json"], {})
+    github_export = safe_json_loads(row["github_export_json"], None)
+    publish_mode = row["publish_mode"] or "direct-netlify"
+
+    if row["status"] == "PENDING":
+        return PipelineLeadResult(
+            leadKey=lead.leadKey,
+            canonicalLeadKey=canonical_key,
+            businessName=row["business_name"],
+            status="PENDING_APPROVAL",
+            pipelineStatus="PENDING_APPROVAL",
+            currentStep="reused_pending_approval",
+            stepHistory=step_history,
+            approvalStatus="PENDING",
+            pendingApprovalId=row["id"],
+            pendingPreviewHtml=row["html"],
+            cleanedLead=context,
+            siteContent=site_content,
+            publishMode=publish_mode,
+            githubExport=github_export,
+        )
+
+    deployment_row = get_deployment_history_row(row["deployment_history_id"]) or latest_deployment_history_for_lead(canonical_key)
+    deployment = deployment_from_history(deployment_row)
+    deployment_history = deployment_history_row_to_dict(deployment_row)
+
+    return PipelineLeadResult(
+        leadKey=lead.leadKey,
+        canonicalLeadKey=canonical_key,
+        businessName=row["business_name"],
+        status="COMPLETED_REUSED",
+        pipelineStatus="COMPLETED_REUSED",
+        currentStep="reused_deployment",
+        stepHistory=step_history,
+        approvalStatus=row["status"],
+        pendingApprovalId=row["id"],
+        pendingPreviewHtml=None,
+        cleanedLead=context,
+        siteContent=site_content,
+        outreachDraft=safe_json_loads(row["outreach_json"], None),
+        deployment=deployment,
+        deploymentHistory=deployment_history,
+        zendesk=safe_json_loads(row["zendesk_json"], None),
+        publishMode=publish_mode,
+        githubExport=github_export or (deployment or {}).get("githubExport"),
+    )
 
 
 init_pipeline_db()
@@ -1327,7 +1538,7 @@ def build_google_maps_query(preset: Dict[str, Any], location: str, custom_query:
 def run_apify_google_maps(query: str, limit: int, location: str = "South Africa") -> List[Dict[str, Any]]:
     token = require_env("APIFY_API_TOKEN")
     actor_id = os.getenv("APIFY_GOOGLE_MAPS_ACTOR_ID", "compass/crawler-google-places").replace("/", "~")
-    max_items = max(limit, 10)
+    max_items = max(limit, 5)
     country_code = infer_country_code(location)
 
     log_event(
@@ -1631,35 +1842,65 @@ def parse_json_response(text: str) -> Dict[str, Any]:
 def gemini_text_json(prompt: str, model: Optional[str] = None) -> Dict[str, Any]:
     api_key = require_env("GEMINI_API_KEY")
     model_name = model or os.getenv("GEMINI_TEXT_MODEL", "gemini-2.0-flash")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
-    log_event("info", "provider.gemini_text.start", "Sending chunked text prompt to Gemini.", model=model_name, promptChars=len(prompt))
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
 
-    try:
-        response = requests.post(
-            url,
-            headers={"Content-Type": "application/json"},
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {
-                    "responseMimeType": "application/json",
-                    "temperature": 0.35,
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "temperature": 0.35,
+        },
+    }
+
+    for attempt in range(5):
+        try:
+            response = requests.post(
+                url,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-goog-api-key": api_key,
                 },
-            },
-            timeout=60,
-        )
-        response.raise_for_status()
-    except requests.RequestException as error:
-        log_event("error", "provider.gemini_text.error", "Gemini text request failed.", model=model_name, reason=str(error))
-        raise
+                json=payload,
+                timeout=90,
+            )
 
-    data = response.json()
-    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-    text = "".join(part.get("text", "") for part in parts)
-    if not text:
-        raise RuntimeError("Gemini returned an empty response.")
-    log_event("info", "provider.gemini_text.finish", "Gemini returned text JSON.", model=model_name, responseChars=len(text))
-    return parse_json_response(text)
+            if response.status_code == 429:
+                wait_time = 10 * (attempt + 1)
+                log_event(
+                    "warning",
+                    "provider.gemini.rate_limited",
+                    f"Gemini rate limited. Retrying in {wait_time}s.",
+                    model=model_name,
+                    attempt=attempt + 1,
+                )
+                time.sleep(wait_time)
+                continue
 
+            response.raise_for_status()
+
+            data = response.json()
+            parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+            text = "".join(part.get("text", "") for part in parts)
+
+            if not text:
+                raise RuntimeError("Gemini returned an empty response.")
+
+            return parse_json_response(text)
+
+        except requests.RequestException as error:
+            if attempt == 4:
+                log_event(
+                    "error",
+                    "provider.gemini_text.error",
+                    "Gemini text request failed after retries.",
+                    model=model_name,
+                    reason=error.__class__.__name__,
+                )
+                raise RuntimeError("Gemini request failed after retries.")
+
+            time.sleep(5 * (attempt + 1))
+
+    raise RuntimeError("Gemini request failed after retries.")
 
 def groq_chat_json(prompt: str, system_prompt: str) -> Dict[str, Any]:
     api_key = require_env("GROQ_API_KEY")
@@ -1782,27 +2023,36 @@ def generate_site_content_with_groq(context: Dict[str, Any], template: Dict[str,
 
 def generate_page_prompt_with_gemini(context: Dict[str, Any], template: Dict[str, Any]) -> Dict[str, Any]:
     prompt = (
-        "Create a production-ready prompt that another AI model can use to generate a single-file HTML landing page. "
+        "Create a production-ready prompt for a single-file HTML landing page. "
         "Return strict JSON with keys: pagePrompt, designNotes, contentGuardrails, imageDirection. "
-        "The pagePrompt must preserve this original site structure: hero, four service cards, about section, contact section, footer. "
-        "Use only public lead context. Do not invent awards, prices, guarantees, or unavailable services. "
-        "The design should use the selected template accent/background and be suitable for a South African local business.\n\n"
+        "The pagePrompt must preserve: hero, four service cards, about section, contact section, footer. "
+        "Use only public lead context. Do not invent awards, prices, guarantees, or unavailable services.\n\n"
         f"Template: {model_safe_json(template)}\n"
         f"Lead context: {model_safe_json(context)}"
     )
 
-    result = gemini_text_json(prompt)
+    try:
+        result = gemini_text_json(prompt)
+    except Exception as error:
+        log_event(
+            "warning",
+            "provider.gemini_page_prompt.fallback",
+            "Gemini page prompt failed. Using local fallback.",
+            reason=str(error),
+        )
+        result = {}
+
     result.setdefault(
         "pagePrompt",
         (
-            f"Build a standalone HTML landing page for {context.get('businessName')} in {context.get('location')}. "
-            "Include a hero, exactly four service cards, about, contact, and footer. "
-            "Use polished responsive CSS, accessible semantic HTML, and no unsupported claims."
+            f"Build a standalone responsive HTML landing page for {context.get('businessName')} "
+            f"in {context.get('location')}. Include a hero, exactly four service cards, about, "
+            "contact, and footer. Use accessible semantic HTML, polished CSS, and grounded claims only."
         ),
     )
     result.setdefault("designNotes", f"Use accent {template.get('accent')} and background {template.get('background')}.")
     result.setdefault("contentGuardrails", "Use only the provided public lead context.")
-    result.setdefault("imageDirection", "Use tasteful CSS treatments or safe placeholder imagery if no real images are available.")
+    result.setdefault("imageDirection", "Use tasteful CSS gradients or placeholder imagery.")
     return result
 
 
@@ -1840,25 +2090,36 @@ def finalize_html_with_gemini(
     draft_html: str,
 ) -> Dict[str, Any]:
     prompt = (
-        "Rewrite and finalize this single-file HTML website for deployment. Return strict JSON with keys: html, qaNotes. "
-        "Keep the original structure: hero, four service cards, about, contact, footer. "
-        "Fix malformed HTML/CSS, improve responsive behavior, preserve contact details, and keep claims grounded in the lead context. "
-        "The final html must be a complete deployable document and must not include markdown fences.\n\n"
+        "Finalize this single-file HTML website for deployment. Return strict JSON with keys: html, qaNotes. "
+        "Keep the structure: hero, four service cards, about, contact, footer. "
+        "Fix malformed HTML/CSS and keep claims grounded.\n\n"
         f"Template: {model_safe_json(template)}\n"
         f"Lead context: {model_safe_json(context)}\n"
-        f"Original Gemini page prompt: {model_safe_json(page_prompt)}\n"
-        f"Groq draft HTML: {draft_html[:MODEL_CHUNK_CHARS * MODEL_MAX_CHUNKS]}"
+        f"Page prompt: {model_safe_json(page_prompt)}\n"
+        f"Draft HTML: {draft_html[:MODEL_CHUNK_CHARS * MODEL_MAX_CHUNKS]}"
     )
 
-    result = gemini_text_json(prompt)
-    html_value = compact_text(result.get("html"))
-    if not html_value:
-        raise RuntimeError("Gemini did not return final HTML.")
-    if "<html" not in html_value.lower() or "</html>" not in html_value.lower():
-        raise RuntimeError("Gemini final HTML was not a complete HTML document.")
-    result["html"] = html_value
-    result.setdefault("qaNotes", "Gemini finalized the HTML for deployment.")
-    return result
+    try:
+        result = gemini_text_json(prompt)
+        html_value = compact_text(result.get("html"))
+
+        if html_value and "<html" in html_value.lower() and "</html>" in html_value.lower():
+            result["html"] = html_value
+            result.setdefault("qaNotes", "Gemini finalized the HTML.")
+            return result
+
+    except Exception as error:
+        log_event(
+            "warning",
+            "provider.gemini_final_html.fallback",
+            "Gemini final HTML failed. Using Groq draft HTML.",
+            reason=str(error),
+        )
+
+    return {
+        "html": draft_html,
+        "qaNotes": "Gemini finalization skipped. Groq draft HTML used as deployable fallback.",
+    }
 
 
 def generate_outreach_with_groq(context: Dict[str, Any], site_url: str) -> Dict[str, Any]:
@@ -1907,13 +2168,20 @@ def fallback_image_data_uri(label: str, accent: str) -> str:
 
 
 def generate_gemini_images(prompts: List[str], accent: str) -> List[str]:
+    if os.getenv("ENABLE_GEMINI_IMAGES", "false").lower() != "true":
+        return [
+            fallback_image_data_uri("Hero image", accent),
+            fallback_image_data_uri("Service 1", accent),
+            fallback_image_data_uri("Service 2", accent),
+            fallback_image_data_uri("Service 3", accent),
+            fallback_image_data_uri("Service 4", accent),
+        ]
+
     api_key = require_env("GEMINI_API_KEY")
     model_name = os.getenv("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
     images: List[str] = []
-    safe_prompts = [compact_text(prompt) for prompt in prompts[:5]]
-    log_event("info", "provider.gemini_image.start", "Generating landing-page image assets.", model=model_name, imageCount=len(safe_prompts))
 
-    for prompt in safe_prompts:
+    for prompt in [compact_text(prompt) for prompt in prompts[:5]]:
         try:
             response = requests.post(
                 f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent",
@@ -1921,34 +2189,42 @@ def generate_gemini_images(prompts: List[str], accent: str) -> List[str]:
                     "x-goog-api-key": api_key,
                     "Content-Type": "application/json",
                 },
-                json={
-                    "contents": [{"parts": [{"text": prompt[:MODEL_CHUNK_CHARS]}]}],
-                },
-                timeout=90,
+                json={"contents": [{"parts": [{"text": prompt[:MODEL_CHUNK_CHARS]}]}]},
+                timeout=60,
             )
+
+            if response.status_code == 429:
+                raise RuntimeError("Gemini image rate limit reached.")
+
             response.raise_for_status()
-        except requests.RequestException as error:
-            log_event("error", "provider.gemini_image.error", "Gemini image request failed.", model=model_name, reason=str(error))
-            raise
+            data = response.json()
+            parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
 
-        data = response.json()
-        parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-        image_data = None
-        mime_type = "image/png"
-        for part in parts:
-            inline_data = part.get("inlineData") or part.get("inline_data")
-            if inline_data:
-                image_data = inline_data.get("data")
-                mime_type = inline_data.get("mimeType") or inline_data.get("mime_type") or mime_type
-                break
+            image_data = None
+            mime_type = "image/png"
 
-        if image_data:
-            images.append(f"data:{mime_type};base64,{image_data}")
+            for part in parts:
+                inline_data = part.get("inlineData") or part.get("inline_data")
+                if inline_data:
+                    image_data = inline_data.get("data")
+                    mime_type = inline_data.get("mimeType") or inline_data.get("mime_type") or mime_type
+                    break
+
+            if image_data:
+                images.append(f"data:{mime_type};base64,{image_data}")
+
+        except Exception as error:
+            log_event(
+                "warning",
+                "provider.gemini_image.fallback",
+                "Gemini image generation skipped for one prompt.",
+                reason=str(error),
+            )
+            images.append(fallback_image_data_uri("Generated asset", accent))
 
     while len(images) < 5:
         images.append(fallback_image_data_uri(f"Generated asset {len(images) + 1}", accent))
 
-    log_event("info", "provider.gemini_image.finish", "Image asset generation finished.", model=model_name, generated=len(images))
     return images[:5]
 
 
@@ -2286,6 +2562,80 @@ def zip_site_html(site_html: str) -> bytes:
     return buffer.getvalue()
 
 
+def github_export_path(canonical_key: str, business_name: str) -> str:
+    prefix = compact_text(os.getenv("GITHUB_SITE_PATH_PREFIX"), "generated-sites").strip("/")
+    directory = f"{slugify(business_name, 32)}-{canonical_key[:8]}"
+    if prefix:
+        return f"{prefix}/{directory}/index.html"
+    return f"{directory}/index.html"
+
+
+def export_site_to_github(canonical_key: str, business_name: str, site_html: str) -> Dict[str, Any]:
+    token = require_env("GITHUB_TOKEN")
+    owner = require_env("GITHUB_OWNER")
+    repo = require_env("GITHUB_REPO")
+    branch = compact_text(os.getenv("GITHUB_BRANCH"), "main")
+    path = github_export_path(canonical_key, business_name)
+    checksum = html_checksum(site_html)
+    url = f"https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "AI-Site-Factory",
+    }
+
+    log_event(
+        "info",
+        "provider.github.export_start",
+        "Exporting generated site HTML to GitHub.",
+        repository=f"{owner}/{repo}",
+        branch=branch,
+        path=path,
+    )
+
+    existing_sha = None
+    existing_response = requests.get(url, headers=headers, params={"ref": branch}, timeout=30)
+    if existing_response.status_code == 200:
+        existing_sha = existing_response.json().get("sha")
+    elif existing_response.status_code != 404:
+        existing_response.raise_for_status()
+
+    payload = {
+        "message": f"Publish generated site for {business_name}",
+        "content": base64.b64encode(site_html.encode("utf-8")).decode("ascii"),
+        "branch": branch,
+    }
+    if existing_sha:
+        payload["sha"] = existing_sha
+
+    update_response = requests.put(url, headers=headers, json=payload, timeout=45)
+    update_response.raise_for_status()
+    data = update_response.json()
+    content = data.get("content", {}) or {}
+    commit = data.get("commit", {}) or {}
+    result = {
+        "exportAction": "UPDATED" if existing_sha else "CREATED",
+        "repository": f"{owner}/{repo}",
+        "branch": branch,
+        "path": path,
+        "htmlChecksum": checksum,
+        "contentSha": content.get("sha"),
+        "commitSha": commit.get("sha"),
+        "htmlUrl": content.get("html_url"),
+        "exportedAt": now_iso(),
+    }
+    log_event(
+        "info",
+        "provider.github.export_finish",
+        "Generated site HTML exported to GitHub.",
+        repository=result["repository"],
+        branch=branch,
+        path=path,
+        exportAction=result["exportAction"],
+    )
+    return result
+
+
 def deploy_site_to_netlify(business_name: str, site_html: str) -> Dict[str, Any]:
     token = require_env("NETLIFY_AUTH_TOKEN")
     headers = {
@@ -2374,6 +2724,8 @@ def deploy_site_to_netlify_for_lead(
     approval_id: Optional[str],
     approved_by: Optional[str],
     regenerate_existing_site: bool = True,
+    publish_mode: str = "direct-netlify",
+    github_export: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     token = require_env("NETLIFY_AUTH_TOKEN")
     headers = {
@@ -2402,6 +2754,8 @@ def deploy_site_to_netlify_for_lead(
             "mode": "production",
             "htmlChecksum": checksum,
             "deploymentHistoryId": None,
+            "publishMode": publish_mode,
+            "githubExport": github_export,
         }
 
     site_created = False
@@ -2508,6 +2862,8 @@ def deploy_site_to_netlify_for_lead(
         "mode": "production",
         "htmlChecksum": checksum,
         "deploymentHistoryId": deployment_history_id,
+        "publishMode": publish_mode,
+        "githubExport": github_export,
     }
 
     with get_pipeline_db() as db:
@@ -2545,9 +2901,9 @@ def deploy_site_to_netlify_for_lead(
             INSERT INTO deployment_history (
                 id, canonical_lead_key, pipeline_id, approval_id, site_id, site_name,
                 deploy_id, url, deploy_action, state, html_checksum, deployed_at,
-                approved_by, raw_json
+                approved_by, publish_mode, github_export_json, raw_json
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 deployment_history_id,
@@ -2563,6 +2919,8 @@ def deploy_site_to_netlify_for_lead(
                 checksum,
                 deployed_at,
                 approved_by,
+                publish_mode,
+                json.dumps(github_export, default=str) if github_export else None,
                 json.dumps(result, default=str),
             ),
         )
@@ -2717,6 +3075,133 @@ def create_zendesk_outreach_ticket(
     }
     log_event("info", "provider.zendesk.finish", "Zendesk ticket created.", businessName=business_name, ticketId=result["ticketId"])
     return result
+
+
+def resume_failed_outreach_approval(
+    lead: DiscoveredLead,
+    row: sqlite3.Row,
+    pipeline_id: str,
+) -> PipelineLeadResult:
+    canonical_key = row["canonical_lead_key"]
+    deployment_row = get_deployment_history_row(row["deployment_history_id"]) or latest_deployment_history_for_lead(canonical_key)
+    deployment = deployment_from_history(deployment_row)
+    deployment_history = deployment_history_row_to_dict(deployment_row)
+    if not deployment or not deployment.get("url"):
+        raise RuntimeError("Cannot resume outreach because no completed deployment was found.")
+
+    context = safe_json_loads(row["context_json"], {})
+    site_content = safe_json_loads(row["site_content_json"], {})
+    publish_mode = row["publish_mode"] or "direct-netlify"
+    github_export = safe_json_loads(row["github_export_json"], None) or deployment.get("githubExport")
+    step_history: List[Dict[str, Any]] = [
+        record_skipped_pipeline_step(
+            pipeline_id,
+            canonical_key,
+            "netlify_deploy",
+            "Reused the previously completed Netlify deployment.",
+            provider="netlify",
+            details={"approvalId": row["id"], "deploymentHistoryId": deployment.get("deploymentHistoryId")},
+        )
+    ]
+
+    def run_resume_step(step: str, provider: str, callback):
+        started = now_iso()
+        try:
+            result = callback()
+        except Exception as step_error:
+            snapshot = record_pipeline_step(
+                pipeline_id=pipeline_id,
+                canonical_key=canonical_key,
+                step=step,
+                status="FAILED",
+                provider=provider,
+                message=str(step_error),
+                started_at=started,
+                finished_at=now_iso(),
+                retryable=True,
+                details={"approvalId": row["id"], "errorType": step_error.__class__.__name__},
+            )
+            step_history.append(snapshot)
+            raise
+
+        snapshot = record_pipeline_step(
+            pipeline_id=pipeline_id,
+            canonical_key=canonical_key,
+            step=step,
+            status="COMPLETED",
+            provider=provider,
+            message=f"{step} completed.",
+            started_at=started,
+            finished_at=now_iso(),
+            retryable=False,
+            details={"approvalId": row["id"]},
+        )
+        step_history.append(snapshot)
+        return result
+
+    outreach = safe_json_loads(row["outreach_json"], None)
+    if outreach:
+        step_history.append(
+            record_skipped_pipeline_step(
+                pipeline_id,
+                canonical_key,
+                "groq_outreach",
+                "Reused the previously generated outreach draft.",
+                provider="groq",
+                details={"approvalId": row["id"]},
+            )
+        )
+    else:
+        outreach = run_resume_step(
+            "groq_outreach",
+            "groq",
+            lambda: generate_outreach_with_groq(context, deployment.get("url", "")),
+        )
+
+    zendesk = run_resume_step(
+        "zendesk_ticket",
+        "zendesk",
+        lambda: create_zendesk_outreach_ticket(context, deployment, outreach, pipeline_id),
+    )
+
+    with get_pipeline_db() as db:
+        db.execute(
+            """
+            UPDATE approval_records
+            SET status = 'APPROVED', updated_at = ?, outreach_json = ?,
+                zendesk_json = ?, errors_json = ?
+            WHERE id = ?
+            """,
+            (
+                now_iso(),
+                json.dumps(outreach, default=str),
+                json.dumps(zendesk, default=str),
+                json.dumps([], default=str),
+                row["id"],
+            ),
+        )
+
+    refresh_pipeline_run_status_from_approvals(row["pipeline_id"])
+
+    return PipelineLeadResult(
+        leadKey=lead.leadKey,
+        canonicalLeadKey=canonical_key,
+        businessName=row["business_name"],
+        status="COMPLETED_RESUMED",
+        pipelineStatus="COMPLETED_RESUMED",
+        currentStep="resumed_outreach",
+        stepHistory=step_history,
+        approvalStatus="APPROVED",
+        pendingApprovalId=row["id"],
+        cleanedLead=context,
+        siteContent=site_content,
+        outreachDraft=outreach,
+        deployment=deployment,
+        deploymentHistory=deployment_history,
+        zendesk=zendesk,
+        publishMode=publish_mode,
+        githubExport=github_export,
+    )
 
 
 def run_probe_check(name: str, callback) -> ApiProbeCheck:
@@ -2899,128 +3384,123 @@ def get_lead_presets():
 def get_site_templates():
     return {"templates": SITE_TEMPLATES}
 
-
 @app.post("/api/leads/discover", response_model=DiscoverLeadsResponse)
 def discover_leads(request: DiscoverLeadsRequest):
     preset = get_preset_or_404(request.presetId)
-    location = "South Africa"
-    limit = max(10, min(request.limit, 25))
-
+    location = compact_text(request.location, "Durban, South Africa")
+    limit = max(1, min(request.limit or 3, 5))
     primary_query = build_google_maps_query(preset, location, request.query)
-    query_term = compact_text(request.query) or compact_text(preset.get("query", ""))
-    if not query_term:
-        query_term = preset.get("industry", "services")
 
     warnings: List[str] = []
-    province_stats: Dict[str, Any] = {
-        province: {"rawItems": 0, "normalized": 0, "selected": 0, "duplicatesSkipped": 0}
-        for province in SOUTH_AFRICA_PROVINCES
-    }
     duplicates_skipped = 0
+    selected_leads: List[DiscoveredLead] = []
+
+    province_stats: Dict[str, Any] = {
+        location: {
+            "rawItems": 0,
+            "normalized": 0,
+            "selected": 0,
+            "duplicatesSkipped": 0,
+        }
+    }
 
     log_event(
         "info",
         "leads.discover.start",
-        "All-province South Africa lead discovery started.",
+        "Focused lead discovery started.",
         presetId=request.presetId,
         location=location,
         query=primary_query,
         limit=limit,
-        provinces=SOUTH_AFRICA_PROVINCES,
     )
 
-    province_buckets: Dict[str, List[DiscoveredLead]] = {province: [] for province in SOUTH_AFRICA_PROVINCES}
-    seen_batch_keys = set()
-
     try:
-        per_province_limit = max(3, min(10, limit))
-        for province in SOUTH_AFRICA_PROVINCES:
-            province_location = f"{province}, South Africa"
-            province_query = build_google_maps_query(preset, province_location, request.query)
-            query_items = run_apify_google_maps(province_query, per_province_limit, province_location)
-            province_stats[province]["rawItems"] = len(query_items)
-            normalized = normalize_apify_items(query_items, preset["industry"], province_location, per_province_limit)
-            province_stats[province]["normalized"] = len(normalized)
+        query_items = run_apify_google_maps(primary_query, limit, location)
+        province_stats[location]["rawItems"] = len(query_items)
 
-            candidate_keys = [canonical_lead_key_for_lead(lead) for lead in normalized]
-            existing_keys = existing_canonical_lead_keys(candidate_keys)
-
-            for lead in normalized:
-                canonical_key = canonical_lead_key_for_lead(lead)
-                lead.canonicalLeadKey = canonical_key
-                lead.province = province
-                lead.location = province_location
-                lead.ownerName = compact_text(request.ownerName) or None
-                lead.ownerEmail = compact_text(request.ownerEmail).lower() or None
-                lead.ownerStatus = compact_text(request.ownerStatus, "unassigned")
-                if lead.ownerName or lead.ownerEmail:
-                    lead.assignedAt = now_iso()
-
-                if canonical_key in existing_keys or canonical_key in seen_batch_keys:
-                    duplicates_skipped += 1
-                    province_stats[province]["duplicatesSkipped"] += 1
-                    continue
-
-                seen_batch_keys.add(canonical_key)
-                province_buckets[province].append(lead)
-
-    except requests.RequestException as error:
-        log_event(
-            "error",
-            "leads.discover.failed",
-            "Apify lead discovery request failed.",
-            presetId=request.presetId,
-            reason=str(error),
+        normalized = normalize_apify_items(
+            query_items,
+            preset["industry"],
+            location,
+            limit,
         )
-        raise HTTPException(
-            status_code=502,
-            detail=f"Apify lead discovery failed: {str(error)}",
-        )
+        province_stats[location]["normalized"] = len(normalized)
 
-    except RuntimeError as error:
-        log_event(
-            "error",
-            "leads.discover.failed",
-            "Lead discovery configuration failed.",
-            presetId=request.presetId,
-            reason=str(error),
-        )
-        raise HTTPException(status_code=500, detail=str(error))
+        candidate_keys = [canonical_lead_key_for_lead(lead) for lead in normalized]
+        existing_keys = existing_canonical_lead_keys(candidate_keys)
+        seen_batch_keys = set()
 
-    selected_leads: List[DiscoveredLead] = []
+        for lead in normalized:
+            canonical_key = canonical_lead_key_for_lead(lead)
+            lead.canonicalLeadKey = canonical_key
+            lead.location = location
+            lead.ownerName = compact_text(request.ownerName) or None
+            lead.ownerEmail = compact_text(request.ownerEmail).lower() or None
+            lead.ownerStatus = compact_text(request.ownerStatus, "unassigned")
 
-    for province in SOUTH_AFRICA_PROVINCES:
-        bucket = province_buckets[province]
-        if bucket and len(selected_leads) < limit:
-            selected = bucket.pop(0)
-            selected_leads.append(selected)
-            province_stats[province]["selected"] += 1
+            if lead.ownerName or lead.ownerEmail:
+                lead.assignedAt = now_iso()
 
-    while len(selected_leads) < limit:
-        added = False
-        for province in SOUTH_AFRICA_PROVINCES:
-            bucket = province_buckets[province]
-            if not bucket:
+            if canonical_key in existing_keys or canonical_key in seen_batch_keys:
+                duplicates_skipped += 1
+                province_stats[location]["duplicatesSkipped"] += 1
                 continue
-            selected = bucket.pop(0)
-            selected_leads.append(selected)
-            province_stats[province]["selected"] += 1
-            added = True
+
+            seen_batch_keys.add(canonical_key)
+            selected_leads.append(lead)
+
             if len(selected_leads) >= limit:
                 break
-        if not added:
-            break
+
+    except Exception as error:
+        warnings.append(f"Apify failed, demo fallback leads were used: {str(error)}")
+
+        demo_category = preset.get("industry", "Local Service")
+        demo_businesses = [
+            f"{location.split(',')[0]} {demo_category} Co",
+            f"Reliable {demo_category} Durban",
+            f"Quick Help {demo_category}",
+        ]
+
+        for business_name in demo_businesses[:limit]:
+            lead = DiscoveredLead(
+                leadKey=stable_lead_key(business_name, location, demo_category),
+                canonicalLeadKey=stable_lead_key("demo", business_name, location, demo_category),
+                businessName=business_name,
+                email="info@example.com",
+                phone="+27 31 000 0000",
+                website=None,
+                domain=None,
+                category=demo_category,
+                address=location,
+                location=location,
+                province=None,
+                rating=None,
+                reviewsCount=None,
+                source="demo-fallback",
+                sourceUrl=None,
+                ownerName=compact_text(request.ownerName) or None,
+                ownerEmail=compact_text(request.ownerEmail).lower() or None,
+                ownerStatus=compact_text(request.ownerStatus, "unassigned"),
+                assignedAt=now_iso() if request.ownerName or request.ownerEmail else None,
+                notes="Demo fallback lead used because the live Apify request failed or timed out.",
+                raw={"fallback": True},
+            )
+            selected_leads.append(lead)
 
     for lead in selected_leads:
-        upsert_lead_registry(lead)
+        try:
+            upsert_lead_registry(lead)
+        except Exception as error:
+            warnings.append(f"Could not save lead {lead.businessName}: {str(error)}")
 
-    if len(selected_leads) < 10:
-        warnings.append(
-            f"Only {len(selected_leads)} new valid leads were returned for South Africa. "
-            "Some Apify results were removed because they did not match the requested location."
-        )
+    province_stats[location]["selected"] = len(selected_leads)
+
+    if not selected_leads:
+        warnings.append("No leads were returned. Try a smaller city search such as Durban, South Africa.")
 
     batch_id = str(uuid4())
+
     response = DiscoverLeadsResponse(
         batchId=batch_id,
         preset=preset,
@@ -3034,16 +3514,25 @@ def discover_leads(request: DiscoverLeadsRequest):
     )
 
     DISCOVERY_DB[batch_id] = response.model_dump()
-    record_discovery_batch(
-        batch_id=batch_id,
-        preset_id=request.presetId,
-        query=primary_query,
-        location=location,
-        lead_count=len(selected_leads),
-        duplicates_skipped=duplicates_skipped,
-        province_stats=province_stats,
-        warnings=warnings,
-    )
+
+    try:
+        record_discovery_batch(
+            batch_id=batch_id,
+            preset_id=request.presetId,
+            query=primary_query,
+            location=location,
+            lead_count=len(selected_leads),
+            duplicates_skipped=duplicates_skipped,
+            province_stats=province_stats,
+            warnings=warnings,
+        )
+    except Exception as error:
+        log_event(
+            "warning",
+            "leads.discover.batch_save_failed",
+            "Discovery batch could not be saved.",
+            reason=str(error),
+        )
 
     log_event(
         "info",
@@ -3058,7 +3547,6 @@ def discover_leads(request: DiscoverLeadsRequest):
     )
 
     return response
-
 
 @app.post("/api/pipeline/run", response_model=PipelineRunResponse)
 def run_pipeline(request: PipelineRunRequest):
@@ -3148,6 +3636,27 @@ def run_pipeline(request: PipelineRunRequest):
         try:
             log_event("info", "pipeline.lead.start", "Processing pipeline lead.", pipelineId=pipeline_id, leadKey=lead.leadKey, businessName=lead.businessName)
             upsert_lead_registry(lead)
+
+            if request.resumeExisting and not request.forceRegenerate:
+                existing_approval = latest_reusable_approval_for_lead(canonical_key)
+                if existing_approval:
+                    log_event(
+                        "info",
+                        "pipeline.lead.resume_existing",
+                        "Reusable pipeline output found for lead.",
+                        pipelineId=pipeline_id,
+                        leadKey=lead.leadKey,
+                        canonicalLeadKey=canonical_key,
+                        approvalId=existing_approval["id"],
+                        approvalStatus=existing_approval["status"],
+                    )
+                    if existing_approval["status"] == "DEPLOYED_ZENDESK_FAILED":
+                        current_step = "resume_outreach"
+                        results.append(resume_failed_outreach_approval(lead, existing_approval, pipeline_id))
+                    else:
+                        results.append(pipeline_result_from_reused_approval(lead, existing_approval, pipeline_id))
+                    continue
+
             contact_details = run_step("scrape_contact_details", "website", lambda: scrape_contact_details(lead), retryable=True)
             log_event("info", "pipeline.lead.scraped", "Contact details scraped.", pipelineId=pipeline_id, leadKey=lead.leadKey, hasEmail=bool(contact_details.get("email")), hasWebsite=bool(contact_details.get("website")))
             cleaned_context = {
@@ -3206,6 +3715,8 @@ def run_pipeline(request: PipelineRunRequest):
                 site_content=site_content,
                 template=template,
             )
+            if request.forceRegenerate:
+                supersede_pending_approvals(canonical_key, approval_id, "pipeline force regenerate")
             approval_status = "PENDING"
             current_step = "approval"
             status = "PENDING_APPROVAL"
@@ -3244,6 +3755,8 @@ def run_pipeline(request: PipelineRunRequest):
                 outreachDraft=None,
                 deployment=None,
                 zendesk=None,
+                publishMode="direct-netlify",
+                githubExport=None,
                 structuredErrors=structured_errors,
                 errors=errors,
             )
@@ -3252,13 +3765,16 @@ def run_pipeline(request: PipelineRunRequest):
     pending_count = sum(1 for result in results if result.status == "PENDING_APPROVAL")
     failed_count = sum(1 for result in results if result.status == "FAILED")
     completed_count = sum(1 for result in results if result.status.startswith("COMPLETED"))
-    response_status = (
-        "PENDING_APPROVAL"
-        if pending_count == len(results)
-        else "PARTIAL_FAILURE"
-        if pending_count or completed_count
-        else "FAILED"
-    )
+    if failed_count and (pending_count or completed_count):
+        response_status = "PARTIAL_FAILURE"
+    elif failed_count:
+        response_status = "FAILED"
+    elif pending_count and completed_count:
+        response_status = "PARTIAL_PENDING"
+    elif pending_count:
+        response_status = "PENDING_APPROVAL"
+    else:
+        response_status = "COMPLETED"
     response = PipelineRunResponse(
         pipelineId=pipeline_id,
         status=response_status,
@@ -3461,6 +3977,8 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
     deployment_history: Optional[Dict[str, Any]] = None
     outreach: Optional[Dict[str, Any]] = None
     zendesk: Optional[Dict[str, Any]] = None
+    github_export: Optional[Dict[str, Any]] = None
+    publish_mode = normalize_publish_mode(request.publishMode)
     status = "APPROVED"
 
     if not site_html:
@@ -3500,6 +4018,42 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
         return result
 
     try:
+        if publish_mode == "github-netlify":
+            github_export = run_approval_step(
+                "github_export",
+                "github",
+                lambda: export_site_to_github(
+                    canonical_key=row["canonical_lead_key"],
+                    business_name=row["business_name"],
+                    site_html=site_html,
+                ),
+            )
+    except Exception as error:
+        status = "PUBLISH_FAILED"
+        errors.append(structured_pipeline_error("github_export", error, provider="github", retryable=True))
+        with get_pipeline_db() as db:
+            db.execute(
+                """
+                UPDATE approval_records
+                SET status = ?, updated_at = ?, approved_by = ?, notes = ?,
+                    publish_mode = ?, github_export_json = ?, errors_json = ?
+                WHERE id = ?
+                """,
+                (
+                    status,
+                    now_iso(),
+                    approved_by,
+                    request.notes,
+                    publish_mode,
+                    json.dumps(github_export, default=str) if github_export else None,
+                    json.dumps(errors, default=str),
+                    approval_id,
+                ),
+            )
+        refresh_pipeline_run_status_from_approvals(row["pipeline_id"])
+        raise HTTPException(status_code=502, detail=f"GitHub export failed: {str(error)}")
+
+    try:
         deployment = run_approval_step(
             "netlify_deploy",
             "netlify",
@@ -3511,16 +4065,11 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
                 approval_id=approval_id,
                 approved_by=approved_by,
                 regenerate_existing_site=request.regenerateExistingSite,
+                publish_mode=publish_mode,
+                github_export=github_export,
             ),
         )
-        with get_pipeline_db() as db:
-            deployment_row = db.execute(
-                "SELECT * FROM deployment_history WHERE id = ?",
-                (deployment.get("deploymentHistoryId"),),
-            ).fetchone()
-        if deployment_row:
-            deployment_history = dict(deployment_row)
-            deployment_history["raw"] = safe_json_loads(deployment_history.pop("raw_json", None), {})
+        deployment_history = deployment_history_row_to_dict(get_deployment_history_row(deployment.get("deploymentHistoryId")))
     except Exception as error:
         status = "DEPLOY_FAILED"
         errors.append(structured_pipeline_error("netlify_deploy", error, provider="netlify", retryable=True))
@@ -3528,10 +4077,20 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
             db.execute(
                 """
                 UPDATE approval_records
-                SET status = ?, updated_at = ?, approved_by = ?, notes = ?, errors_json = ?
+                SET status = ?, updated_at = ?, approved_by = ?, notes = ?,
+                    publish_mode = ?, github_export_json = ?, errors_json = ?
                 WHERE id = ?
                 """,
-                (status, now_iso(), approved_by, request.notes, json.dumps(errors, default=str), approval_id),
+                (
+                    status,
+                    now_iso(),
+                    approved_by,
+                    request.notes,
+                    publish_mode,
+                    json.dumps(github_export, default=str) if github_export else None,
+                    json.dumps(errors, default=str),
+                    approval_id,
+                ),
             )
         refresh_pipeline_run_status_from_approvals(row["pipeline_id"])
         raise HTTPException(status_code=502, detail=f"Netlify deployment failed: {str(error)}")
@@ -3562,7 +4121,8 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
             """
             UPDATE approval_records
             SET status = ?, updated_at = ?, approved_by = ?, notes = ?,
-                deployment_history_id = ?, outreach_json = ?, zendesk_json = ?, errors_json = ?
+                deployment_history_id = ?, outreach_json = ?, zendesk_json = ?,
+                publish_mode = ?, github_export_json = ?, errors_json = ?
             WHERE id = ?
             """,
             (
@@ -3573,6 +4133,8 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
                 deployment.get("deploymentHistoryId") if deployment else None,
                 json.dumps(outreach, default=str) if outreach else None,
                 json.dumps(zendesk, default=str) if zendesk else None,
+                publish_mode,
+                json.dumps(github_export, default=str) if github_export else None,
                 json.dumps(errors, default=str),
                 approval_id,
             ),
@@ -3599,6 +4161,8 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
         deploymentHistory=deployment_history,
         zendesk=zendesk,
         outreachDraft=outreach,
+        publishMode=publish_mode,
+        githubExport=github_export,
         errors=errors,
     )
 
@@ -3790,6 +4354,8 @@ def get_deployment_history(limit: int = 50):
     for row in rows:
         item = dict(row)
         item["raw"] = safe_json_loads(item.pop("raw_json", None), {})
+        item["githubExport"] = safe_json_loads(item.pop("github_export_json", None), None)
+        item["publishMode"] = item.pop("publish_mode", None) or "direct-netlify"
         history.append(item)
     return {"deployments": history, "count": len(history)}
 

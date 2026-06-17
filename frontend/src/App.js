@@ -58,7 +58,7 @@ const FALLBACK_TEMPLATES = [
 const MAX_UI_LOGS = 80;
 
 function App() {
-  const API_BASE = process.env.REACT_APP_API_BASE || "http://127.0.0.1:8000";
+  const API_BASE = "http://127.0.0.1:8000";
   const shellRef = useRef(null);
   const flowRef = useRef(null);
 
@@ -66,7 +66,7 @@ function App() {
   const [templates, setTemplates] = useState(FALLBACK_TEMPLATES);
   const [selectedPresetId, setSelectedPresetId] = useState("restaurants");
   const [selectedTemplateId, setSelectedTemplateId] = useState("default-service");
-  const [location] = useState("South Africa");
+  const [location, setLocation] = useState("Durban, South Africa");
   const [customQuery, setCustomQuery] = useState("");
   const [ownerName, setOwnerName] = useState("");
   const [ownerEmail, setOwnerEmail] = useState("");
@@ -96,6 +96,8 @@ function App() {
   const [apiProbe, setApiProbe] = useState(null);
   const [manualFlow, setManualFlow] = useState(null);
   const [debugBusy, setDebugBusy] = useState(null);
+  const [forceRegenerate, setForceRegenerate] = useState(false);
+  const [publishMode, setPublishMode] = useState("direct-netlify");
 
   const addUiLog = useCallback((level, event, text, details = {}) => {
     const entry = {
@@ -317,8 +319,8 @@ function App() {
       },
       {
         key: "pipeline",
-        label: "Generate",
-        detail: running ? "Models active" : pipelineResult?.status || "Not run",
+        label: forceRegenerate ? "Regenerate" : "Resume",
+        detail: running ? (forceRegenerate ? "Models active" : "Checking saved work") : pipelineResult?.status || "Not run",
         state: running ? "active" : pipelineResult ? (failedCount ? "danger" : "complete") : "idle",
       },
       {
@@ -328,13 +330,24 @@ function App() {
         state: pendingApprovalCount ? "warning" : approvals.length ? "complete" : "idle",
       },
       {
+        key: "github",
+        label: "GitHub",
+        detail: publishMode === "github-netlify" ? "Optional export on" : "Optional",
+        state:
+          approvalBusy && publishMode === "github-netlify"
+            ? "active"
+            : deployments.some((deployment) => deployment.publishMode === "github-netlify" || deployment.raw?.publishMode === "github-netlify")
+              ? "complete"
+              : "idle",
+      },
+      {
         key: "deploy",
         label: "Deploy",
         detail: deployments.length ? `${deployments.length} deploys` : "After approval",
         state: deployments.length ? "complete" : approvalBusy ? "active" : "idle",
       },
     ],
-    [approvalBusy, approvals.length, debugStatus, deployments.length, discovering, failedCount, leads.length, pendingApprovalCount, pipelineResult, running, selectedLeads.length]
+    [approvalBusy, approvals.length, debugStatus, deployments, discovering, failedCount, forceRegenerate, leads.length, pendingApprovalCount, pipelineResult, publishMode, running, selectedLeads.length]
   );
 
   useEffect(() => {
@@ -433,7 +446,7 @@ useEffect(() => {
       setProvinceStats({});
       setDuplicatesSkipped(0);
       setSelectedLeadKeys([]);
-      setNotice("Searching Google Maps with Apify across all South African provinces...", "info");
+      setNotice("Searching Google Maps with Apify...", "info");
 
       const data = await callApi(
         "Lead Discovery API",
@@ -441,9 +454,9 @@ useEffect(() => {
         "/api/leads/discover",
         {
           presetId: selectedPreset.id,
-          location: "South Africa",
+          location: location || "Durban, South Africa",
           query: customQuery || null,
-          limit: 10,
+          limit: 3,
           ownerName: ownerName || null,
           ownerEmail: ownerEmail || null,
           ownerStatus,
@@ -456,10 +469,12 @@ useEffect(() => {
       setWarnings(data.warnings || []);
       setProvinceStats(data.provinceStats || {});
       setDuplicatesSkipped(data.duplicatesSkipped || 0);
+
       setNotice(
         `Fetched ${data.leads?.length || 0} new South African leads. Skipped ${data.duplicatesSkipped || 0} duplicates.`,
         data.leads?.length ? "success" : "warning"
       );
+
       refreshDiagnostics(true);
       refreshOperations(true);
     } catch (error) {
@@ -484,7 +499,12 @@ useEffect(() => {
     try {
       setRunning(true);
       setPipelineResult(null);
-      setNotice("Generating final HTML and preparing approvals. Deployment waits for manual approval.", "info");
+      setNotice(
+        forceRegenerate
+          ? "Forcing fresh HTML generation and preparing new approvals."
+          : "Resuming saved work first. New HTML is generated only for leads without reusable output.",
+        "info"
+      );
 
       const data = await callApi(
         "Full Pipeline API",
@@ -495,14 +515,16 @@ useEffect(() => {
           templateId: selectedTemplate.id,
           leads: selectedLeads,
           regenerateExistingSites: true,
+          resumeExisting: true,
+          forceRegenerate,
         },
         { timeout: 600000 }
       );
 
       setPipelineResult(data);
       setNotice(
-        `Pipeline finished with status ${data.status}. Review pending approvals before deployment.`,
-        data.status === "PENDING_APPROVAL" ? "warning" : data.status === "COMPLETED" ? "success" : "warning"
+        `Pipeline finished with status ${data.status}. Reused/skipped steps are shown in each result history.`,
+        data.status === "PENDING_APPROVAL" || data.status === "PARTIAL_PENDING" ? "warning" : data.status === "COMPLETED" ? "success" : "warning"
       );
       refreshDiagnostics(true);
       refreshOperations(true);
@@ -518,7 +540,12 @@ useEffect(() => {
   const approveSite = async (approvalId) => {
     try {
       setApprovalBusy(approvalId);
-      setNotice("Approving site and deploying to Netlify...", "info");
+      setNotice(
+        publishMode === "github-netlify"
+          ? "Approving site, exporting HTML to GitHub, then deploying to Netlify..."
+          : "Approving site and deploying to Netlify...",
+        "info"
+      );
       const data = await callApi(
         "Approval Deploy API",
         "post",
@@ -527,13 +554,14 @@ useEffect(() => {
           approvedBy: ownerName || "Dashboard Operator",
           notes: "Approved from dashboard.",
           regenerateExistingSite: true,
+          publishMode,
         },
         { timeout: 420000 }
       );
       setNotice(
         data.zendesk?.ticketUrl
-          ? `Approved and deployed ${data.businessName}. Zendesk ticket created.`
-          : `Approved and deployed ${data.businessName}. Zendesk needs review.`,
+          ? `Approved and deployed ${data.businessName}${data.githubExport ? " via GitHub" : ""}. Zendesk ticket created.`
+          : `Approved and deployed ${data.businessName}${data.githubExport ? " via GitHub" : ""}. Zendesk needs review.`,
         data.status === "APPROVED" ? "success" : "warning"
       );
       refreshDiagnostics(true);
@@ -766,8 +794,8 @@ useEffect(() => {
 
   const statusBadgeClass = (status) => {
     if (status?.startsWith("COMPLETED") || status === "VALID" || status === "READY") return "text-bg-success";
-    if (status === "PROCESSING" || status === "ACTION_REQUIRED") return "text-bg-warning";
-    if (status === "FAILED" || status === "INVALID") return "text-bg-danger";
+    if (status === "PROCESSING" || status === "ACTION_REQUIRED" || status === "PENDING_APPROVAL" || status === "PARTIAL_PENDING" || status === "SKIPPED") return "text-bg-warning";
+    if (status === "FAILED" || status === "INVALID" || status === "PARTIAL_FAILURE" || status === "DEPLOYED_ZENDESK_FAILED" || status === "DEPLOY_FAILED" || status === "PUBLISH_FAILED") return "text-bg-danger";
     return "text-bg-secondary";
   };
 
@@ -875,9 +903,8 @@ useEffect(() => {
                     <input
                       className="form-control"
                       value={location}
-                      readOnly
-                      data-bs-toggle="tooltip"
-                      title="Searches all nine South African provinces and filters out non-South African results."
+                       onChange={(event) => setLocation(event.target.value)}
+                       placeholder="Durban, South Africa"
                     />
                   </div>
                   <div className="col-md-6">
@@ -1159,14 +1186,23 @@ useEffect(() => {
                 <button className="btn btn-outline-secondary" type="button" onClick={clearSelectedLeads} disabled={!selectedLeadKeys.length}>
                   Clear
                 </button>
+                <label className="form-check d-flex align-items-center gap-2 mb-0">
+                  <input
+                    className="form-check-input mt-0"
+                    type="checkbox"
+                    checked={forceRegenerate}
+                    onChange={(event) => setForceRegenerate(event.target.checked)}
+                  />
+                  <span className="small">Force regenerate</span>
+                </label>
                 <button
                   className="btn btn-primary"
                   onClick={runPipeline}
                   disabled={running || !selectedLeads.length}
                   data-bs-toggle="tooltip"
-                  title="Runs Gemini and Groq generation, then stores final HTML for manual approval before deployment."
+                  title="Resumes saved work first. Force regenerate creates fresh Gemini and Groq output."
                 >
-                  {running ? "Running..." : "Run Pipeline"}
+                  {running ? "Running..." : forceRegenerate ? "Regenerate Selected" : "Resume Pipeline"}
                 </button>
               </div>
             </div>
@@ -1268,7 +1304,7 @@ useEffect(() => {
                       <article className="result-card processing" key={lead.leadKey}>
                         <span className="badge text-bg-primary">PROCESSING</span>
                         <h3>{lead.businessName}</h3>
-                        <p>Queued for Gemini/Groq generation and manual approval.</p>
+                        <p>{forceRegenerate ? "Queued for fresh Gemini/Groq generation." : "Checking saved approvals and deployments before generating."}</p>
                       </article>
                     ))}
                   </div>
@@ -1297,6 +1333,13 @@ useEffect(() => {
                           <div>
                             <dt>Current step</dt>
                             <dd>{result.currentStep || result.pipelineStatus || result.status}</dd>
+                          </div>
+                          <div>
+                            <dt>Publish</dt>
+                            <dd>
+                              {result.publishMode || "direct-netlify"}
+                              {result.githubExport?.path ? ` | ${result.githubExport.path}` : ""}
+                            </dd>
                           </div>
                           <div>
                             <dt>Netlify</dt>
@@ -1405,9 +1448,23 @@ useEffect(() => {
                             <dt>Checksum</dt>
                             <dd>{approval.htmlChecksum}</dd>
                           </div>
+                          <div>
+                            <dt>Publish</dt>
+                            <dd>{approval.publishMode || "direct-netlify"}</dd>
+                          </div>
                         </dl>
                         {approval.status === "PENDING" && (
                           <div className="d-flex flex-wrap gap-2">
+                            <select
+                              className="form-select form-select-sm approval-publish-mode"
+                              value={publishMode}
+                              onChange={(event) => setPublishMode(event.target.value)}
+                              disabled={approvalBusy === approval.approvalId}
+                              aria-label="Publish mode"
+                            >
+                              <option value="direct-netlify">Direct Netlify</option>
+                              <option value="github-netlify">GitHub + Netlify</option>
+                            </select>
                             <button
                               className="btn btn-outline-secondary btn-sm"
                               type="button"
@@ -1479,6 +1536,7 @@ useEffect(() => {
                         <div>
                           <strong>{deployment.site_name || deployment.siteName || deployment.canonical_lead_key}</strong>
                           <span>{deployment.deploy_action || deployment.deployAction} | {deployment.state}</span>
+                          <span>{deployment.publishMode || deployment.raw?.publishMode || "direct-netlify"}</span>
                         </div>
                         {deployment.url && (
                           <a href={deployment.url} target="_blank" rel="noreferrer">
