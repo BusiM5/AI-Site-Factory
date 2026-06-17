@@ -67,6 +67,7 @@ REQUIRED_PROVIDER_ENV = {
     "groq": ["GROQ_API_KEY"],
     "netlify": ["NETLIFY_AUTH_TOKEN"],
     "zendesk": ["ZENDESK_SUBDOMAIN", "ZENDESK_EMAIL", "ZENDESK_API_TOKEN"],
+    "github": ["GITHUB_OWNER", "GITHUB_REPO", "GITHUB_TOKEN"],
 }
 
 VALID_PUBLISH_MODES = {"direct-netlify", "github-netlify"}
