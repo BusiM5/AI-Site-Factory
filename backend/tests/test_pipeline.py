@@ -25,6 +25,20 @@ def isolated_pipeline_db(tmp_path, monkeypatch):
     yield
 
 
+class FakeResponse:
+    def __init__(self, status_code=200, payload=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = str(self._payload)
+
+    def json(self):
+        return self._payload
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
 def apify_item(index, category="Restaurant", province="Gauteng"):
     return {
         "title": f"Lead Business {index}",
@@ -39,90 +53,6 @@ def apify_item(index, category="Restaurant", province="Gauteng"):
     }
 
 
-def stub_generation(monkeypatch, model_calls=None):
-    calls = model_calls if model_calls is not None else []
-    monkeypatch.setattr(main, "scrape_contact_details", lambda lead: {"email": lead.email, "phone": lead.phone, "website": lead.website})
-    monkeypatch.setattr(
-        main,
-        "generate_page_prompt_with_gemini",
-        lambda context, template: calls.append("gemini_prompt") or {"pagePrompt": "Build the page."},
-    )
-    monkeypatch.setattr(
-        main,
-        "generate_draft_html_with_groq",
-        lambda context, template, page_prompt: calls.append("groq_html") or {
-            "html": "<!doctype html><html><head><title>Draft</title></head><body>Draft</body></html>",
-            "notes": "Draft",
-        },
-    )
-    monkeypatch.setattr(
-        main,
-        "finalize_html_with_gemini",
-        lambda context, template, page_prompt, draft_html: calls.append("gemini_final") or {
-            "html": "<!doctype html><html><head><title>Final</title></head><body>Final</body></html>",
-            "qaNotes": "Final",
-        },
-    )
-    return calls
-
-
-def fake_deploy_with_history(
-    canonical_key,
-    business_name,
-    site_html,
-    pipeline_id,
-    approval_id,
-    approved_by,
-    regenerate_existing_site=True,
-    publish_mode="direct-netlify",
-    github_export=None,
-):
-    history_id = f"history-{canonical_key}"
-    result = {
-        "deployAction": "CREATED",
-        "siteCreated": True,
-        "siteReused": False,
-        "siteId": f"site-{canonical_key}",
-        "siteName": "ai-site-alpha",
-        "deployId": f"deploy-{canonical_key}",
-        "state": "ready",
-        "url": "https://alpha.netlify.app",
-        "deploymentHistoryId": history_id,
-        "publishMode": publish_mode,
-        "githubExport": github_export,
-    }
-    with main.get_pipeline_db() as db:
-        db.execute(
-            """
-            INSERT INTO deployment_history (
-                id, canonical_lead_key, pipeline_id, approval_id, site_id, site_name,
-                deploy_id, url, deploy_action, state, html_checksum, deployed_at,
-                approved_by, publish_mode, github_export_json, raw_json
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                history_id,
-                canonical_key,
-                pipeline_id,
-                approval_id,
-                result["siteId"],
-                result["siteName"],
-                result["deployId"],
-                result["url"],
-                result["deployAction"],
-                result["state"],
-                main.html_checksum(site_html),
-                main.now_iso(),
-                approved_by,
-                publish_mode,
-                main.json.dumps(github_export, default=str) if github_export else None,
-                main.json.dumps(result, default=str),
-            ),
-        )
-    return result
-
-
 def lead_payload():
     return main.DiscoveredLead(
         leadKey="lead-1",
@@ -133,483 +63,404 @@ def lead_payload():
     ).model_dump()
 
 
-def test_discover_leads_searches_requested_location(monkeypatch):
-    calls = []
-
-    def fake_apify(query, limit, location="South Africa"):
-        calls.append((query, location))
-        return [
-            apify_item(10, province="Gauteng"),
-            apify_item(11, province="Gauteng"),
-        ]
-
-    monkeypatch.setattr(main, "run_apify_google_maps", fake_apify)
-
-    response = client.post(
-        "/api/leads/discover",
-        json={
-            "presetId": "restaurants",
-            "location": "Gauteng, South Africa",
-            "query": "family restaurants",
-            "limit": 2,
-        },
-    )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["sourceStatus"] == "READY"
-    assert len(payload["leads"]) == 2
-    assert calls == [("family restaurants in Gauteng, South Africa", "Gauteng, South Africa")]
-    assert payload["leads"][0]["location"] == "Gauteng, South Africa"
-    assert payload["provinceStats"]["Gauteng, South Africa"]["rawItems"] == 2
-    assert payload["duplicatesSkipped"] == 0
+def fake_github_export(canonical_key, business_name, site_html, pipeline_id=None, approval_id=None):
+    return {
+        "exportAction": "CREATED",
+        "repository": f"owner/ai-site-{canonical_key[:8]}",
+        "repoName": f"ai-site-{canonical_key[:8]}",
+        "repoUrl": f"https://github.com/owner/ai-site-{canonical_key[:8]}",
+        "branch": "main",
+        "path": "index.html",
+        "htmlChecksum": main.html_checksum(site_html),
+        "indexContentSha": "index-sha",
+        "readmeContentSha": "readme-sha",
+        "commitSha": f"commit-{canonical_key[:8]}",
+        "htmlUrl": f"https://github.com/owner/ai-site-{canonical_key[:8]}/blob/main/index.html",
+        "pipelineId": pipeline_id,
+        "approvalId": approval_id,
+        "exportedAt": main.now_iso(),
+    }
 
 
-def test_discover_leads_skips_previously_seen_leads(monkeypatch):
-    def fake_apify(query, limit, location="South Africa"):
-        province = location.split(",")[0]
-        return [apify_item(1, province=province)]
-
-    monkeypatch.setattr(main, "run_apify_google_maps", fake_apify)
-
-    first = client.post(
-        "/api/leads/discover",
-        json={"presetId": "restaurants", "location": "South Africa", "limit": 10},
-    )
-    second = client.post(
-        "/api/leads/discover",
-        json={"presetId": "restaurants", "location": "South Africa", "limit": 10},
-    )
-
-    assert first.status_code == 200
-    assert len(first.json()["leads"]) == 1
-    assert second.status_code == 200
-    assert second.json()["leads"] == []
-    assert second.json()["duplicatesSkipped"] == 1
-
-
-def test_normalize_apify_items_handles_missing_fields_and_duplicates():
-    items = [
-        {"title": "Same Business", "website": "same.example.com", "countryCode": "ZA"},
-        {"title": "Same Business", "website": "https://same.example.com", "countryCode": "ZA"},
-        {"title": "No Contact Business", "categoryName": "Plumbing", "countryCode": "ZA"},
-        {"website": "https://missing-name.example.com", "countryCode": "ZA"},
-    ]
-
-    leads = main.normalize_apify_items(
-        items,
-        fallback_category="General Services",
-        location="South Africa",
-        limit=10,
-    )
-
-    assert len(leads) == 2
-    assert leads[0].domain == "same.example.com"
-    assert leads[1].email is None
-    assert leads[1].category == "Plumbing"
-
-
-def test_pipeline_run_processes_multiple_leads(monkeypatch):
-    model_calls = []
-
+def stub_generation(monkeypatch, model_calls=None, export_calls=None):
+    calls = model_calls if model_calls is not None else []
+    exports = export_calls if export_calls is not None else []
     monkeypatch.setattr(main, "scrape_contact_details", lambda lead: {"email": lead.email, "phone": lead.phone, "website": lead.website})
     monkeypatch.setattr(
         main,
         "generate_page_prompt_with_gemini",
-        lambda context, template: model_calls.append("gemini_prompt") or {"pagePrompt": "Build the page."},
+        lambda context, template: calls.append("gemini_prompt") or {"pagePrompt": "Build the page with Bootstrap 5 and GSAP."},
     )
     monkeypatch.setattr(
         main,
         "generate_draft_html_with_groq",
-        lambda context, template, page_prompt: model_calls.append("groq_html") or {
-            "html": "<!doctype html><html><head><title>Draft</title></head><body><main><section>Draft</section></main></body></html>",
+        lambda context, template, page_prompt: calls.append("groq_html") or {
+            "html": "<!doctype html><html><head><title>Draft</title></head><body><main>Draft</main></body></html>",
             "notes": "Draft",
         },
     )
     monkeypatch.setattr(
         main,
         "finalize_html_with_gemini",
-        lambda context, template, page_prompt, draft_html: model_calls.append("gemini_final") or {
-            "html": "<!doctype html><html><head><title>Final</title></head><body><main><section id='hero'>Final</section></main></body></html>",
+        lambda context, template, page_prompt, draft_html: calls.append("gemini_final") or {
+            "html": "<!doctype html><html><head><title>Final</title></head><body><main>Final</main></body></html>",
             "qaNotes": "Final",
         },
     )
+
+    def export_stub(canonical_key, business_name, site_html, pipeline_id=None, approval_id=None):
+        exports.append((canonical_key, approval_id))
+        return fake_github_export(canonical_key, business_name, site_html, pipeline_id, approval_id)
+
+    monkeypatch.setattr(main, "export_site_to_github", export_stub)
+    return calls, exports
+
+
+def fake_git_deploy_with_history(
+    canonical_key,
+    business_name,
+    pipeline_id,
+    approval_id,
+    approved_by,
+    github_export,
+    regenerate_existing_site=False,
+):
+    history_id = f"history-{canonical_key}"
+    result = {
+        "deployAction": "CREATED",
+        "siteCreated": True,
+        "siteReused": False,
+        "siteId": f"site-{canonical_key}",
+        "siteName": "ai-site-alpha",
+        "buildId": f"build-{canonical_key}",
+        "deployId": f"deploy-{canonical_key}",
+        "state": "ready",
+        "url": "https://alpha.netlify.app",
+        "deploymentHistoryId": history_id,
+        "publishMode": "github-netlify",
+        "githubExport": github_export,
+        "githubRepoUrl": github_export["repoUrl"],
+        "githubRepoFullName": github_export["repository"],
+        "commitSha": github_export["commitSha"],
+    }
+    with main.get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT INTO deployment_history (
+                id, canonical_lead_key, pipeline_id, approval_id, site_id, site_name,
+                deploy_id, build_id, url, deploy_action, state, html_checksum, deployed_at,
+                approved_by, approval_status, github_repo_full_name, github_repo_url,
+                commit_sha, publish_mode, github_export_json, raw_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                history_id,
+                canonical_key,
+                pipeline_id,
+                approval_id,
+                result["siteId"],
+                result["siteName"],
+                result["deployId"],
+                result["buildId"],
+                result["url"],
+                result["deployAction"],
+                result["state"],
+                github_export["htmlChecksum"],
+                main.now_iso(),
+                approved_by,
+                "APPROVED",
+                github_export["repository"],
+                github_export["repoUrl"],
+                github_export["commitSha"],
+                "github-netlify",
+                main.json.dumps(github_export, default=str),
+                main.json.dumps(result, default=str),
+            ),
+        )
+    return result
+
+
+def test_discover_leads_searches_requested_location_and_caches(monkeypatch):
+    calls = []
+
+    def fake_apify(query, limit, location="South Africa"):
+        calls.append((query, location, limit))
+        return [apify_item(10, province="Gauteng"), apify_item(11, province="Gauteng")]
+
+    monkeypatch.setattr(main, "run_apify_google_maps", fake_apify)
+
+    first = client.post(
+        "/api/leads/discover",
+        json={"presetId": "restaurants", "location": "Gauteng, South Africa", "query": "family restaurants", "limit": 2},
+    )
+    second = client.post(
+        "/api/leads/discover",
+        json={"presetId": "restaurants", "location": "Gauteng, South Africa", "query": "family restaurants", "limit": 2},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["cached"] is False
+    assert second.json()["cached"] is True
+    assert len(second.json()["leads"]) == 2
+    assert calls == [("family restaurants in Gauteng, South Africa", "Gauteng, South Africa", 2)]
+
+
+def test_discover_force_refresh_skips_previously_seen_duplicate(monkeypatch):
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda query, limit, location="South Africa": [apify_item(1, province="Gauteng")])
+
+    first = client.post("/api/leads/discover", json={"presetId": "restaurants", "location": "South Africa", "limit": 1})
+    second = client.post("/api/leads/discover", json={"presetId": "restaurants", "location": "South Africa", "limit": 1, "forceRefresh": True})
+
+    assert first.status_code == 200
+    assert len(first.json()["leads"]) == 1
+    assert second.status_code == 200
+    assert second.json()["cached"] is False
+    assert second.json()["leads"] == []
+    assert second.json()["duplicatesSkipped"] == 1
+
+
+def test_pipeline_generates_bootstrap_gsap_html_and_exports_to_github_before_approval(monkeypatch):
+    model_calls, export_calls = stub_generation(monkeypatch)
     monkeypatch.setattr(
         main,
-        "deploy_site_to_netlify_for_lead",
+        "deploy_github_repo_to_netlify_for_lead",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("deployment must wait for approval")),
     )
-    monkeypatch.setattr(
-        main,
-        "create_zendesk_outreach_ticket",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("zendesk must wait for approval")),
-    )
 
-    leads = [
-        main.DiscoveredLead(
-            leadKey="lead-1",
-            businessName="Alpha Plumbing",
-            email="alpha@example.com",
-            category="Plumbing",
-            location="Durban",
-        ).model_dump(),
-        main.DiscoveredLead(
-            leadKey="lead-2",
-            businessName="Beta Dental",
-            email="beta@example.com",
-            category="Dental",
-            location="Cape Town",
-        ).model_dump(),
-    ]
-
-    response = client.post(
-        "/api/pipeline/run",
-        json={"templateId": "default-service", "sourceBatchId": "batch-1", "leads": leads},
-    )
+    response = client.post("/api/pipeline/run", json={"templateId": "default-service", "sourceBatchId": "batch-1", "leads": [lead_payload()]})
 
     assert response.status_code == 200
     payload = response.json()
+    result = payload["results"][0]
     assert payload["status"] == "PENDING_APPROVAL"
-    assert len(payload["results"]) == 2
-    assert payload["results"][0]["status"] == "PENDING_APPROVAL"
-    assert payload["results"][0]["pendingApprovalId"]
-    assert payload["results"][0]["deployment"] is None
-    assert payload["results"][0]["zendesk"] is None
-    assert model_calls == [
-        "gemini_prompt",
-        "groq_html",
-        "gemini_final",
-        "gemini_prompt",
-        "groq_html",
-        "gemini_final",
-    ]
+    assert result["status"] == "PENDING_APPROVAL"
+    assert result["pendingApprovalId"]
+    assert result["githubExport"]["repoUrl"].startswith("https://github.com/")
+    assert "bootstrap@5" in result["pendingPreviewHtml"]
+    assert "gsap" in result["pendingPreviewHtml"].lower()
+    assert model_calls == ["gemini_prompt", "groq_html", "gemini_final"]
+    assert len(export_calls) == 1
 
-    approvals = client.get("/api/approvals?status=PENDING").json()["approvals"]
-    assert len(approvals) == 2
+    detail = client.get(f"/api/approvals/{result['pendingApprovalId']}").json()
+    assert detail["status"] == "PENDING"
+    assert detail["githubExport"]["commitSha"]
 
 
-def test_approval_deploys_existing_pipeline_output_and_syncs_zendesk(monkeypatch):
-    monkeypatch.setattr(main, "scrape_contact_details", lambda lead: {"email": lead.email, "phone": lead.phone, "website": lead.website})
-    monkeypatch.setattr(main, "generate_page_prompt_with_gemini", lambda context, template: {"pagePrompt": "Build the page."})
-    monkeypatch.setattr(
-        main,
-        "generate_draft_html_with_groq",
-        lambda context, template, page_prompt: {
-            "html": "<!doctype html><html><head><title>Draft</title></head><body>Draft</body></html>",
-            "notes": "Draft",
-        },
-    )
-    monkeypatch.setattr(
-        main,
-        "finalize_html_with_gemini",
-        lambda context, template, page_prompt, draft_html: {
-            "html": "<!doctype html><html><head><title>Final</title></head><body>Final</body></html>",
-            "qaNotes": "Final",
-        },
-    )
-    monkeypatch.setattr(
-        main,
-        "deploy_site_to_netlify_for_lead",
-        fake_deploy_with_history,
-    )
-    monkeypatch.setattr(
-        main,
-        "generate_outreach_with_groq",
-        lambda context, site_url: {
-            "subject": f"Website preview for {context['businessName']}",
-            "body": f"Please see {site_url}",
-            "siteUrl": site_url,
-            "recipientEmail": context["email"],
-        },
-    )
-    monkeypatch.setattr(
-        main,
-        "create_zendesk_outreach_ticket",
-        lambda context, deployment, outreach, pipeline_id: {
-            "syncStatus": "TICKET_CREATED",
-            "ticketId": 123,
-            "ticketUrl": "https://example.zendesk.com/agent/tickets/123",
-        },
-    )
+def test_pipeline_records_github_export_without_netlify_before_approval(monkeypatch):
+    stub_generation(monkeypatch)
 
-    lead = lead_payload()
+    response = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead_payload()]})
+    pipeline_id = response.json()["pipelineId"]
+    steps = client.get(f"/api/pipeline/runs/{pipeline_id}").json()["steps"]
+    step_names = [step["step"] for step in steps]
 
-    pipeline_response = client.post(
-        "/api/pipeline/run",
-        json={"templateId": "default-service", "sourceBatchId": "batch-1", "leads": [lead]},
-    )
-    approval_id = pipeline_response.json()["results"][0]["pendingApprovalId"]
-
-    approval_response = client.post(
-        f"/api/approvals/{approval_id}/approve",
-        json={"approvedBy": "Ops", "notes": "Approved"},
-    )
-
-    assert approval_response.status_code == 200
-    payload = approval_response.json()
-    assert payload["status"] == "APPROVED"
-    assert payload["deployment"]["url"] == "https://alpha.netlify.app"
-    assert payload["zendesk"]["ticketUrl"].endswith("/123")
-
-    detail = client.get(f"/api/approvals/{approval_id}?includeHtml=true")
-    assert detail.status_code == 200
-    assert "<html>" in detail.json()["pendingPreviewHtml"]
-
-    run_detail = client.get(f"/api/pipeline/runs/{pipeline_response.json()['pipelineId']}")
-    assert run_detail.status_code == 200
-    steps = [step["step"] for step in run_detail.json()["steps"]]
-    assert "netlify_deploy" in steps
-    assert "groq_outreach" in steps
-    assert "zendesk_ticket" in steps
-
-    runs = client.get("/api/pipeline/runs").json()["runs"]
-    assert runs[0]["status"] == "COMPLETED"
+    assert response.status_code == 200
+    assert "github_export" in step_names
+    assert "netlify_deploy" not in step_names
 
 
-def test_pipeline_run_reuses_existing_pending_approval_without_model_calls(monkeypatch):
-    model_calls = stub_generation(monkeypatch, [])
-    lead = lead_payload()
-
-    first = client.post(
-        "/api/pipeline/run",
-        json={"templateId": "default-service", "sourceBatchId": "batch-1", "leads": [lead]},
-    )
-    first_approval_id = first.json()["results"][0]["pendingApprovalId"]
-
-    model_calls.clear()
-    second = client.post(
-        "/api/pipeline/run",
-        json={"templateId": "default-service", "sourceBatchId": "batch-1", "leads": [lead]},
-    )
-
-    assert second.status_code == 200
-    payload = second.json()
-    assert payload["status"] == "PENDING_APPROVAL"
-    assert payload["results"][0]["status"] == "PENDING_APPROVAL"
-    assert payload["results"][0]["currentStep"] == "reused_pending_approval"
-    assert payload["results"][0]["pendingApprovalId"] == first_approval_id
-    assert payload["results"][0]["stepHistory"][0]["status"] == "SKIPPED"
-    assert model_calls == []
-
-
-def test_pipeline_run_reuses_approved_deployment_without_redeploying(monkeypatch):
-    model_calls = stub_generation(monkeypatch, [])
-    monkeypatch.setattr(main, "deploy_site_to_netlify_for_lead", fake_deploy_with_history)
-    monkeypatch.setattr(
-        main,
-        "generate_outreach_with_groq",
-        lambda context, site_url: {"subject": "Preview", "body": f"See {site_url}"},
-    )
+def test_approval_deploys_from_github_and_clears_successful_html(monkeypatch):
+    stub_generation(monkeypatch)
+    monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", fake_git_deploy_with_history)
+    monkeypatch.setattr(main, "generate_outreach_with_groq", lambda context, site_url: {"subject": "Preview", "body": f"See {site_url}"})
     monkeypatch.setattr(
         main,
         "create_zendesk_outreach_ticket",
         lambda context, deployment, outreach, pipeline_id: {"syncStatus": "TICKET_CREATED", "ticketId": 123, "ticketUrl": "https://zendesk.test/123"},
     )
-    lead = lead_payload()
 
-    pipeline_response = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead]})
-    approval_id = pipeline_response.json()["results"][0]["pendingApprovalId"]
-    approval_response = client.post(f"/api/approvals/{approval_id}/approve", json={"approvedBy": "Ops"})
-    assert approval_response.status_code == 200
+    pipeline = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead_payload()]}).json()
+    approval_id = pipeline["results"][0]["pendingApprovalId"]
+    approved = client.post(f"/api/approvals/{approval_id}/approve", json={"approvedBy": "Ops"}).json()
 
-    model_calls.clear()
-    monkeypatch.setattr(
-        main,
-        "deploy_site_to_netlify_for_lead",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("deployment should be reused")),
-    )
-    second = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead]})
+    assert approved["status"] == "APPROVED"
+    assert approved["deployment"]["url"] == "https://alpha.netlify.app"
+    assert approved["deployment"]["githubRepoUrl"].startswith("https://github.com/")
+    assert approved["deployment"]["buildId"]
+    assert approved["zendesk"]["ticketId"] == 123
 
-    assert second.status_code == 200
-    payload = second.json()
-    assert payload["status"] == "COMPLETED"
-    assert payload["results"][0]["status"] == "COMPLETED_REUSED"
-    assert payload["results"][0]["currentStep"] == "reused_deployment"
-    assert payload["results"][0]["deployment"]["url"] == "https://alpha.netlify.app"
-    assert model_calls == []
+    detail = client.get(f"/api/approvals/{approval_id}?includeHtml=true").json()
+    assert detail["pendingPreviewHtml"] is None
+    assert detail["previewAvailable"] is False
 
-
-def test_pipeline_run_resumes_zendesk_after_post_deploy_failure_without_redeploying(monkeypatch):
-    stub_generation(monkeypatch, [])
-    monkeypatch.setattr(main, "deploy_site_to_netlify_for_lead", fake_deploy_with_history)
-    outreach_calls = []
-    zendesk_calls = []
-    monkeypatch.setattr(
-        main,
-        "generate_outreach_with_groq",
-        lambda context, site_url: outreach_calls.append("outreach") or {"subject": "Preview", "body": f"See {site_url}"},
-    )
-
-    def flaky_zendesk(context, deployment, outreach, pipeline_id):
-        zendesk_calls.append("zendesk")
-        if len(zendesk_calls) == 1:
-            raise RuntimeError("Zendesk is temporarily unavailable.")
-        return {"syncStatus": "TICKET_CREATED", "ticketId": 456, "ticketUrl": "https://zendesk.test/456"}
-
-    monkeypatch.setattr(main, "create_zendesk_outreach_ticket", flaky_zendesk)
-    lead = lead_payload()
-
-    pipeline_response = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead]})
-    approval_id = pipeline_response.json()["results"][0]["pendingApprovalId"]
-    approval_response = client.post(f"/api/approvals/{approval_id}/approve", json={"approvedBy": "Ops"})
-    assert approval_response.status_code == 200
-    assert approval_response.json()["status"] == "DEPLOYED_ZENDESK_FAILED"
-
-    monkeypatch.setattr(
-        main,
-        "deploy_site_to_netlify_for_lead",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("deployment should not run during outreach resume")),
-    )
-    resumed = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead]})
-
-    assert resumed.status_code == 200
-    payload = resumed.json()
-    assert payload["status"] == "COMPLETED"
-    assert payload["results"][0]["status"] == "COMPLETED_RESUMED"
-    assert payload["results"][0]["zendesk"]["ticketId"] == 456
-    assert outreach_calls == ["outreach"]
-    assert zendesk_calls == ["zendesk", "zendesk"]
-    assert [step["step"] for step in payload["results"][0]["stepHistory"]] == [
-        "netlify_deploy",
-        "groq_outreach",
-        "zendesk_ticket",
-    ]
-
-
-def test_force_regenerate_creates_new_approval_and_supersedes_old_pending(monkeypatch):
-    model_calls = stub_generation(monkeypatch, [])
-    lead = lead_payload()
-
-    first = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead]})
-    first_approval_id = first.json()["results"][0]["pendingApprovalId"]
-
-    model_calls.clear()
-    second = client.post(
-        "/api/pipeline/run",
-        json={"templateId": "default-service", "leads": [lead], "forceRegenerate": True},
-    )
-    second_approval_id = second.json()["results"][0]["pendingApprovalId"]
-
-    assert second.status_code == 200
-    assert second_approval_id != first_approval_id
-    assert model_calls == ["gemini_prompt", "groq_html", "gemini_final"]
-    approvals = client.get("/api/approvals?status=ALL").json()["approvals"]
-    statuses = {approval["approvalId"]: approval["status"] for approval in approvals}
-    assert statuses[first_approval_id] == "SUPERSEDED"
-    assert statuses[second_approval_id] == "PENDING"
-
-
-def test_github_publish_mode_exports_before_netlify(monkeypatch):
-    stub_generation(monkeypatch, [])
-    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
-    monkeypatch.setenv("GITHUB_OWNER", "owner")
-    monkeypatch.setenv("GITHUB_REPO", "sites")
-    monkeypatch.setenv("GITHUB_BRANCH", "main")
-    monkeypatch.setattr(main, "deploy_site_to_netlify_for_lead", fake_deploy_with_history)
-    monkeypatch.setattr(
-        main,
-        "generate_outreach_with_groq",
-        lambda context, site_url: {"subject": "Preview", "body": f"See {site_url}"},
-    )
-    monkeypatch.setattr(
-        main,
-        "create_zendesk_outreach_ticket",
-        lambda context, deployment, outreach, pipeline_id: {"syncStatus": "TICKET_CREATED", "ticketId": 789, "ticketUrl": "https://zendesk.test/789"},
-    )
-
-    class FakeResponse:
-        def __init__(self, status_code, payload):
-            self.status_code = status_code
-            self._payload = payload
-
-        def json(self):
-            return self._payload
-
-        def raise_for_status(self):
-            if self.status_code >= 400:
-                raise RuntimeError(f"HTTP {self.status_code}")
-
-    github_calls = []
-
-    def fake_get(url, headers=None, params=None, timeout=None):
-        github_calls.append(("get", url, params))
-        return FakeResponse(404, {})
-
-    def fake_put(url, headers=None, json=None, timeout=None):
-        github_calls.append(("put", url, json))
-        assert json["branch"] == "main"
-        assert json["content"]
-        return FakeResponse(
-            201,
-            {
-                "content": {"sha": "content-sha", "html_url": "https://github.test/owner/sites/index.html"},
-                "commit": {"sha": "commit-sha"},
-            },
-        )
-
-    monkeypatch.setattr(main.requests, "get", fake_get)
-    monkeypatch.setattr(main.requests, "put", fake_put)
-
-    lead = lead_payload()
-    pipeline_response = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead]})
-    approval_id = pipeline_response.json()["results"][0]["pendingApprovalId"]
-    approval_response = client.post(
-        f"/api/approvals/{approval_id}/approve",
-        json={"approvedBy": "Ops", "publishMode": "github-netlify"},
-    )
-
-    assert approval_response.status_code == 200
-    payload = approval_response.json()
-    assert payload["status"] == "APPROVED"
-    assert payload["publishMode"] == "github-netlify"
-    assert payload["githubExport"]["commitSha"] == "commit-sha"
-    assert payload["deployment"]["publishMode"] == "github-netlify"
-    assert github_calls[0][0] == "get"
-    assert github_calls[1][0] == "put"
-
-    detail = client.get(f"/api/approvals/{approval_id}").json()
-    assert detail["githubExport"]["commitSha"] == "commit-sha"
-    steps = client.get(f"/api/pipeline/runs/{pipeline_response.json()['pipelineId']}").json()["steps"]
+    steps = client.get(f"/api/pipeline/runs/{pipeline['pipelineId']}").json()["steps"]
     step_names = [step["step"] for step in steps]
     assert step_names.index("github_export") < step_names.index("netlify_deploy")
 
 
-def test_update_lead_owner_updates_registry_and_pending_approval_context():
-    lead = main.DiscoveredLead(
-        leadKey="lead-owner",
-        canonicalLeadKey="canonical-owner",
-        businessName="Owner Test",
-        email="owner-test@example.com",
-        category="Restaurant",
-        location="Gauteng, South Africa",
-        province="Gauteng",
+def test_failed_github_netlify_deployment_keeps_generated_html(monkeypatch):
+    stub_generation(monkeypatch)
+
+    def failed_deploy(*args, **kwargs):
+        raise RuntimeError("netlify build failed")
+
+    monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", failed_deploy)
+    pipeline = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead_payload()]}).json()
+    approval_id = pipeline["results"][0]["pendingApprovalId"]
+
+    response = client.post(f"/api/approvals/{approval_id}/approve", json={"approvedBy": "Ops"})
+    detail = client.get(f"/api/approvals/{approval_id}?includeHtml=true").json()
+
+    assert response.status_code == 502
+    assert detail["status"] == "DEPLOY_FAILED"
+    assert detail["pendingPreviewHtml"]
+    assert detail["previewAvailable"] is True
+    assert detail["errors"][0]["retryable"] is True
+
+
+def test_pipeline_reuses_pending_github_export_without_model_calls(monkeypatch):
+    model_calls, export_calls = stub_generation(monkeypatch)
+    lead = lead_payload()
+
+    first = client.post("/api/pipeline/run", json={"templateId": "default-service", "sourceBatchId": "batch-1", "leads": [lead]})
+    first_approval_id = first.json()["results"][0]["pendingApprovalId"]
+
+    model_calls.clear()
+    export_calls.clear()
+    second = client.post("/api/pipeline/run", json={"templateId": "default-service", "sourceBatchId": "batch-1", "leads": [lead]})
+
+    assert second.status_code == 200
+    result = second.json()["results"][0]
+    assert result["currentStep"] == "reused_pending_approval"
+    assert result["pendingApprovalId"] == first_approval_id
+    assert result["githubExport"]["commitSha"]
+    assert model_calls == []
+    assert export_calls == []
+
+
+def test_github_export_failure_is_retryable_and_keeps_html(monkeypatch):
+    calls, _exports = stub_generation(monkeypatch)
+    attempts = {"count": 0}
+
+    def flaky_export(canonical_key, business_name, site_html, pipeline_id=None, approval_id=None):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("temporary github failure")
+        return fake_github_export(canonical_key, business_name, site_html, pipeline_id, approval_id)
+
+    monkeypatch.setattr(main, "export_site_to_github", flaky_export)
+
+    pipeline = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead_payload()]})
+    result = pipeline.json()["results"][0]
+
+    assert pipeline.status_code == 200
+    assert pipeline.json()["status"] == "FAILED"
+    assert result["status"] == "EXPORT_FAILED"
+    assert result["pendingPreviewHtml"]
+    assert result["structuredErrors"][0]["retryable"] is True
+
+    retried = client.post(f"/api/approvals/{result['pendingApprovalId']}/retry-export", json={"requestedBy": "Ops"})
+    assert retried.status_code == 200
+    assert retried.json()["status"] == "PENDING"
+    assert attempts["count"] == 2
+    assert calls == ["gemini_prompt", "groq_html", "gemini_final"]
+
+
+def test_github_export_creates_unique_repo_and_commits_readme_then_index(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    monkeypatch.setenv("GITHUB_OWNER", "owner")
+    created_repos = []
+    put_paths = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        assert url == "https://api.github.com/user/repos"
+        created_repos.append(json["name"])
+        assert json["private"] is False
+        return FakeResponse(
+            201,
+            {"id": len(created_repos), "name": json["name"], "full_name": f"owner/{json['name']}", "html_url": f"https://github.com/owner/{json['name']}", "default_branch": "main", "private": False},
+        )
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return FakeResponse(404, {})
+
+    def fake_put(url, headers=None, json=None, timeout=None):
+        path = url.rsplit("/", 1)[-1]
+        put_paths.append(path)
+        return FakeResponse(201, {"content": {"sha": f"{path}-sha", "html_url": f"https://github.test/{path}"}, "commit": {"sha": f"{path}-commit"}})
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    monkeypatch.setattr(main.requests, "put", fake_put)
+
+    first = main.export_site_to_github("canonical-one", "Alpha Plumbing", "<html>one</html>", "pipeline-1", "approval-1")
+    second = main.export_site_to_github("canonical-two", "Alpha Plumbing", "<html>two</html>", "pipeline-2", "approval-2")
+
+    assert first["repository"].startswith("owner/ai-site-alpha-plumbing-")
+    assert first["repoUrl"].startswith("https://github.com/owner/")
+    assert first["commitSha"] == "index.html-commit"
+    assert put_paths == ["README.md", "index.html", "README.md", "index.html"]
+    assert len(set(created_repos)) == 2
+    with main.get_pipeline_db() as db:
+        rows = db.execute("SELECT * FROM github_site_repos WHERE export_status = 'EXPORTED'").fetchall()
+    assert len(rows) == 2
+
+
+def test_netlify_git_deploy_uses_build_api_not_zip_upload(monkeypatch):
+    monkeypatch.setenv("NETLIFY_AUTH_TOKEN", "netlify-secret")
+    calls = []
+    github_export = fake_github_export("canonical-one", "Alpha Plumbing", "<html>one</html>", "pipeline-1", "approval-1")
+
+    def fake_post(url, headers=None, json=None, params=None, data=None, timeout=None):
+        calls.append(("post", url, json, data))
+        assert data is None
+        if url.endswith("/api/v1/sites"):
+            assert json["repo"]["repo_path"] == github_export["repository"]
+            return FakeResponse(201, {"id": "site-1", "name": "ai-site-alpha", "ssl_url": "https://alpha.netlify.app", "admin_url": "https://app.netlify.com/sites/alpha"})
+        if url.endswith("/builds"):
+            return FakeResponse(201, {"id": "build-1", "deploy_id": "deploy-1", "done": True})
+        raise AssertionError(url)
+
+    def fake_get(url, headers=None, timeout=None):
+        calls.append(("get", url, None, None))
+        if "/deploys/" in url:
+            return FakeResponse(200, {"id": "deploy-1", "state": "ready", "ssl_url": "https://alpha.netlify.app"})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    monkeypatch.setattr(main.requests, "get", fake_get)
+
+    deployment = main.deploy_github_repo_to_netlify_for_lead(
+        "canonical-one",
+        "Alpha Plumbing",
+        "pipeline-1",
+        "approval-1",
+        "Ops",
+        github_export,
     )
-    main.upsert_lead_registry(lead)
+
+    assert deployment["state"] == "ready"
+    assert deployment["buildId"] == "build-1"
+    assert not any("/deploys" in call[1] and call[0] == "post" for call in calls)
+    history = client.get("/api/deployments/history").json()["deployments"]
+    assert history[0]["github_repo_url"] == github_export["repoUrl"]
+    assert history[0]["build_id"] == "build-1"
+
+
+def test_no_owner_fields_in_responses(monkeypatch):
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda query, limit, location="South Africa": [apify_item(1, province="Gauteng")])
+    discovery = client.post("/api/leads/discover", json={"presetId": "restaurants", "location": "South Africa", "limit": 1}).json()
+    assert "ownerName" not in discovery["leads"][0]
+    assert "ownerEmail" not in discovery["leads"][0]
+    assert "ownerStatus" not in discovery["leads"][0]
+
     approval_id = main.create_approval_record(
         pipeline_id="pipeline-owner",
         canonical_key="canonical-owner",
         lead_key="lead-owner",
         business_name="Owner Test",
         site_html="<!doctype html><html><body>Owner Test</body></html>",
-        context={"businessName": "Owner Test"},
+        context={"businessName": "Owner Test", "ownerName": "Ops", "ownerEmail": "ops@example.com", "ownerStatus": "assigned"},
         site_content={"finalHtmlChecksum": "checksum"},
         template={"id": "default-service"},
     )
-
-    response = client.post(
-        "/api/leads/canonical-owner/owner",
-        json={"ownerName": "Ops Lead", "ownerEmail": "ops@example.com", "ownerStatus": "working"},
-    )
-
-    assert response.status_code == 200
-    payload = response.json()
-    assert payload["ownerName"] == "Ops Lead"
-    assert payload["ownerEmail"] == "ops@example.com"
-    assert payload["ownerStatus"] == "working"
-
     approval = client.get(f"/api/approvals/{approval_id}").json()
-    assert approval["context"]["ownerName"] == "Ops Lead"
-    assert approval["context"]["ownerEmail"] == "ops@example.com"
+    assert "ownerName" not in approval["context"]
+    assert "ownerEmail" not in approval["context"]
+    summary = client.get("/api/reporting/summary").json()
+    assert "ownerPerformance" not in summary
 
 
 def test_model_safe_value_chunks_large_text():
@@ -629,6 +480,8 @@ def test_debug_status_redacts_provider_values(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "gemini-secret-value")
     monkeypatch.setenv("GROQ_API_KEY", "groq-secret-value")
     monkeypatch.setenv("NETLIFY_AUTH_TOKEN", "netlify-secret-value")
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret-value")
+    monkeypatch.setenv("GITHUB_OWNER", "owner")
     monkeypatch.setenv("ZENDESK_SUBDOMAIN", "cxsupporthub")
     monkeypatch.setenv("ZENDESK_EMAIL", "owner@company.test")
     monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-secret-value")
@@ -638,8 +491,8 @@ def test_debug_status_redacts_provider_values(monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload["status"] == "READY"
-    masked = payload["providers"]["apify"]["checks"][0]["maskedValue"]
-    assert masked != "apify-secret-value"
+    masked = payload["providers"]["github"]["checks"][1]["maskedValue"]
+    assert masked != "github-secret-value"
     assert "chars" in masked
 
 
@@ -649,6 +502,8 @@ def test_debug_probe_reports_missing_environment(monkeypatch):
         "GEMINI_API_KEY",
         "GROQ_API_KEY",
         "NETLIFY_AUTH_TOKEN",
+        "GITHUB_TOKEN",
+        "GITHUB_OWNER",
         "ZENDESK_SUBDOMAIN",
         "ZENDESK_EMAIL",
         "ZENDESK_API_TOKEN",
@@ -675,6 +530,7 @@ def test_debug_logs_redact_sensitive_details():
         "Sensitive details should be masked.",
         email="owner@example.com",
         apiToken="super-secret-token",
+        authorization="Bearer raw-token-value",
     )
 
     response = client.get("/api/debug/logs?limit=5")
@@ -684,3 +540,4 @@ def test_debug_logs_redact_sensitive_details():
     details = redaction_log["details"]
     assert details["email"] != "owner@example.com"
     assert details["apiToken"] != "super-secret-token"
+    assert details["authorization"] != "Bearer raw-token-value"
