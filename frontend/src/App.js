@@ -22,13 +22,10 @@ const FALLBACK_TEMPLATES = [
 ];
 
 const NAV_ITEMS = [
-  { path: "/dashboard", label: "Dashboard" },
-  { path: "/lead-discovery", label: "Lead Discovery" },
-  { path: "/generate-approval", label: "Generate & Approval" },
+  { path: "/pipeline", label: "Pipeline Workspace" },
   { path: "/deployments", label: "Deployments" },
   { path: "/pipeline-runs", label: "Pipeline Runs" },
   { path: "/admin", label: "Admin/Backend" },
-  { path: "/settings", label: "Settings" },
 ];
 
 function statusBadgeClass(status = "") {
@@ -64,11 +61,14 @@ function deploymentGithubName(deployment) {
   return deployment?.github_repo_full_name || deployment?.githubRepoFullName || deployment?.githubExport?.repository || deployment?.raw?.githubRepoFullName || deployment?.raw?.githubExport?.repository;
 }
 
-function Section({ title, action, children }) {
+function Section({ title, help, action, children }) {
   return (
     <section className="panel entry-animate">
       <div className="panel-head">
-        <h2>{title}</h2>
+        <div>
+          <h2>{title}</h2>
+          {help && <p className="section-help">{help}</p>}
+        </div>
         {action}
       </div>
       {children}
@@ -340,7 +340,7 @@ function AppShell() {
   const approveSite = async (approvalId) => {
     try {
       setApprovalBusy(approvalId);
-      const data = await callApi("Approval Deploy API", "post", `/api/approvals/${approvalId}/approve`, { approvedBy: "Dashboard Operator", notes: "Approved from dashboard." }, { timeout: 420000 });
+      const data = await callApi("Approval Deploy API", "post", `/api/approvals/${approvalId}/approve`, { approvedBy: "Pipeline Operator", notes: "Approved from Pipeline Workspace." }, { timeout: 420000 });
       setNotice(`Approved and deployed ${data.businessName}.`, data.status === "APPROVED" ? "success" : "warning");
       refreshOperations(true);
     } catch (error) {
@@ -355,7 +355,7 @@ function AppShell() {
   const retryExport = async (approvalId) => {
     try {
       setApprovalBusy(approvalId);
-      const data = await callApi("GitHub Export Retry API", "post", `/api/approvals/${approvalId}/retry-export`, { requestedBy: "Dashboard Operator" }, { timeout: 240000 });
+      const data = await callApi("GitHub Export Retry API", "post", `/api/approvals/${approvalId}/retry-export`, { requestedBy: "Pipeline Operator" }, { timeout: 240000 });
       setNotice(`GitHub export ready for ${data.businessName}.`, "success");
       refreshOperations(true);
     } catch (error) {
@@ -369,7 +369,7 @@ function AppShell() {
   const rejectSite = async (approvalId) => {
     try {
       setApprovalBusy(approvalId);
-      const data = await callApi("Approval Reject API", "post", `/api/approvals/${approvalId}/reject`, { rejectedBy: "Dashboard Operator", reason: "Rejected from dashboard." });
+      const data = await callApi("Approval Reject API", "post", `/api/approvals/${approvalId}/reject`, { rejectedBy: "Pipeline Operator", reason: "Rejected from Pipeline Workspace." });
       setNotice(`Rejected ${data.businessName}.`, "warning");
       refreshOperations(true);
     } catch (error) {
@@ -383,7 +383,7 @@ function AppShell() {
   const regenerateSite = async (approvalId) => {
     try {
       setApprovalBusy(approvalId);
-      const data = await callApi("Approval Regenerate API", "post", `/api/approvals/${approvalId}/regenerate`, { requestedBy: "Dashboard Operator" }, { timeout: 600000 });
+      const data = await callApi("Approval Regenerate API", "post", `/api/approvals/${approvalId}/regenerate`, { requestedBy: "Pipeline Operator" }, { timeout: 600000 });
       setNotice(`Regenerated ${data.businessName}.`, data.status === "EXPORT_FAILED" ? "danger" : "success");
       refreshOperations(true);
     } catch (error) {
@@ -517,55 +517,95 @@ function AppShell() {
       <main className="content-shell" ref={contentRef}>
         <header className="topbar">
           <div>
-            <h1>{NAV_ITEMS.find((item) => item.path === locationPath.pathname)?.label || "Dashboard"}</h1>
+            <h1>{NAV_ITEMS.find((item) => item.path === locationPath.pathname)?.label || "Pipeline Workspace"}</h1>
             <span className={`badge ${statusBadgeClass(debugStatus?.status)}`}>{debugStatus?.status || "LOADING"}</span>
           </div>
           {message && <div className={`notice ${messageTone}`}>{message}</div>}
         </header>
         <Routes>
-          <Route path="/" element={<Navigate to="/dashboard" replace />} />
-          <Route path="/dashboard" element={<DashboardPage {...shared} />} />
-          <Route path="/lead-discovery" element={<LeadDiscoveryPage {...shared} />} />
-          <Route path="/generate-approval" element={<GenerateApprovalPage {...shared} />} />
+          <Route path="/" element={<Navigate to="/pipeline" replace />} />
+          <Route path="/dashboard" element={<Navigate to="/pipeline" replace />} />
+          <Route path="/lead-discovery" element={<Navigate to="/pipeline" replace />} />
+          <Route path="/generate-approval" element={<Navigate to="/pipeline" replace />} />
+          <Route path="/settings" element={<Navigate to="/admin" replace />} />
+          <Route path="/pipeline" element={<PipelineWorkspacePage {...shared} />} />
           <Route path="/deployments" element={<DeploymentsPage {...shared} />} />
           <Route path="/pipeline-runs" element={<PipelineRunsPage {...shared} />} />
           <Route path="/admin" element={<AdminPage {...shared} />} />
-          <Route path="/settings" element={<SettingsPage {...shared} />} />
         </Routes>
       </main>
     </div>
   );
 }
 
-function DashboardPage({ reportingSummary, pendingApprovals, deployments, pipelineRuns, backendLogs, uiLogs }) {
+function PipelineWorkspacePage(props) {
+  const {
+    presets,
+    templates,
+    selectedPresetId,
+    setSelectedPresetId,
+    selectedTemplateId,
+    setSelectedTemplateId,
+    location,
+    setLocation,
+    customQuery,
+    setCustomQuery,
+    leadCount,
+    setLeadCount,
+    forceRefresh,
+    setForceRefresh,
+    forceRegenerate,
+    setForceRegenerate,
+    leads,
+    selectedLeadKeys,
+    selectedLeads,
+    setSelectedLeadKeys,
+    toggleLead,
+    discovering,
+    discoverLeads,
+    running,
+    runPipeline,
+    warnings,
+    duplicatesSkipped,
+    lastDiscoveryCached,
+    provinceStats,
+    pipelineResult,
+    reportingSummary,
+    pendingApprovals,
+    approvals,
+    approvalPreviews,
+    approvalBusy,
+    previewApproval,
+    approveSite,
+    retryExport,
+    rejectSite,
+    regenerateSite,
+    deployments,
+  } = props;
   const metrics = reportingSummary?.metrics || {};
-  return (
-    <div className="page-grid">
-      <section className="metric-grid entry-animate">
-        <div className="metric-card"><span>{metrics.leadsDiscovered || 0}</span><label>Leads</label></div>
-        <div className="metric-card"><span>{metrics.githubRepos || 0}</span><label>Repos</label></div>
-        <div className="metric-card"><span>{metrics.gitDeployments || metrics.approvedDeployments || 0}</span><label>Deploys</label></div>
-        <div className="metric-card"><span>{pendingApprovals.length}</span><label>Approvals</label></div>
-      </section>
-      <Section title="Recent Pipeline Runs">
-        <RunList runs={pipelineRuns.slice(0, 6)} compact />
-      </Section>
-      <Section title="Deployed Sites">
-        <DeploymentList deployments={deployments.slice(0, 6)} />
-      </Section>
-      <Section title="Live Logs">
-        <LogColumns uiLogs={uiLogs} backendLogs={backendLogs} />
-      </Section>
-    </div>
-  );
-}
+  const visiblePreviewApprovals = approvals.filter((approval) => approvalPreviews[approval.approvalId]);
 
-function LeadDiscoveryPage(props) {
-  const { presets, selectedPresetId, setSelectedPresetId, location, setLocation, customQuery, setCustomQuery, leadCount, setLeadCount, forceRefresh, setForceRefresh, leads, selectedLeadKeys, setSelectedLeadKeys, toggleLead, discovering, discoverLeads, warnings, duplicatesSkipped, lastDiscoveryCached, provinceStats } = props;
   return (
-    <div className="page-grid">
+    <div className="page-stack">
+      <section className="workspace-hero entry-animate">
+        <div>
+          <span className="hero-kicker">Lead Pipeline Control Center</span>
+          <h2>Find leads, generate polished sites, approve deployment, and track every step.</h2>
+          <p>Work from top to bottom: search one location, choose your leads, generate a Bootstrap and GSAP landing page, review the GitHub export, then approve Netlify deployment.</p>
+        </div>
+        <MetricRail
+          metrics={[
+            ["Leads", metrics.leadsDiscovered || leads.length || 0],
+            ["Selected", selectedLeads.length],
+            ["Approvals", pendingApprovals.length],
+            ["Deployments", metrics.gitDeployments || metrics.approvedDeployments || deployments.length || 0],
+          ]}
+        />
+      </section>
+
       <Section
-        title="Lead Discovery"
+        title="Section 1: Lead Discovery"
+        help="Choose a business type and city. The search uses the selected location only and reuses cached results unless force refresh is on."
         action={<button className="btn btn-primary" type="button" onClick={discoverLeads} disabled={discovering}>{discovering ? "Searching..." : "Search Leads"}</button>}
       >
         <div className="preset-grid">
@@ -573,14 +613,15 @@ function LeadDiscoveryPage(props) {
             <button key={preset.id} className={`preset-tile ${selectedPresetId === preset.id ? "selected" : ""}`} type="button" onClick={() => setSelectedPresetId(preset.id)}>
               <strong>{preset.label}</strong>
               <span>{preset.industry}</span>
+              <small>{preset.description}</small>
             </button>
           ))}
         </div>
         <div className="control-grid mt-3">
           <label>Location<input className="form-control" value={location} onChange={(event) => setLocation(event.target.value)} /></label>
-          <label>Query<input className="form-control" value={customQuery} onChange={(event) => setCustomQuery(event.target.value)} placeholder="Optional" /></label>
+          <label>Search phrase<input className="form-control" value={customQuery} onChange={(event) => setCustomQuery(event.target.value)} placeholder="Optional, e.g. emergency plumber" /></label>
           <label>Lead count<select className="form-select" value={leadCount} onChange={(event) => setLeadCount(Number(event.target.value))}>{[1, 2, 3, 4, 5].map((count) => <option key={count} value={count}>{count}</option>)}</select></label>
-          <label className="checkline"><input type="checkbox" checked={forceRefresh} onChange={(event) => setForceRefresh(event.target.checked)} />Force refresh</label>
+          <label className="checkline"><input type="checkbox" checked={forceRefresh} onChange={(event) => setForceRefresh(event.target.checked)} />Force discovery refresh</label>
         </div>
         <div className="status-strip">
           <span className={`badge ${lastDiscoveryCached ? "text-bg-info" : "text-bg-success"}`}>{lastDiscoveryCached ? "CACHE" : "LIVE"}</span>
@@ -589,8 +630,10 @@ function LeadDiscoveryPage(props) {
         </div>
         {warnings.map((warning) => <div className="alert alert-warning" key={warning}>{warning}</div>)}
       </Section>
+
       <Section
-        title="Discovered Leads"
+        title="Section 2: Selected Leads"
+        help="Review discovered businesses and tick the leads you want to generate pages for."
         action={
           <div className="button-row">
             <button className="btn btn-outline-secondary" type="button" onClick={() => setSelectedLeadKeys(leads.map((lead) => lead.leadKey))} disabled={!leads.length}>Select All</button>
@@ -598,8 +641,97 @@ function LeadDiscoveryPage(props) {
           </div>
         }
       >
+        <div className="selection-summary">
+          <div><strong>{selectedLeads.length}</strong><span>selected</span></div>
+          <p>Selected leads move into generation. No deployment can happen until you approve a generated page.</p>
+        </div>
         <LeadTable leads={leads} selectedLeadKeys={selectedLeadKeys} toggleLead={toggleLead} />
       </Section>
+
+      <Section
+        title="Section 3: Generate Landing Page"
+        help="Generate reusable landing pages, export them to GitHub, and prepare approval records."
+        action={<button className="btn btn-primary" type="button" onClick={runPipeline} disabled={running || !selectedLeads.length}>{running ? "Running..." : "Run Pipeline"}</button>}
+      >
+        <div className="control-grid">
+          <label>Template<select className="form-select" value={selectedTemplateId} onChange={(event) => setSelectedTemplateId(event.target.value)}>{templates.map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label>
+          <label className="checkline"><input type="checkbox" checked={forceRegenerate} onChange={(event) => setForceRegenerate(event.target.checked)} />Force regenerate</label>
+          <div className="stat-box"><strong>{selectedLeads.length}</strong><span>leads ready</span></div>
+        </div>
+        {pipelineResult?.results?.length ? (
+          <div className="result-grid mt-3">
+            {pipelineResult.results.map((result) => <PipelineResultCard key={result.leadKey} result={result} />)}
+          </div>
+        ) : (
+          <EmptyState title="No generated pages yet" text="Select leads above, then run the pipeline." />
+        )}
+      </Section>
+
+      <Section
+        title="Section 4: Approval Queue"
+        help="Preview, retry exports, approve GitHub-based Netlify deployment, reject, or regenerate."
+      >
+        {approvals.length ? (
+          <div className="approval-list">
+            {approvals.map((approval) => (
+              <ApprovalItem
+                key={approval.approvalId}
+                approval={approval}
+                previewHtml={approvalPreviews[approval.approvalId]}
+                busy={approvalBusy === approval.approvalId}
+                onPreview={() => previewApproval(approval.approvalId)}
+                onApprove={() => approveSite(approval.approvalId)}
+                onRetry={() => retryExport(approval.approvalId)}
+                onReject={() => rejectSite(approval.approvalId)}
+                onRegenerate={() => regenerateSite(approval.approvalId)}
+              />
+            ))}
+          </div>
+        ) : (
+          <EmptyState title="No approvals" text="Generated pages appear here after a successful GitHub export." />
+        )}
+      </Section>
+
+      <Section
+        title="Section 5: Preview"
+        help="Open a preview from the approval queue to inspect the generated landing page before deployment."
+      >
+        <ApprovalPreviewPanel approvals={visiblePreviewApprovals} approvalPreviews={approvalPreviews} />
+      </Section>
+
+      <Section
+        title="Section 6: Deployment Action"
+        help="Approved pages deploy from GitHub to Netlify. Recent deployments show the live site, repository, build, and status."
+      >
+        <DeploymentList deployments={deployments.slice(0, 4)} />
+      </Section>
+    </div>
+  );
+}
+
+function MetricRail({ metrics }) {
+  return (
+    <div className="metric-grid hero-metrics">
+      {metrics.map(([label, value]) => (
+        <div className="metric-card" key={label}><span>{value}</span><label>{label}</label></div>
+      ))}
+    </div>
+  );
+}
+
+function ApprovalPreviewPanel({ approvals, approvalPreviews }) {
+  if (!approvals.length) return <EmptyState title="No preview open" text="Use Preview in the approval queue to inspect a generated page here." />;
+  return (
+    <div className="preview-stack">
+      {approvals.map((approval) => (
+        <article className="preview-card" key={approval.approvalId}>
+          <div className="item-head">
+            <div><h3>{approval.businessName}</h3><span>{approval.githubExport?.repository || approval.approvalId}</span></div>
+            <span className={`badge ${statusBadgeClass(approval.status)}`}>{approval.status}</span>
+          </div>
+          <iframe className="approval-preview" title={`Preview ${approval.businessName}`} srcDoc={approvalPreviews[approval.approvalId]} />
+        </article>
+      ))}
     </div>
   );
 }
@@ -626,54 +758,6 @@ function LeadTable({ leads, selectedLeadKeys, toggleLead }) {
           ))}
         </tbody>
       </table>
-    </div>
-  );
-}
-
-function GenerateApprovalPage(props) {
-  const { templates, selectedTemplateId, setSelectedTemplateId, selectedLeads, forceRegenerate, setForceRegenerate, running, runPipeline, pipelineResult, approvals, approvalPreviews, approvalBusy, previewApproval, approveSite, retryExport, rejectSite, regenerateSite } = props;
-  return (
-    <div className="page-grid">
-      <Section
-        title="Generate & Approval"
-        action={<button className="btn btn-primary" type="button" onClick={runPipeline} disabled={running || !selectedLeads.length}>{running ? "Running..." : "Run Pipeline"}</button>}
-      >
-        <div className="control-grid">
-          <label>Template<select className="form-select" value={selectedTemplateId} onChange={(event) => setSelectedTemplateId(event.target.value)}>{templates.map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label>
-          <label className="checkline"><input type="checkbox" checked={forceRegenerate} onChange={(event) => setForceRegenerate(event.target.checked)} />Force regenerate</label>
-          <div className="stat-box"><strong>{selectedLeads.length}</strong><span>Selected leads</span></div>
-        </div>
-      </Section>
-      <Section title="Pipeline Results">
-        {pipelineResult?.results?.length ? (
-          <div className="result-grid">
-            {pipelineResult.results.map((result) => <PipelineResultCard key={result.leadKey} result={result} />)}
-          </div>
-        ) : (
-          <EmptyState title="No pipeline output" text="Select leads and run the pipeline." />
-        )}
-      </Section>
-      <Section title="Approval Queue">
-        {approvals.length ? (
-          <div className="approval-list">
-            {approvals.map((approval) => (
-              <ApprovalItem
-                key={approval.approvalId}
-                approval={approval}
-                previewHtml={approvalPreviews[approval.approvalId]}
-                busy={approvalBusy === approval.approvalId}
-                onPreview={() => previewApproval(approval.approvalId)}
-                onApprove={() => approveSite(approval.approvalId)}
-                onRetry={() => retryExport(approval.approvalId)}
-                onReject={() => rejectSite(approval.approvalId)}
-                onRegenerate={() => regenerateSite(approval.approvalId)}
-              />
-            ))}
-          </div>
-        ) : (
-          <EmptyState title="No approvals" text="Generated pages appear here." />
-        )}
-      </Section>
     </div>
   );
 }
@@ -716,7 +800,6 @@ function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRet
         <button className="btn btn-outline-primary btn-sm" type="button" onClick={onRegenerate} disabled={busy}>Regenerate</button>
         <button className="btn btn-outline-danger btn-sm" type="button" onClick={onReject} disabled={busy || !["PENDING", "EXPORT_FAILED"].includes(approval.status)}>Reject</button>
       </div>
-      {previewHtml && <iframe className="approval-preview" title={`Preview ${approval.businessName}`} srcDoc={previewHtml} />}
       {approval.errors?.length > 0 && <pre>{JSON.stringify(approval.errors, null, 2)}</pre>}
     </article>
   );
@@ -756,11 +839,11 @@ function DeploymentList({ deployments, detailed = false }) {
 function PipelineRunsPage({ pipelineRuns, selectedRunDetail, loadRunDetail }) {
   const selectedRun = selectedRunDetail?.run;
   return (
-    <div className="split-grid">
-      <Section title="Pipeline Runs">
+    <div className="page-stack">
+      <Section title="Pipeline Runs" help="Open a run to see each backend step, including GitHub export and Netlify build activity.">
         <RunList runs={pipelineRuns} onSelect={loadRunDetail} />
       </Section>
-      <Section title="Run Detail">
+      <Section title="Run Detail" help="Step history and related approvals are shown vertically for easier scanning.">
         {selectedRun ? (
           <div className="detail-stack">
             <div className="item-head"><h3>{selectedRun.pipeline_id}</h3><span className={`badge ${statusBadgeClass(selectedRun.status)}`}>{selectedRun.status}</span></div>
@@ -808,37 +891,41 @@ function StepList({ steps }) {
   );
 }
 
-function AdminPage({ debugStatus, backendLogs, uiLogs, apiProbe, debugBusy, runApiProbe, runManualFlow, manualFlow, refreshDiagnostics }) {
+function AdminPage({ debugStatus, backendLogs, uiLogs, apiProbe, debugBusy, runApiProbe, runManualFlow, manualFlow, refreshDiagnostics, leadCount, setLeadCount, forceRegenerate, setForceRegenerate, forceRefresh, setForceRefresh }) {
   return (
-    <div className="page-grid">
+    <div className="page-stack">
       <Section
         title="API Safety Center"
+        help="Run local checks first. External probes may touch provider APIs, so keep them for deliberate validation."
         action={<div className="button-row"><button className="btn btn-outline-secondary" type="button" onClick={() => refreshDiagnostics(false)}>Refresh</button><button className="btn btn-primary" type="button" onClick={() => runApiProbe(false)} disabled={Boolean(debugBusy)}>Local Probe</button><button className="btn btn-outline-primary" type="button" onClick={() => runApiProbe(true)} disabled={Boolean(debugBusy)}>External Probe</button><button className="btn btn-outline-secondary" type="button" onClick={runManualFlow} disabled={Boolean(debugBusy)}>{debugBusy === "manual-flow" ? "Testing..." : "Safe Flow Test"}</button></div>}
       >
-        <ProviderGrid providers={debugStatus?.providers || {}} />
         {apiProbe && <ProbeGrid apiProbe={apiProbe} />}
         {manualFlow && <div className="alert alert-success">Lead {manualFlow.leadId} passed {manualFlow.steps.join(" -> ")}. Preview: {manualFlow.previewUrl}</div>}
       </Section>
-      <Section title="Live Logs">
-        <LogColumns uiLogs={uiLogs} backendLogs={backendLogs} />
+      <Section title="Provider Diagnostics" help="Secrets remain redacted. Use this panel to spot missing provider configuration before running live work.">
+        <ProviderGrid providers={debugStatus?.providers || {}} />
       </Section>
-    </div>
-  );
-}
-
-function SettingsPage({ debugStatus, leadCount, setLeadCount, forceRegenerate, setForceRegenerate, forceRefresh, setForceRefresh }) {
-  return (
-    <div className="page-grid">
-      <Section title="Settings">
+      <Section title="Workspace Settings" help="These controls adjust the current pipeline workflow while keeping existing API contracts stable.">
         <div className="control-grid">
-          <label>Default lead count<select className="form-select" value={leadCount} onChange={(event) => setLeadCount(Number(event.target.value))}>{[1, 2, 3, 4, 5].map((count) => <option key={count} value={count}>{count}</option>)}</select></label>
+          <label>Max leads per search<select className="form-select" value={leadCount} onChange={(event) => setLeadCount(Number(event.target.value))}>{[1, 2, 3, 4, 5].map((count) => <option key={count} value={count}>{count}</option>)}</select></label>
           <label className="checkline"><input type="checkbox" checked={forceRegenerate} onChange={(event) => setForceRegenerate(event.target.checked)} />Force regenerate</label>
           <label className="checkline"><input type="checkbox" checked={forceRefresh} onChange={(event) => setForceRefresh(event.target.checked)} />Force discovery refresh</label>
           <div className="stat-box"><strong>Off</strong><span>Gemini images</span></div>
         </div>
       </Section>
-      <Section title="Provider Configuration">
-        <ProviderGrid providers={debugStatus?.providers || {}} />
+      <Section title="Model & API Usage" help="The default flow saves usage by caching leads, reusing generated pages, and keeping Gemini image generation off unless enabled in backend environment.">
+        <div className="priority-flow">
+          {["Apify lead search", "Gemini prompt/final polish", "Groq draft fallback", "GitHub export", "Netlify Git build"].map((item, index) => (
+            <div className="priority-step" key={item}><span>{index + 1}</span><strong>{item}</strong></div>
+          ))}
+        </div>
+        <div className="usage-notes">
+          <p>Use cached discovery for repeat searches, keep force regenerate off for normal runs, and approve only pages that are ready to deploy.</p>
+          <p>Gemini images are disabled by default; fallback visual assets keep generated pages lightweight and predictable.</p>
+        </div>
+      </Section>
+      <Section title="Live Logs" help="Recent UI actions and backend logs are shown side by side for quick diagnostics.">
+        <LogColumns uiLogs={uiLogs} backendLogs={backendLogs} />
       </Section>
     </div>
   );

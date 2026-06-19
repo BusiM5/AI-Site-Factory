@@ -2145,6 +2145,7 @@ def generate_page_prompt_with_gemini(context: Dict[str, Any], template: Dict[str
         "Return strict JSON with keys: pagePrompt, designNotes, contentGuardrails, imageDirection. "
         "The pagePrompt must preserve: hero, four service cards, about section, contact section, footer. "
         "The page must use Bootstrap 5 from a CDN for responsive layout/components and GSAP from a CDN for entry animations. "
+        "Require an animated hero section, strong CTA buttons, modern service cards, polished gradients, spacing, shadows, hover effects, and responsive layout. "
         "Use only public lead context. Do not invent awards, prices, guarantees, or unavailable services.\n\n"
         f"Template: {model_safe_json(template)}\n"
         f"Lead context: {model_safe_json(context)}"
@@ -2166,7 +2167,7 @@ def generate_page_prompt_with_gemini(context: Dict[str, Any], template: Dict[str
         (
             f"Build a standalone responsive HTML landing page for {context.get('businessName')} "
             f"in {context.get('location')}. Include a hero, exactly four service cards, about, "
-            "contact, and footer. Use Bootstrap 5 CDN assets, GSAP CDN animations, accessible semantic HTML, polished CSS, and grounded claims only."
+            "contact, and footer. Use Bootstrap 5 CDN assets, GSAP CDN animations, accessible semantic HTML, strong CTA buttons, modern cards, polished gradients, spacing, shadows, hover effects, and grounded claims only."
         ),
     )
     result.setdefault("designNotes", f"Use accent {template.get('accent')} and background {template.get('background')}.")
@@ -2185,6 +2186,7 @@ def generate_draft_html_with_groq(
         "Return strict JSON with keys: html, notes. The html value must include <!doctype html>, <html>, <head>, CSS, and <body>. "
         "Preserve this original structure exactly: hero, four service cards, about section, contact section, footer. "
         "Use Bootstrap 5 CDN CSS/JS and GSAP CDN for modern responsive layout and tasteful entry animations. "
+        "Make the page feel like a real professional business website with a polished hero, CTA buttons, service cards, gradients, shadows, spacing, hover states, and mobile-friendly sections. "
         "No markdown fences. Do not invent private information, guarantees, prices, awards, or unsupported services.\n\n"
         f"Gemini page prompt: {model_safe_json(page_prompt)}\n"
         f"Template: {model_safe_json(template)}\n"
@@ -2212,7 +2214,7 @@ def finalize_html_with_gemini(
     prompt = (
         "Finalize this single-file HTML website for deployment. Return strict JSON with keys: html, qaNotes. "
         "Keep the structure: hero, four service cards, about, contact, footer. "
-        "Ensure Bootstrap 5 CDN assets and GSAP CDN animations are present. Fix malformed HTML/CSS and keep claims grounded.\n\n"
+        "Ensure Bootstrap 5 CDN assets and GSAP CDN animations are present. Improve bland layouts with a professional hero, strong CTA buttons, modern service cards, polished color, gradients, spacing, shadows, hover effects, and responsive sections. Fix malformed HTML/CSS and keep claims grounded.\n\n"
         f"Template: {model_safe_json(template)}\n"
         f"Lead context: {model_safe_json(context)}\n"
         f"Page prompt: {model_safe_json(page_prompt)}\n"
@@ -2431,12 +2433,16 @@ def render_site_html(
         image = images[(index + 1) % len(images)]
         services_html.append(
             f"""
-            <article class="service-card">
-              <img src="{image}" alt="">
-              <span>0{index + 1}</span>
-              <h3>{title}</h3>
-              <p>{description}</p>
-            </article>
+            <div class="col-md-6 col-xl-3">
+              <article class="service-card card h-100">
+                <img src="{image}" alt="{title}">
+                <div class="card-body">
+                  <span class="service-number">Service 0{index + 1}</span>
+                  <h3>{title}</h3>
+                  <p>{description}</p>
+                </div>
+              </article>
+            </div>
             """
         )
 
@@ -2456,49 +2462,62 @@ def render_site_html(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{business_name}</title>
   <meta name="description" content="{subheadline}">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
     :root {{
       --accent: {accent};
       --background: {background};
-      --ink: #111827;
-      --muted: #5b6472;
-      --line: #d9dee7;
+      --ink: #102033;
+      --muted: #667085;
+      --line: #d9e2ef;
       --surface: #ffffff;
+      --navy: #071b33;
+      --cyan: #1d9bf0;
+      --teal: #0f9f96;
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      font-family: Arial, Helvetica, sans-serif;
+      font-family: Inter, Segoe UI, Arial, sans-serif;
       color: var(--ink);
-      background: var(--background);
-      line-height: 1.55;
+      background: linear-gradient(180deg, #f8fbff 0%, var(--background) 100%);
+      line-height: 1.6;
     }}
     a {{ color: inherit; }}
-    header {{
-      min-height: 78vh;
-      display: grid;
-      grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
+    .hero {{
+      min-height: 720px;
+      display: flex;
       align-items: center;
-      gap: 44px;
-      padding: clamp(28px, 5vw, 72px);
+      padding: 88px 0 72px;
+      color: #ffffff;
+      background:
+        linear-gradient(135deg, rgba(7, 27, 51, 0.96), rgba(15, 159, 150, 0.86)),
+        linear-gradient(90deg, rgba(29, 155, 240, 0.22), rgba(139, 92, 246, 0.2));
+    }}
+    .hero-content {{
+      max-width: 680px;
     }}
     .eyebrow {{
-      color: var(--accent);
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0;
+      display: inline-flex;
+      margin-bottom: 14px;
+      padding: 8px 12px;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 8px;
+      color: #bff6ff;
       font-size: 0.82rem;
+      font-weight: 800;
+      text-transform: uppercase;
     }}
     h1 {{
-      margin: 14px 0 18px;
-      font-size: clamp(2.3rem, 5vw, 5.4rem);
-      line-height: 0.96;
+      margin: 0 0 18px;
+      font-size: 4rem;
+      line-height: 1;
       letter-spacing: 0;
+      font-weight: 900;
     }}
-    .hero-copy p {{
-      max-width: 680px;
-      font-size: clamp(1.02rem, 1.6vw, 1.32rem);
-      color: var(--muted);
+    .hero-copy {{
+      color: #dbeafe;
+      font-size: 1.16rem;
     }}
     .hero-actions {{
       display: flex;
@@ -2506,62 +2525,83 @@ def render_site_html(
       gap: 12px;
       margin-top: 28px;
     }}
-    .button {{
+    .btn-brand {{
+      min-height: 50px;
       display: inline-flex;
-      min-height: 48px;
       align-items: center;
       justify-content: center;
-      padding: 0 18px;
-      border: 1px solid var(--accent);
       border-radius: 8px;
-      background: var(--accent);
-      color: #fff;
+      padding: 0 20px;
+      background: linear-gradient(90deg, var(--teal), var(--cyan));
+      color: #ffffff;
+      font-weight: 800;
       text-decoration: none;
-      font-weight: 700;
+      box-shadow: 0 18px 40px rgba(29, 155, 240, 0.25);
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
     }}
-    .button.secondary {{
-      background: transparent;
-      color: var(--accent);
+    .btn-brand:hover {{
+      color: #ffffff;
+      transform: translateY(-2px);
+      box-shadow: 0 22px 46px rgba(15, 159, 150, 0.3);
+    }}
+    .btn-ghost {{
+      min-height: 50px;
+      border: 1px solid rgba(255, 255, 255, 0.32);
+      border-radius: 8px;
+      padding: 0 20px;
+      color: #ffffff;
+      font-weight: 800;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
     }}
     .hero-image {{
-      min-height: 420px;
-      border-radius: 8px;
       overflow: hidden;
-      box-shadow: 0 24px 70px rgba(17, 24, 39, 0.16);
-      animation: lift 0.7s ease both;
+      border: 1px solid rgba(255, 255, 255, 0.22);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.12);
+      box-shadow: 0 28px 70px rgba(0, 0, 0, 0.28);
     }}
     .hero-image img {{
       width: 100%;
-      height: 100%;
-      min-height: 420px;
+      min-height: 440px;
       object-fit: cover;
       display: block;
+      transition: transform 0.35s ease;
     }}
-    main {{ padding-bottom: 48px; }}
+    .hero-image:hover img {{
+      transform: scale(1.03);
+    }}
     section {{
-      padding: 56px clamp(20px, 5vw, 72px);
+      padding: 76px 0;
     }}
     .section-head {{
       max-width: 760px;
-      margin-bottom: 26px;
+      margin-bottom: 28px;
     }}
     .section-head h2 {{
-      font-size: clamp(1.8rem, 3vw, 3rem);
       margin: 0 0 10px;
+      font-size: 2.5rem;
+      font-weight: 900;
       letter-spacing: 0;
     }}
-    .services {{
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 18px;
+    .section-head p {{
+      color: var(--muted);
+      font-size: 1.05rem;
     }}
     .service-card {{
-      min-height: 100%;
-      background: var(--surface);
+      height: 100%;
+      overflow: hidden;
       border: 1px solid var(--line);
       border-radius: 8px;
-      overflow: hidden;
-      animation: rise 0.55s ease both;
+      background: var(--surface);
+      box-shadow: 0 16px 42px rgba(16, 32, 51, 0.08);
+      transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+    }}
+    .service-card:hover {{
+      border-color: var(--accent);
+      transform: translateY(-4px);
+      box-shadow: 0 22px 54px rgba(16, 32, 51, 0.13);
     }}
     .service-card img {{
       width: 100%;
@@ -2569,55 +2609,42 @@ def render_site_html(
       object-fit: cover;
       display: block;
     }}
-    .service-card span {{
-      display: block;
+    .service-number {{
       color: var(--accent);
-      font-weight: 700;
-      padding: 18px 18px 0;
+      font-size: 0.78rem;
+      font-weight: 900;
+      text-transform: uppercase;
     }}
     .service-card h3 {{
-      margin: 8px 18px;
-      font-size: 1.08rem;
+      margin: 8px 0 10px;
+      font-size: 1.16rem;
+      font-weight: 850;
     }}
     .service-card p {{
-      margin: 0;
-      padding: 0 18px 20px;
       color: var(--muted);
     }}
     .about-band {{
-      background: #fff;
+      background: #ffffff;
       border-top: 1px solid var(--line);
       border-bottom: 1px solid var(--line);
     }}
-    .about-grid {{
-      display: grid;
-      grid-template-columns: 0.8fr 1.2fr;
-      gap: 36px;
-      align-items: start;
-    }}
-    .facts {{
-      display: grid;
-      gap: 10px;
-    }}
     .fact {{
-      padding: 14px 16px;
+      padding: 16px 18px;
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: var(--background);
-      font-weight: 700;
+      background: linear-gradient(180deg, #ffffff, #f7fbff);
+      font-weight: 800;
     }}
-    .contact {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 24px;
-      background: var(--ink);
-      color: #fff;
+    .contact-card {{
       border-radius: 8px;
-      margin: 0 clamp(20px, 5vw, 72px) 48px;
-      padding: clamp(24px, 4vw, 48px);
+      padding: 42px;
+      color: #ffffff;
+      background: linear-gradient(135deg, var(--navy), #12385e);
+      box-shadow: 0 22px 60px rgba(7, 27, 51, 0.18);
     }}
-    .contact p {{ color: #d1d5db; }}
+    .contact-card p {{
+      color: #dbeafe;
+    }}
     .contact-links {{
       display: flex;
       flex-wrap: wrap;
@@ -2625,100 +2652,132 @@ def render_site_html(
     }}
     .contact-links a,
     .contact-links span {{
-      border: 1px solid rgba(255, 255, 255, 0.22);
+      border: 1px solid rgba(255, 255, 255, 0.24);
       border-radius: 8px;
       padding: 10px 12px;
+      color: #ffffff;
       text-decoration: none;
+      font-weight: 750;
     }}
     footer {{
-      padding: 28px clamp(20px, 5vw, 72px);
+      padding: 32px 0;
       color: var(--muted);
       border-top: 1px solid var(--line);
     }}
-    @keyframes lift {{
-      from {{ opacity: 0; transform: translateY(18px); }}
-      to {{ opacity: 1; transform: translateY(0); }}
-    }}
-    @keyframes rise {{
-      from {{ opacity: 0; transform: translateY(10px); }}
-      to {{ opacity: 1; transform: translateY(0); }}
-    }}
-    @media (max-width: 980px) {{
-      header,
-      .about-grid {{
-        grid-template-columns: 1fr;
-      }}
-      .services {{
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }}
-      .contact {{
-        align-items: flex-start;
-        flex-direction: column;
-      }}
-    }}
-    @media (max-width: 620px) {{
-      header {{
+    @media (max-width: 992px) {{
+      .hero {{
         min-height: auto;
+        padding: 64px 0;
       }}
-      .hero-image,
+      h1 {{
+        font-size: 2.8rem;
+      }}
       .hero-image img {{
-        min-height: 280px;
+        min-height: 320px;
       }}
-      .services {{
-        grid-template-columns: 1fr;
+      section {{
+        padding: 56px 0;
+      }}
+    }}
+    @media (max-width: 576px) {{
+      h1 {{
+        font-size: 2.25rem;
+      }}
+      .section-head h2 {{
+        font-size: 1.8rem;
+      }}
+      .contact-card {{
+        padding: 24px;
       }}
     }}
   </style>
 </head>
 <body>
-  <header>
-    <div class="hero-copy">
-      <div class="eyebrow">{industry} in {location}</div>
-      <h1>{headline}</h1>
-      <p>{subheadline}</p>
-      <div class="hero-actions">
-        <a class="button" href="#contact">{cta_label}</a>
-        <a class="button secondary" href="#services">View services</a>
+  <header class="hero hero-section">
+    <div class="container">
+      <div class="row align-items-center g-5">
+        <div class="col-lg-6 hero-content">
+          <div class="eyebrow">{industry} in {location}</div>
+          <h1>{headline}</h1>
+          <p class="hero-copy">{subheadline}</p>
+          <div class="hero-actions">
+            <a class="btn-brand" href="#contact">{cta_label}</a>
+            <a class="btn-ghost" href="#services">View services</a>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <div class="hero-image">
+            <img src="{images[0]}" alt="{business_name}">
+          </div>
+        </div>
       </div>
-    </div>
-    <div class="hero-image">
-      <img src="{images[0]}" alt="">
     </div>
   </header>
   <main>
     <section id="services">
-      <div class="section-head">
-        <h2>Services</h2>
-        <p>{business_name} presents a practical, customer-focused service experience for local customers.</p>
-      </div>
-      <div class="services">
-        {''.join(services_html)}
+      <div class="container">
+        <div class="section-head">
+          <h2>Services built around local customers</h2>
+          <p>{business_name} presents a practical, customer-focused service experience for people in {location}.</p>
+        </div>
+        <div class="row g-4">
+          {''.join(services_html)}
+        </div>
       </div>
     </section>
-    <section class="about-band">
-      <div class="about-grid">
-        <div class="section-head">
-          <h2>About {business_name}</h2>
-        </div>
-        <div>
-          <p>{about}</p>
-          <div class="facts">
-            <div class="fact">{industry}</div>
-            <div class="fact">{location}</div>
-            <div class="fact">Built from public business information</div>
+    <section class="about-band" id="about">
+      <div class="container">
+        <div class="row g-4 align-items-start">
+          <div class="col-lg-5">
+            <div class="section-head mb-0">
+              <h2>About {business_name}</h2>
+              <p>Clear information, local context, and a simple path for customers to reach out.</p>
+            </div>
+          </div>
+          <div class="col-lg-7">
+            <p class="lead">{about}</p>
+            <div class="row g-3 mt-2">
+              <div class="col-md-4"><div class="fact">{industry}</div></div>
+              <div class="col-md-4"><div class="fact">{location}</div></div>
+              <div class="col-md-4"><div class="fact">Public business information</div></div>
+            </div>
           </div>
         </div>
       </div>
     </section>
-    <section id="contact" class="contact">
-      <div>
-        <h2>{cta_label}</h2>
-        <p>{contact_intro}</p>
+    <section id="contact">
+      <div class="container">
+        <div class="contact-card">
+          <div class="row g-4 align-items-center">
+            <div class="col-lg-7">
+              <h2>{cta_label}</h2>
+              <p>{contact_intro}</p>
+            </div>
+            <div class="col-lg-5">
+              <div class="contact-links">{contact_html}</div>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="contact-links">{contact_html}</div>
     </section>
   </main>
-  <footer>{footer_text}</footer>
+  <footer>
+    <div class="container d-flex flex-wrap justify-content-between gap-2">
+      <span>{footer_text}</span>
+      <span>Responsive landing page preview</span>
+    </div>
+  </footer>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>
+  <script>
+    window.addEventListener("DOMContentLoaded", function () {{
+      if (window.gsap) {{
+        gsap.from(".hero-content > *", {{ y: 18, opacity: 0, duration: 0.75, ease: "power2.out", stagger: 0.08 }});
+        gsap.from(".hero-image", {{ y: 24, opacity: 0, duration: 0.8, ease: "power2.out", delay: 0.15 }});
+        gsap.from(".service-card, .about-band .row, .contact-card", {{ y: 22, opacity: 0, duration: 0.7, ease: "power2.out", stagger: 0.08, delay: 0.25 }});
+      }}
+    }});
+  </script>
 </body>
 </html>"""
 

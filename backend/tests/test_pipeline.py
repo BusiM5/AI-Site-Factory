@@ -248,6 +248,46 @@ def test_pipeline_generates_bootstrap_gsap_html_and_exports_to_github_before_app
     assert detail["githubExport"]["commitSha"]
 
 
+def test_fallback_landing_page_renderer_is_bootstrap_gsap_and_polished():
+    html = main.render_site_html(
+        {
+            "businessName": "Alpha Plumbing",
+            "industry": "Plumbing",
+            "location": "Durban",
+            "email": "alpha@example.com",
+            "phone": "+27 31 000 0000",
+            "website": "https://alpha.example.com",
+            "summary": "Local plumbing support for Durban customers.",
+        },
+        {
+            "headline": "Reliable Plumbing Help in Durban",
+            "subheadline": "Fast, practical plumbing support for local homes and businesses.",
+            "about": "Alpha Plumbing helps Durban customers with practical service and clear communication.",
+            "ctaLabel": "Request a Quote",
+            "contactIntro": "Contact the team to discuss your plumbing needs.",
+            "footerText": "Alpha Plumbing | Durban",
+            "services": [
+                {"title": "Emergency Repairs", "description": "Responsive help for urgent plumbing problems."},
+                {"title": "Installations", "description": "Support for fixtures, pipes, and upgrades."},
+                {"title": "Maintenance", "description": "Routine checks that help prevent future issues."},
+                {"title": "Customer Support", "description": "Clear communication from first contact."},
+            ],
+        },
+        {"accent": "#0f9f96", "background": "#f8fbff"},
+        ["data:image/svg+xml;base64,hero", "data:image/svg+xml;base64,one", "data:image/svg+xml;base64,two", "data:image/svg+xml;base64,three", "data:image/svg+xml;base64,four"],
+    )
+
+    lower = html.lower()
+    assert "bootstrap@5.3.3" in lower
+    assert "gsap@3.12.5" in lower
+    assert "class=\"hero hero-section\"" in lower
+    assert "btn-brand" in lower
+    assert lower.count("service-card") >= 4
+    assert "about-band" in lower
+    assert "contact-card" in lower
+    assert "<footer>" in lower
+
+
 def test_pipeline_records_github_export_without_netlify_before_approval(monkeypatch):
     stub_generation(monkeypatch)
 
