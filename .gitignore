@@ -14,8 +14,6 @@ __pycache__/
 *.pyc
 
 *.log
-backend/logs/
-backend/data/
 
 dist/
 build/
