@@ -75,7 +75,15 @@ const approval = {
   createdAt: new Date().toISOString(),
 };
 
-const approvalsPayload = { approvals: [approval] };
+const exportFailedApproval = {
+  ...approval,
+  approvalId: "approval-export",
+  businessName: "Beta Electrical",
+  status: "EXPORT_FAILED",
+  githubExport: null,
+};
+
+const approvalsPayload = { approvals: [approval, exportFailedApproval] };
 
 const deploymentsPayload = {
   deployments: [
@@ -92,6 +100,27 @@ const deploymentsPayload = {
       github_repo_full_name: "owner/ai-site-alpha-plumbing",
       commit_sha: "commit-1",
       publishMode: "github-netlify",
+      deploymentMode: "GitHub \u2192 Netlify",
+      deployed_at: new Date().toISOString(),
+    },
+    {
+      id: "history-2",
+      pipeline_id: "pipeline-2",
+      site_name: "ai-site-beta",
+      build_id: null,
+      deploy_id: "deploy-2",
+      deploy_action: "DIRECT_FALLBACK_CREATED",
+      state: "ready",
+      url: "https://beta-fallback.netlify.app",
+      github_repo_url: "https://github.com/owner/ai-site-beta",
+      github_repo_full_name: "owner/ai-site-beta",
+      commit_sha: "commit-2",
+      publishMode: "direct-netlify-fallback",
+      deploymentMode: "Direct Netlify fallback",
+      raw: {
+        fallbackReason: "Host key verification failed / Could not read from remote repository",
+        errors: [{ message: "Git-linked deploy failed before fallback." }],
+      },
       deployed_at: new Date().toISOString(),
     },
   ],
@@ -128,6 +157,7 @@ beforeEach(() => {
     if (url.includes("/api/debug/logs")) return response(debugLogs);
     if (url.includes("/api/reporting/summary")) return response(reportingSummary);
     if (url.includes("/api/approvals/approval-1")) return response({ ...approval, pendingPreviewHtml: "<!doctype html><html><body>Alpha Plumbing</body></html>" });
+    if (url.includes("/api/approvals/approval-export")) return response({ ...exportFailedApproval, pendingPreviewHtml: "<!doctype html><html><body>Beta Electrical</body></html>" });
     if (url.includes("/api/approvals")) return response(approvalsPayload);
     if (url.includes("/api/deployments/history")) return response(deploymentsPayload);
     if (url.includes("/api/pipeline/runs/pipeline-1")) return response(pipelineDetailPayload);
@@ -137,6 +167,7 @@ beforeEach(() => {
 
   axios.mockImplementation(({ method, url, data }) => {
     if (method === "get" && url.includes("/api/approvals/approval-1")) return response({ ...approval, pendingPreviewHtml: "<!doctype html><html><body>Alpha Plumbing</body></html>" });
+    if (method === "get" && url.includes("/api/approvals/approval-export")) return response({ ...exportFailedApproval, pendingPreviewHtml: "<!doctype html><html><body>Beta Electrical</body></html>" });
     if (method === "get" && url.includes("/api/pipeline/runs/pipeline-1")) return response(pipelineDetailPayload);
     if (method === "get" && url.includes("/api/pipeline/runs")) return response(pipelineRunsPayload);
     if (method === "get" && url.includes("/api/presets")) return response(presetsPayload);
@@ -198,6 +229,8 @@ beforeEach(() => {
         deployment: {
           url: "https://alpha.netlify.app",
           buildId: "build-1",
+          publishMode: "github-netlify",
+          deploymentMode: "GitHub \u2192 Netlify",
           githubRepoUrl: "https://github.com/owner/ai-site-alpha-plumbing",
           githubRepoFullName: "owner/ai-site-alpha-plumbing",
         },
@@ -208,6 +241,10 @@ beforeEach(() => {
 
     if (method === "post" && url.includes("/api/approvals/approval-1/retry-export")) {
       return response({ ...approval, status: "PENDING" });
+    }
+
+    if (method === "post" && url.includes("/api/approvals/approval-export/retry-export")) {
+      return response({ ...exportFailedApproval, status: "PENDING" });
     }
 
     if (method === "post" && url.includes("/api/approvals/approval-1/reject")) {
@@ -241,13 +278,28 @@ beforeEach(() => {
   });
 });
 
-test("renders routed sidebar dashboard without owner features", async () => {
+test("renders four-page Pipeline Workspace with merged sections", async () => {
   render(<App />);
 
   expect(await screen.findByText("AI Site Factory")).toBeInTheDocument();
-  expect(screen.getByRole("link", { name: "Dashboard" })).toBeInTheDocument();
-  expect(screen.getByRole("link", { name: "Lead Discovery" })).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Pipeline Workspace" })).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Deployments" })).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Pipeline Runs" })).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Admin/Backend" })).toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Dashboard" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Lead Discovery" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Generate & Approval" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "Settings" })).not.toBeInTheDocument();
   expect(screen.getByText("GitHub to Netlify")).toBeInTheDocument();
+  expect(screen.getByText("Lead Pipeline Control Center")).toBeInTheDocument();
+  [
+    "Section 1: Lead Discovery",
+    "Section 2: Selected Leads",
+    "Section 3: Generate Landing Page",
+    "Section 4: Approval Queue",
+    "Section 5: Preview",
+    "Section 6: Deployment Action",
+  ].forEach((heading) => expect(screen.getByText(heading)).toBeInTheDocument());
   expect(screen.queryByText("All owners")).not.toBeInTheDocument();
   expect(screen.queryByText("Owner Performance")).not.toBeInTheDocument();
   expect(screen.queryByText("Assign Owner")).not.toBeInTheDocument();
@@ -256,7 +308,7 @@ test("renders routed sidebar dashboard without owner features", async () => {
 test("discovers leads with selectable count and runs GitHub export pipeline", async () => {
   render(<App />);
 
-  fireEvent.click(await screen.findByRole("link", { name: "Lead Discovery" }));
+  fireEvent.click(await screen.findByRole("link", { name: "Pipeline Workspace" }));
   fireEvent.change(screen.getByLabelText("Lead count"), { target: { value: "5" } });
   fireEvent.click(screen.getByText("Search Leads"));
 
@@ -265,7 +317,6 @@ test("discovers leads with selectable count and runs GitHub export pipeline", as
   expect(screen.queryByText(/All provinces/i)).not.toBeInTheDocument();
 
   fireEvent.click(screen.getByLabelText("Select Alpha Plumbing"));
-  fireEvent.click(screen.getByRole("link", { name: "Generate & Approval" }));
   fireEvent.click(screen.getByText("Run Pipeline"));
 
   expect(await screen.findByText("approval-1")).toBeInTheDocument();
@@ -276,23 +327,49 @@ test("discovers leads with selectable count and runs GitHub export pipeline", as
 test("previews and approves a GitHub-based Netlify deployment", async () => {
   render(<App />);
 
-  fireEvent.click(await screen.findByRole("link", { name: "Generate & Approval" }));
+  fireEvent.click(await screen.findByRole("link", { name: "Pipeline Workspace" }));
   expect(await screen.findByText("approval-1")).toBeInTheDocument();
 
-  fireEvent.click(screen.getByText("Preview"));
+  const queue = screen.getByText("Section 4: Approval Queue").closest("section");
+  fireEvent.click(within(queue).getAllByText("Preview")[0]);
   expect(await screen.findByTitle("Preview Alpha Plumbing")).toBeInTheDocument();
 
-  fireEvent.click(screen.getByText("Approve"));
+  fireEvent.click(within(queue).getAllByText("Approve")[0]);
   expect(await screen.findByText(/Approved and deployed Alpha Plumbing/i)).toBeInTheDocument();
 
   fireEvent.click(screen.getByRole("link", { name: "Deployments" }));
   expect(await screen.findByText("https://alpha.netlify.app")).toBeInTheDocument();
   expect(screen.getByText("build-1")).toBeInTheDocument();
   expect(screen.getByText("owner/ai-site-alpha-plumbing")).toBeInTheDocument();
+  expect(screen.getAllByText("GitHub \u2192 Netlify").length).toBeGreaterThan(0);
 });
 
-test("shows pipeline run details and backend diagnostics", async () => {
+test("supports retry export, regenerate, and reject actions from approval queue", async () => {
   render(<App />);
+
+  fireEvent.click(await screen.findByRole("link", { name: "Pipeline Workspace" }));
+  expect(await screen.findByText("approval-export")).toBeInTheDocument();
+
+  fireEvent.click(screen.getByText("Retry Export"));
+  expect(await screen.findByText(/GitHub export ready for Beta Electrical/i)).toBeInTheDocument();
+
+  fireEvent.click(screen.getAllByText("Regenerate")[0]);
+  expect(await screen.findByText(/Regenerated Alpha Plumbing/i)).toBeInTheDocument();
+
+  fireEvent.click(screen.getAllByText("Reject")[0]);
+  expect(await screen.findByText(/Rejected Alpha Plumbing/i)).toBeInTheDocument();
+});
+
+test("shows deployments, pipeline run details, and merged backend admin settings", async () => {
+  render(<App />);
+
+  fireEvent.click(await screen.findByRole("link", { name: "Deployments" }));
+  expect(await screen.findByText("https://alpha.netlify.app")).toBeInTheDocument();
+  expect(screen.getByText("owner/ai-site-alpha-plumbing")).toBeInTheDocument();
+  expect(screen.getByText("https://beta-fallback.netlify.app")).toBeInTheDocument();
+  expect(screen.getByText("Direct Netlify fallback")).toBeInTheDocument();
+  expect(screen.getAllByText(/Git-linked deploy failed before fallback/i).length).toBeGreaterThan(0);
+  expect(screen.getAllByText("View technical details").length).toBeGreaterThan(0);
 
   fireEvent.click(await screen.findByRole("link", { name: "Pipeline Runs" }));
   fireEvent.click(await screen.findByText("pipeline-1"));
@@ -302,15 +379,12 @@ test("shows pipeline run details and backend diagnostics", async () => {
 
   fireEvent.click(screen.getByRole("link", { name: "Admin/Backend" }));
   expect(await screen.findByText("API Safety Center")).toBeInTheDocument();
+  expect(screen.getByText("Workspace Settings")).toBeInTheDocument();
+  expect(screen.getByText("Provider Diagnostics")).toBeInTheDocument();
+  expect(screen.getByText("Model & API Usage")).toBeInTheDocument();
+  expect(screen.getByLabelText("Max leads per search")).toHaveValue("3");
+  expect(screen.getByText("Gemini images")).toBeInTheDocument();
+  expect(screen.getByText("Off")).toBeInTheDocument();
   fireEvent.click(screen.getByText("Local Probe"));
   expect(await screen.findByText("github check passed.")).toBeInTheDocument();
-});
-
-test("settings expose defaults and disabled Gemini image generation", async () => {
-  render(<App />);
-
-  fireEvent.click(await screen.findByRole("link", { name: "Settings" }));
-  expect(await screen.findByText("Gemini images")).toBeInTheDocument();
-  expect(screen.getByText("Off")).toBeInTheDocument();
-  expect(screen.getByLabelText("Default lead count")).toHaveValue("3");
 });

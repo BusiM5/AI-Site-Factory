@@ -5,11 +5,13 @@ import base64
 from collections import deque
 import hashlib
 import html
+import io
 import json
 import logging
 import re
 import sqlite3
 import time
+import zipfile
 from urllib.parse import urlparse
 import os
 from dotenv import load_dotenv
@@ -79,7 +81,7 @@ REQUIRED_PROVIDER_ENV = {
     "github": ["GITHUB_OWNER", "GITHUB_TOKEN"],
 }
 
-VALID_PUBLISH_MODES = {"github-netlify"}
+VALID_PUBLISH_MODES = {"github-netlify", "direct-netlify-fallback"}
 
 def redact_value(value: Any) -> Any:
     if isinstance(value, dict):
@@ -1431,6 +1433,8 @@ def approval_row_to_dict(row: sqlite3.Row, include_html: bool = False) -> Dict[s
     context = safe_json_loads(row["context_json"], {})
     for key in ["ownerName", "ownerEmail", "ownerStatus"]:
         context.pop(key, None)
+    publish_mode = row["publish_mode"] or "github-netlify"
+    deployment_history = deployment_history_row_to_dict(get_deployment_history_row(row["deployment_history_id"])) if row["deployment_history_id"] else None
     approval = {
         "approvalId": row["id"],
         "pipelineId": row["pipeline_id"],
@@ -1449,7 +1453,9 @@ def approval_row_to_dict(row: sqlite3.Row, include_html: bool = False) -> Dict[s
         "rejectedBy": row["rejected_by"],
         "notes": row["notes"],
         "deploymentHistoryId": row["deployment_history_id"],
-        "publishMode": row["publish_mode"] or "github-netlify",
+        "deploymentHistory": deployment_history,
+        "publishMode": publish_mode,
+        "deploymentMode": deployment_mode_label(publish_mode),
         "githubExport": safe_json_loads(row["github_export_json"], None),
         "zendesk": safe_json_loads(row["zendesk_json"], None),
         "errors": safe_json_loads(row["errors_json"], []),
@@ -1533,6 +1539,7 @@ def deployment_history_row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[
     item["raw"] = safe_json_loads(item.pop("raw_json", None), {})
     item["githubExport"] = safe_json_loads(item.pop("github_export_json", None), None)
     item["publishMode"] = item.pop("publish_mode", None) or "github-netlify"
+    item["deploymentMode"] = deployment_mode_label(item["publishMode"])
     return item
 
 
@@ -1544,6 +1551,7 @@ def deployment_from_history(row: Optional[sqlite3.Row]) -> Optional[Dict[str, An
     if isinstance(raw, dict) and raw:
         raw.setdefault("deploymentHistoryId", history.get("id"))
         raw.setdefault("publishMode", history.get("publishMode"))
+        raw.setdefault("deploymentMode", history.get("deploymentMode"))
         if history.get("githubExport") and not raw.get("githubExport"):
             raw["githubExport"] = history["githubExport"]
         return raw
@@ -1559,6 +1567,7 @@ def deployment_from_history(row: Optional[sqlite3.Row]) -> Optional[Dict[str, An
         "htmlChecksum": history.get("html_checksum"),
         "deployedAt": history.get("deployed_at"),
         "publishMode": history.get("publishMode"),
+        "deploymentMode": history.get("deploymentMode"),
         "githubExport": history.get("githubExport"),
         "githubRepoUrl": history.get("github_repo_url"),
         "githubRepoFullName": history.get("github_repo_full_name"),
@@ -2144,7 +2153,8 @@ def generate_page_prompt_with_gemini(context: Dict[str, Any], template: Dict[str
         "Create a production-ready prompt for a single-file HTML landing page. "
         "Return strict JSON with keys: pagePrompt, designNotes, contentGuardrails, imageDirection. "
         "The pagePrompt must preserve: hero, four service cards, about section, contact section, footer. "
-        "The page must use Bootstrap 5 from a CDN for responsive layout/components and GSAP from a CDN for entry animations. "
+        "The page must use Bootstrap 5.3.8 CSS from https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css and GSAP 3.15 from https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js for responsive layout/components and entry animations. "
+        "Require an animated hero section, strong CTA buttons, modern service cards, polished gradients, spacing, shadows, hover effects, and responsive layout. "
         "Use only public lead context. Do not invent awards, prices, guarantees, or unavailable services.\n\n"
         f"Template: {model_safe_json(template)}\n"
         f"Lead context: {model_safe_json(context)}"
@@ -2166,7 +2176,7 @@ def generate_page_prompt_with_gemini(context: Dict[str, Any], template: Dict[str
         (
             f"Build a standalone responsive HTML landing page for {context.get('businessName')} "
             f"in {context.get('location')}. Include a hero, exactly four service cards, about, "
-            "contact, and footer. Use Bootstrap 5 CDN assets, GSAP CDN animations, accessible semantic HTML, polished CSS, and grounded claims only."
+            "contact, and footer. Use Bootstrap 5.3.8 CSS CDN, GSAP 3.15 CDN animations, accessible semantic HTML, strong CTA buttons, modern cards, polished gradients, spacing, shadows, hover effects, and grounded claims only."
         ),
     )
     result.setdefault("designNotes", f"Use accent {template.get('accent')} and background {template.get('background')}.")
@@ -2174,34 +2184,489 @@ def generate_page_prompt_with_gemini(context: Dict[str, Any], template: Dict[str
     result.setdefault("imageDirection", "Use tasteful CSS gradients or placeholder imagery.")
     return result
 
+def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[str, Any]) -> str:
+    business_name = html.escape(compact_text(context.get("businessName"), "Local Business"))
+    industry = html.escape(compact_text(context.get("industry"), "Local Service"))
+    location = html.escape(compact_text(context.get("location"), "South Africa"))
+    summary = html.escape(
+        compact_text(
+            context.get("summary"),
+            f"{business_name} provides reliable {industry.lower()} services for local customers."
+        )
+    )
+
+    email = compact_text(context.get("email"))
+    phone = compact_text(context.get("phone"))
+    website = compact_text(context.get("website"))
+
+    accent = compact_text(template.get("accent"), "#00AEEF")
+    background = compact_text(template.get("background"), "#F7FAFC")
+
+    keywords = context.get("serviceKeywords")
+    if not isinstance(keywords, list) or not keywords:
+        keywords = [industry]
+
+    default_services = [
+        {
+            "title": f"{industry} Support",
+            "description": f"Reliable {industry.lower()} assistance for customers in {location}.",
+            "icon": "bi-stars",
+        },
+        {
+            "title": "Fast Response",
+            "description": "Clear communication and quick turnaround for customer requests.",
+            "icon": "bi-lightning-charge",
+        },
+        {
+            "title": "Trusted Service",
+            "description": "Professional service built around quality, care, and consistency.",
+            "icon": "bi-shield-check",
+        },
+        {
+            "title": "Local Expertise",
+            "description": f"Focused support for customers around {location}.",
+            "icon": "bi-geo-alt",
+        },
+    ]
+
+    services_html = ""
+    for index, service in enumerate(default_services):
+        services_html += f"""
+        <div class="col-md-6 col-lg-3">
+          <article class="service-card h-100">
+            <div class="service-icon">{index + 1}</div>
+            <h3>{html.escape(service["title"])}</h3>
+            <p>{html.escape(service["description"])}</p>
+          </article>
+        </div>
+        """
+
+    contact_buttons = ""
+    if phone:
+        contact_buttons += f'<a class="btn btn-light btn-lg rounded-pill px-4" href="tel:{html.escape(phone)}">Call now</a>'
+    if email:
+        contact_buttons += f'<a class="btn btn-outline-light btn-lg rounded-pill px-4" href="mailto:{html.escape(email)}">Email us</a>'
+    if website:
+        contact_buttons += f'<a class="btn btn-outline-dark btn-lg rounded-pill px-4" href="{html.escape(website)}" target="_blank" rel="noreferrer">Visit website</a>'
+
+    if not contact_buttons:
+        contact_buttons = '<a class="btn btn-light btn-lg rounded-pill px-4" href="#contact">Get in touch</a>'
+
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{business_name} | {industry} in {location}</title>
+
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
+
+  <style>
+    :root {{
+      --primary: #00c2a8;
+      --secondary: #00aeef;
+      --accent: #7b61ff;
+      --warning: #ffb800;
+      --dark: #102033;
+      --muted: #5d6b82;
+      --surface: #ffffff;
+      --soft: #f6f9fc;
+      --template-accent: {accent};
+      --template-bg: {background};
+    }}
+
+    * {{
+      box-sizing: border-box;
+    }}
+
+    body {{
+      margin: 0;
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--soft);
+      color: var(--dark);
+      overflow-x: hidden;
+    }}
+
+    .hero {{
+      min-height: 92vh;
+      position: relative;
+      display: flex;
+      align-items: center;
+      overflow: hidden;
+      background:
+        radial-gradient(circle at 10% 10%, rgba(123, 97, 255, 0.35), transparent 32%),
+        radial-gradient(circle at 90% 20%, rgba(0, 174, 239, 0.35), transparent 30%),
+        linear-gradient(135deg, #00c2a8 0%, #00aeef 48%, #7b61ff 100%);
+      color: white;
+    }}
+
+    .hero::before {{
+      content: "";
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(rgba(255,255,255,0.14) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,0.14) 1px, transparent 1px);
+      background-size: 42px 42px;
+      opacity: 0.22;
+    }}
+
+    .hero .container {{
+      position: relative;
+      z-index: 2;
+    }}
+
+    .hero-badge {{
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.65rem 1rem;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.18);
+      border: 1px solid rgba(255,255,255,0.32);
+      backdrop-filter: blur(12px);
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-size: 0.78rem;
+    }}
+
+    .hero-title {{
+      font-size: clamp(2.7rem, 7vw, 6.5rem);
+      line-height: 0.95;
+      font-weight: 900;
+      letter-spacing: -0.08em;
+      margin: 1.4rem 0;
+      max-width: 950px;
+    }}
+
+    .hero-text {{
+      font-size: clamp(1.05rem, 2vw, 1.35rem);
+      max-width: 760px;
+      color: rgba(255,255,255,0.92);
+    }}
+
+    .hero-actions {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 1rem;
+      margin-top: 2rem;
+    }}
+
+    .hero-card {{
+      border-radius: 2rem;
+      padding: 2rem;
+      background: rgba(255,255,255,0.18);
+      border: 1px solid rgba(255,255,255,0.35);
+      box-shadow: 0 24px 70px rgba(16, 32, 51, 0.26);
+      backdrop-filter: blur(16px);
+    }}
+
+    .floating-chip {{
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      padding: 0.7rem 1rem;
+      background: white;
+      color: var(--dark);
+      font-weight: 800;
+      box-shadow: 0 18px 40px rgba(16,32,51,0.18);
+      margin: 0.35rem;
+    }}
+
+    .section-padding {{
+      padding: 6rem 0;
+    }}
+
+    .section-kicker {{
+      color: var(--primary);
+      font-weight: 900;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      font-size: 0.78rem;
+    }}
+
+    .section-title {{
+      font-size: clamp(2rem, 4vw, 3.5rem);
+      font-weight: 900;
+      letter-spacing: -0.05em;
+      margin: 0.5rem 0 1rem;
+    }}
+
+    .service-card {{
+      border: 0;
+      border-radius: 1.5rem;
+      padding: 1.7rem;
+      background: white;
+      box-shadow: 0 20px 60px rgba(16,32,51,0.09);
+      transition: transform 0.25s ease, box-shadow 0.25s ease;
+      border-top: 5px solid var(--primary);
+    }}
+
+    .service-card:hover {{
+      transform: translateY(-8px);
+      box-shadow: 0 28px 80px rgba(16,32,51,0.16);
+    }}
+
+    .service-icon {{
+      width: 54px;
+      height: 54px;
+      border-radius: 1rem;
+      display: grid;
+      place-items: center;
+      color: white;
+      font-weight: 900;
+      margin-bottom: 1.1rem;
+      background: linear-gradient(135deg, var(--primary), var(--secondary), var(--accent));
+      box-shadow: 0 14px 35px rgba(0,174,239,0.28);
+    }}
+
+    .service-card h3 {{
+      font-size: 1.2rem;
+      font-weight: 900;
+      margin-bottom: 0.75rem;
+    }}
+
+    .service-card p,
+    .about-text,
+    .contact-text {{
+      color: var(--muted);
+      line-height: 1.75;
+    }}
+
+    .about-panel {{
+      border-radius: 2rem;
+      overflow: hidden;
+      background: white;
+      box-shadow: 0 24px 80px rgba(16,32,51,0.10);
+    }}
+
+    .about-gradient {{
+      min-height: 100%;
+      background:
+        radial-gradient(circle at 20% 20%, rgba(255,255,255,0.45), transparent 34%),
+        linear-gradient(135deg, var(--accent), var(--secondary));
+      color: white;
+      padding: 3rem;
+    }}
+
+    .stat-card {{
+      border-radius: 1.2rem;
+      padding: 1.2rem;
+      background: rgba(255,255,255,0.16);
+      border: 1px solid rgba(255,255,255,0.25);
+    }}
+
+    .cta-band {{
+      border-radius: 2rem;
+      padding: 4rem 2rem;
+      color: white;
+      background:
+        radial-gradient(circle at top right, rgba(255,184,0,0.35), transparent 30%),
+        linear-gradient(135deg, var(--dark), #173b69 45%, var(--primary));
+      box-shadow: 0 24px 80px rgba(16,32,51,0.18);
+    }}
+
+    .contact-pill {{
+      display: inline-flex;
+      align-items: center;
+      gap: 0.5rem;
+      padding: 0.9rem 1.2rem;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.15);
+      border: 1px solid rgba(255,255,255,0.25);
+      color: white;
+      margin: 0.25rem;
+      text-decoration: none;
+    }}
+
+    footer {{
+      padding: 2rem 0;
+      color: var(--muted);
+    }}
+
+    @media (max-width: 768px) {{
+      .hero {{
+        min-height: auto;
+        padding: 5rem 0;
+      }}
+
+      .hero-card {{
+        margin-top: 2rem;
+      }}
+
+      .section-padding {{
+        padding: 4rem 0;
+      }}
+    }}
+  </style>
+</head>
+
+<body>
+  <header class="hero">
+    <div class="container py-5">
+      <div class="row align-items-center g-5">
+        <div class="col-lg-7">
+          <span class="hero-badge hero-animate">Local {industry}</span>
+          <h1 class="hero-title hero-animate">{business_name}</h1>
+          <p class="hero-text hero-animate">{summary}</p>
+          <div class="hero-actions hero-animate">
+            <a href="#contact" class="btn btn-light btn-lg rounded-pill px-4 shadow">Get started</a>
+            <a href="#services" class="btn btn-outline-light btn-lg rounded-pill px-4">View services</a>
+          </div>
+        </div>
+
+        <div class="col-lg-5">
+          <div class="hero-card hero-visual">
+            <p class="fw-bold mb-3">Serving {location}</p>
+            <div class="floating-chip">Fast response</div>
+            <div class="floating-chip">Modern service</div>
+            <div class="floating-chip">Local support</div>
+            <div class="floating-chip">Customer focused</div>
+            <hr class="border-light opacity-25 my-4">
+            <p class="mb-0">A polished digital landing page built to help customers understand services, trust the business, and make contact quickly.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section id="services" class="section-padding">
+      <div class="container">
+        <div class="text-center mb-5">
+          <span class="section-kicker">What we offer</span>
+          <h2 class="section-title">Services designed for local customers</h2>
+          <p class="text-secondary mx-auto" style="max-width: 720px;">Clear, useful information presented in a modern format so visitors can quickly understand what {business_name} provides.</p>
+        </div>
+
+        <div class="row g-4">
+          {services_html}
+        </div>
+      </div>
+    </section>
+
+    <section class="section-padding pt-0">
+      <div class="container">
+        <div class="about-panel">
+          <div class="row g-0">
+            <div class="col-lg-5">
+              <div class="about-gradient h-100">
+                <span class="section-kicker text-white">Why choose us</span>
+                <h2 class="section-title">Built around trust, clarity, and service.</h2>
+                <div class="row g-3 mt-3">
+                  <div class="col-6">
+                    <div class="stat-card">
+                      <strong>{industry}</strong>
+                      <small class="d-block opacity-75">Industry</small>
+                    </div>
+                  </div>
+                  <div class="col-6">
+                    <div class="stat-card">
+                      <strong>{location}</strong>
+                      <small class="d-block opacity-75">Location</small>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div class="col-lg-7">
+              <div class="p-4 p-lg-5">
+                <span class="section-kicker">About</span>
+                <h2 class="section-title">About {business_name}</h2>
+                <p class="about-text">{summary}</p>
+                <p class="about-text">This page highlights the business in a clean, mobile-friendly way using strong calls to action, organised service sections, and easy contact options.</p>
+                <a href="#contact" class="btn btn-primary btn-lg rounded-pill px-4">Contact the business</a>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section id="contact" class="section-padding">
+      <div class="container">
+        <div class="cta-band text-center">
+          <span class="section-kicker text-white">Ready to connect?</span>
+          <h2 class="section-title">Contact {business_name}</h2>
+          <p class="contact-text text-white-50 mx-auto" style="max-width: 680px;">Use the options below to get in touch, ask a question, or request more information.</p>
+          <div class="hero-actions justify-content-center">
+            {contact_buttons}
+          </div>
+          <div class="mt-4">
+            <span class="contact-pill">{industry}</span>
+            <span class="contact-pill">{location}</span>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="container d-flex flex-wrap justify-content-between gap-2">
+      <span>&copy; {datetime.now().year} {business_name}</span>
+      <span>Generated by AI Site Factory</span>
+    </div>
+  </footer>
+
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js"></script>
+
+  <script>
+    window.addEventListener("DOMContentLoaded", function () {{
+      if (!window.gsap) return;
+
+      gsap.from(".hero-animate", {{
+        y: 36,
+        opacity: 0,
+        duration: 0.9,
+        ease: "power3.out",
+        stagger: 0.12
+      }});
+
+      gsap.from(".hero-visual", {{
+        scale: 0.94,
+        y: 28,
+        opacity: 0,
+        duration: 1,
+        ease: "power3.out",
+        delay: 0.25
+      }});
+
+      gsap.from(".service-card", {{
+        y: 42,
+        opacity: 0,
+        duration: 0.8,
+        ease: "power3.out",
+        stagger: 0.12,
+        delay: 0.45
+      }});
+
+      gsap.from(".about-panel, .cta-band", {{
+        y: 38,
+        opacity: 0,
+        duration: 0.9,
+        ease: "power3.out",
+        stagger: 0.15,
+        delay: 0.65
+      }});
+    }});
+  </script>
+</body>
+</html>"""
 
 def generate_draft_html_with_groq(
     context: Dict[str, Any],
     template: Dict[str, Any],
     page_prompt: Dict[str, Any],
 ) -> Dict[str, Any]:
-    prompt = (
-        "Generate a complete standalone responsive HTML document for a small-business landing page. "
-        "Return strict JSON with keys: html, notes. The html value must include <!doctype html>, <html>, <head>, CSS, and <body>. "
-        "Preserve this original structure exactly: hero, four service cards, about section, contact section, footer. "
-        "Use Bootstrap 5 CDN CSS/JS and GSAP CDN for modern responsive layout and tasteful entry animations. "
-        "No markdown fences. Do not invent private information, guarantees, prices, awards, or unsupported services.\n\n"
-        f"Gemini page prompt: {model_safe_json(page_prompt)}\n"
-        f"Template: {model_safe_json(template)}\n"
-        f"Lead context: {model_safe_json(context)}"
-    )
-
-    result = groq_chat_json(
-        prompt,
-        "You generate deployable single-file HTML for ethical small-business website previews. Return valid JSON only.",
-    )
-    html_value = compact_text(result.get("html"))
-    if not html_value:
-        raise RuntimeError("Groq did not return HTML.")
-    result["html"] = html_value
-    result.setdefault("notes", "Groq draft HTML generated.")
-    return result
-
+    site_html = build_bootstrap_gsap_landing_html(context, template)
+    return {
+        "html": site_html,
+        "notes": "Generated deterministic Bootstrap + GSAP landing page."
+    }
 
 def finalize_html_with_gemini(
     context: Dict[str, Any],
@@ -2209,36 +2674,9 @@ def finalize_html_with_gemini(
     page_prompt: Dict[str, Any],
     draft_html: str,
 ) -> Dict[str, Any]:
-    prompt = (
-        "Finalize this single-file HTML website for deployment. Return strict JSON with keys: html, qaNotes. "
-        "Keep the structure: hero, four service cards, about, contact, footer. "
-        "Ensure Bootstrap 5 CDN assets and GSAP CDN animations are present. Fix malformed HTML/CSS and keep claims grounded.\n\n"
-        f"Template: {model_safe_json(template)}\n"
-        f"Lead context: {model_safe_json(context)}\n"
-        f"Page prompt: {model_safe_json(page_prompt)}\n"
-        f"Draft HTML: {draft_html[:MODEL_CHUNK_CHARS * MODEL_MAX_CHUNKS]}"
-    )
-
-    try:
-        result = gemini_text_json(prompt)
-        html_value = compact_text(result.get("html"))
-
-        if html_value and "<html" in html_value.lower() and "</html>" in html_value.lower():
-            result["html"] = html_value
-            result.setdefault("qaNotes", "Gemini finalized the HTML.")
-            return result
-
-    except Exception as error:
-        log_event(
-            "warning",
-            "provider.gemini_final_html.fallback",
-            "Gemini final HTML failed. Using Groq draft HTML.",
-            reason=str(error),
-        )
-
     return {
-        "html": draft_html,
-        "qaNotes": "Gemini finalization skipped. Groq draft HTML used as deployable fallback.",
+        "html": ensure_bootstrap_gsap_assets(draft_html),
+        "qaNotes": "Final HTML uses Bootstrap 5.3.8, GSAP 3.15, custom styling, and animations."
     }
 
 
@@ -2247,15 +2685,14 @@ def ensure_bootstrap_gsap_assets(site_html: str) -> str:
     lower_html = html_value.lower()
 
     bootstrap_css = (
-        '<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" '
+        '<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" '
         'rel="stylesheet" '
-        'integrity="sha384-QWTKZyjpPEjISv5WaRU9Oer+R4m9GdeM0IhJ7rZbXvWgW8G0gWZb8gWZQvG2iU6q" crossorigin="anonymous">'
+        'integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">'
     )
     bootstrap_js = (
-        '<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js" '
-        'integrity="sha384-YvpcrYf0tY3lHB60NNkmXc5s9fDVZLESaAA55NDzOxhy9GkcIdslK1eN7N6jIeHz" crossorigin="anonymous"></script>'
+        '<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>'
     )
-    gsap_js = '<script src="https://cdn.jsdelivr.net/npm/gsap@3.12.5/dist/gsap.min.js"></script>'
+    gsap_js = '<script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js"></script>'
     animation_js = """
 <script>
   window.addEventListener("DOMContentLoaded", function () {
@@ -2271,7 +2708,7 @@ def ensure_bootstrap_gsap_assets(site_html: str) -> str:
   });
 </script>"""
 
-    if "bootstrap@5" not in lower_html and "bootstrap.min.css" not in lower_html:
+    if "bootstrap@5.3.8/dist/css/bootstrap.min.css" not in lower_html:
         if "</head>" in lower_html:
             html_value = re.sub(r"</head>", f"  {bootstrap_css}\n</head>", html_value, count=1, flags=re.IGNORECASE)
         else:
@@ -2279,9 +2716,9 @@ def ensure_bootstrap_gsap_assets(site_html: str) -> str:
 
     lower_html = html_value.lower()
     scripts = []
-    if "bootstrap.bundle.min.js" not in lower_html and "bootstrap.min.js" not in lower_html:
+    if "bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js" not in lower_html:
         scripts.append(bootstrap_js)
-    if "gsap" not in lower_html:
+    if "gsap@3.15/dist/gsap.min.js" not in lower_html:
         scripts.append(gsap_js)
     if "gsap.from" not in lower_html:
         scripts.append(animation_js)
@@ -2431,12 +2868,16 @@ def render_site_html(
         image = images[(index + 1) % len(images)]
         services_html.append(
             f"""
-            <article class="service-card">
-              <img src="{image}" alt="">
-              <span>0{index + 1}</span>
-              <h3>{title}</h3>
-              <p>{description}</p>
-            </article>
+            <div class="col-md-6 col-xl-3">
+              <article class="service-card card h-100">
+                <img src="{image}" alt="{title}">
+                <div class="card-body">
+                  <span class="service-number">Service 0{index + 1}</span>
+                  <h3>{title}</h3>
+                  <p>{description}</p>
+                </div>
+              </article>
+            </div>
             """
         )
 
@@ -2456,49 +2897,64 @@ def render_site_html(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{business_name}</title>
   <meta name="description" content="{subheadline}">
+  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
   <style>
     :root {{
       --accent: {accent};
       --background: {background};
-      --ink: #111827;
-      --muted: #5b6472;
-      --line: #d9dee7;
+      --ink: #102033;
+      --muted: #667085;
+      --line: #d9e2ef;
       --surface: #ffffff;
+      --navy: #071b33;
+      --cyan: #1d9bf0;
+      --teal: #0f9f96;
+      --purple: #8b5cf6;
     }}
     * {{ box-sizing: border-box; }}
     body {{
       margin: 0;
-      font-family: Arial, Helvetica, sans-serif;
+      font-family: Inter, Segoe UI, Arial, sans-serif;
       color: var(--ink);
-      background: var(--background);
-      line-height: 1.55;
+      background: linear-gradient(180deg, #f8fbff 0%, var(--background) 100%);
+      line-height: 1.6;
     }}
     a {{ color: inherit; }}
-    header {{
-      min-height: 78vh;
-      display: grid;
-      grid-template-columns: minmax(0, 1.05fr) minmax(320px, 0.95fr);
+    .hero {{
+      min-height: 720px;
+      display: flex;
       align-items: center;
-      gap: 44px;
-      padding: clamp(28px, 5vw, 72px);
+      padding: 88px 0 72px;
+      color: var(--navy);
+      background:
+        radial-gradient(circle at top right, rgba(139, 92, 246, 0.28), transparent 32%),
+        linear-gradient(135deg, #ecfeff 0%, #dff7ff 42%, #eef2ff 100%);
+    }}
+    .hero-content {{
+      max-width: 680px;
     }}
     .eyebrow {{
-      color: var(--accent);
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0;
+      display: inline-flex;
+      margin-bottom: 14px;
+      padding: 8px 12px;
+      border: 1px solid rgba(15, 159, 150, 0.28);
+      border-radius: 8px;
+      color: #0f766e;
+      background: rgba(255, 255, 255, 0.72);
       font-size: 0.82rem;
+      font-weight: 800;
+      text-transform: uppercase;
     }}
     h1 {{
-      margin: 14px 0 18px;
-      font-size: clamp(2.3rem, 5vw, 5.4rem);
-      line-height: 0.96;
+      margin: 0 0 18px;
+      font-size: 4rem;
+      line-height: 1;
       letter-spacing: 0;
+      font-weight: 900;
     }}
-    .hero-copy p {{
-      max-width: 680px;
-      font-size: clamp(1.02rem, 1.6vw, 1.32rem);
-      color: var(--muted);
+    .hero-copy {{
+      color: #40546a;
+      font-size: 1.16rem;
     }}
     .hero-actions {{
       display: flex;
@@ -2506,62 +2962,84 @@ def render_site_html(
       gap: 12px;
       margin-top: 28px;
     }}
-    .button {{
+    .btn-brand {{
+      min-height: 50px;
       display: inline-flex;
-      min-height: 48px;
       align-items: center;
       justify-content: center;
-      padding: 0 18px;
-      border: 1px solid var(--accent);
       border-radius: 8px;
-      background: var(--accent);
-      color: #fff;
+      padding: 0 20px;
+      background: linear-gradient(90deg, var(--teal), var(--cyan));
+      color: #ffffff;
+      font-weight: 800;
       text-decoration: none;
-      font-weight: 700;
+      box-shadow: 0 18px 40px rgba(29, 155, 240, 0.25);
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
     }}
-    .button.secondary {{
-      background: transparent;
-      color: var(--accent);
+    .btn-brand:hover {{
+      color: #ffffff;
+      transform: translateY(-2px);
+      box-shadow: 0 22px 46px rgba(15, 159, 150, 0.3);
+    }}
+    .btn-ghost {{
+      min-height: 50px;
+      border: 1px solid rgba(16, 32, 51, 0.24);
+      border-radius: 8px;
+      padding: 0 20px;
+      color: var(--navy);
+      background: rgba(255, 255, 255, 0.65);
+      font-weight: 800;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
     }}
     .hero-image {{
-      min-height: 420px;
-      border-radius: 8px;
       overflow: hidden;
-      box-shadow: 0 24px 70px rgba(17, 24, 39, 0.16);
-      animation: lift 0.7s ease both;
+      border: 1px solid rgba(29, 155, 240, 0.22);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.68);
+      box-shadow: 0 28px 70px rgba(29, 155, 240, 0.18);
     }}
     .hero-image img {{
       width: 100%;
-      height: 100%;
-      min-height: 420px;
+      min-height: 440px;
       object-fit: cover;
       display: block;
+      transition: transform 0.35s ease;
     }}
-    main {{ padding-bottom: 48px; }}
+    .hero-image:hover img {{
+      transform: scale(1.03);
+    }}
     section {{
-      padding: 56px clamp(20px, 5vw, 72px);
+      padding: 76px 0;
     }}
     .section-head {{
       max-width: 760px;
-      margin-bottom: 26px;
+      margin-bottom: 28px;
     }}
     .section-head h2 {{
-      font-size: clamp(1.8rem, 3vw, 3rem);
       margin: 0 0 10px;
+      font-size: 2.5rem;
+      font-weight: 900;
       letter-spacing: 0;
     }}
-    .services {{
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 18px;
+    .section-head p {{
+      color: var(--muted);
+      font-size: 1.05rem;
     }}
     .service-card {{
-      min-height: 100%;
-      background: var(--surface);
+      height: 100%;
+      overflow: hidden;
       border: 1px solid var(--line);
       border-radius: 8px;
-      overflow: hidden;
-      animation: rise 0.55s ease both;
+      background: linear-gradient(180deg, #ffffff, #f8fbff);
+      box-shadow: 0 16px 42px rgba(16, 32, 51, 0.08);
+      transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+    }}
+    .service-card:hover {{
+      border-color: var(--accent);
+      transform: translateY(-4px);
+      box-shadow: 0 22px 54px rgba(16, 32, 51, 0.13);
     }}
     .service-card img {{
       width: 100%;
@@ -2569,55 +3047,44 @@ def render_site_html(
       object-fit: cover;
       display: block;
     }}
-    .service-card span {{
-      display: block;
+    .service-number {{
       color: var(--accent);
-      font-weight: 700;
-      padding: 18px 18px 0;
+      font-size: 0.78rem;
+      font-weight: 900;
+      text-transform: uppercase;
     }}
     .service-card h3 {{
-      margin: 8px 18px;
-      font-size: 1.08rem;
+      margin: 8px 0 10px;
+      font-size: 1.16rem;
+      font-weight: 850;
     }}
     .service-card p {{
-      margin: 0;
-      padding: 0 18px 20px;
       color: var(--muted);
     }}
     .about-band {{
-      background: #fff;
+      background: #ffffff;
       border-top: 1px solid var(--line);
       border-bottom: 1px solid var(--line);
     }}
-    .about-grid {{
-      display: grid;
-      grid-template-columns: 0.8fr 1.2fr;
-      gap: 36px;
-      align-items: start;
-    }}
-    .facts {{
-      display: grid;
-      gap: 10px;
-    }}
     .fact {{
-      padding: 14px 16px;
+      padding: 16px 18px;
       border: 1px solid var(--line);
       border-radius: 8px;
-      background: var(--background);
-      font-weight: 700;
+      background: linear-gradient(180deg, #ffffff, #f7fbff);
+      font-weight: 800;
     }}
-    .contact {{
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 24px;
-      background: var(--ink);
-      color: #fff;
+    .contact-card {{
       border-radius: 8px;
-      margin: 0 clamp(20px, 5vw, 72px) 48px;
-      padding: clamp(24px, 4vw, 48px);
+      padding: 42px;
+      color: var(--navy);
+      background:
+        radial-gradient(circle at top right, rgba(139, 92, 246, 0.24), transparent 28%),
+        linear-gradient(135deg, #ecfeff, #e0f2fe 55%, #f5f3ff);
+      box-shadow: 0 22px 60px rgba(29, 155, 240, 0.14);
     }}
-    .contact p {{ color: #d1d5db; }}
+    .contact-card p {{
+      color: #40546a;
+    }}
     .contact-links {{
       display: flex;
       flex-wrap: wrap;
@@ -2625,100 +3092,133 @@ def render_site_html(
     }}
     .contact-links a,
     .contact-links span {{
-      border: 1px solid rgba(255, 255, 255, 0.22);
+      border: 1px solid rgba(16, 32, 51, 0.16);
       border-radius: 8px;
       padding: 10px 12px;
+      color: var(--navy);
+      background: rgba(255, 255, 255, 0.72);
       text-decoration: none;
+      font-weight: 750;
     }}
     footer {{
-      padding: 28px clamp(20px, 5vw, 72px);
+      padding: 32px 0;
       color: var(--muted);
       border-top: 1px solid var(--line);
     }}
-    @keyframes lift {{
-      from {{ opacity: 0; transform: translateY(18px); }}
-      to {{ opacity: 1; transform: translateY(0); }}
-    }}
-    @keyframes rise {{
-      from {{ opacity: 0; transform: translateY(10px); }}
-      to {{ opacity: 1; transform: translateY(0); }}
-    }}
-    @media (max-width: 980px) {{
-      header,
-      .about-grid {{
-        grid-template-columns: 1fr;
-      }}
-      .services {{
-        grid-template-columns: repeat(2, minmax(0, 1fr));
-      }}
-      .contact {{
-        align-items: flex-start;
-        flex-direction: column;
-      }}
-    }}
-    @media (max-width: 620px) {{
-      header {{
+    @media (max-width: 992px) {{
+      .hero {{
         min-height: auto;
+        padding: 64px 0;
       }}
-      .hero-image,
+      h1 {{
+        font-size: 2.8rem;
+      }}
       .hero-image img {{
-        min-height: 280px;
+        min-height: 320px;
       }}
-      .services {{
-        grid-template-columns: 1fr;
+      section {{
+        padding: 56px 0;
+      }}
+    }}
+    @media (max-width: 576px) {{
+      h1 {{
+        font-size: 2.25rem;
+      }}
+      .section-head h2 {{
+        font-size: 1.8rem;
+      }}
+      .contact-card {{
+        padding: 24px;
       }}
     }}
   </style>
 </head>
 <body>
-  <header>
-    <div class="hero-copy">
-      <div class="eyebrow">{industry} in {location}</div>
-      <h1>{headline}</h1>
-      <p>{subheadline}</p>
-      <div class="hero-actions">
-        <a class="button" href="#contact">{cta_label}</a>
-        <a class="button secondary" href="#services">View services</a>
+  <header class="hero hero-section">
+    <div class="container">
+      <div class="row align-items-center g-5">
+        <div class="col-lg-6 hero-content">
+          <div class="eyebrow">{industry} in {location}</div>
+          <h1>{headline}</h1>
+          <p class="hero-copy">{subheadline}</p>
+          <div class="hero-actions">
+            <a class="btn-brand" href="#contact">{cta_label}</a>
+            <a class="btn-ghost" href="#services">View services</a>
+          </div>
+        </div>
+        <div class="col-lg-6">
+          <div class="hero-image">
+            <img src="{images[0]}" alt="{business_name}">
+          </div>
+        </div>
       </div>
-    </div>
-    <div class="hero-image">
-      <img src="{images[0]}" alt="">
     </div>
   </header>
   <main>
     <section id="services">
-      <div class="section-head">
-        <h2>Services</h2>
-        <p>{business_name} presents a practical, customer-focused service experience for local customers.</p>
-      </div>
-      <div class="services">
-        {''.join(services_html)}
+      <div class="container">
+        <div class="section-head">
+          <h2>Services built around local customers</h2>
+          <p>{business_name} presents a practical, customer-focused service experience for people in {location}.</p>
+        </div>
+        <div class="row g-4">
+          {''.join(services_html)}
+        </div>
       </div>
     </section>
-    <section class="about-band">
-      <div class="about-grid">
-        <div class="section-head">
-          <h2>About {business_name}</h2>
-        </div>
-        <div>
-          <p>{about}</p>
-          <div class="facts">
-            <div class="fact">{industry}</div>
-            <div class="fact">{location}</div>
-            <div class="fact">Built from public business information</div>
+    <section class="about-band" id="about">
+      <div class="container">
+        <div class="row g-4 align-items-start">
+          <div class="col-lg-5">
+            <div class="section-head mb-0">
+              <h2>About {business_name}</h2>
+              <p>Clear information, local context, and a simple path for customers to reach out.</p>
+            </div>
+          </div>
+          <div class="col-lg-7">
+            <p class="lead">{about}</p>
+            <div class="row g-3 mt-2">
+              <div class="col-md-4"><div class="fact">{industry}</div></div>
+              <div class="col-md-4"><div class="fact">{location}</div></div>
+              <div class="col-md-4"><div class="fact">Public business information</div></div>
+            </div>
           </div>
         </div>
       </div>
     </section>
-    <section id="contact" class="contact">
-      <div>
-        <h2>{cta_label}</h2>
-        <p>{contact_intro}</p>
+    <section id="contact">
+      <div class="container">
+        <div class="contact-card">
+          <div class="row g-4 align-items-center">
+            <div class="col-lg-7">
+              <h2>{cta_label}</h2>
+              <p>{contact_intro}</p>
+            </div>
+            <div class="col-lg-5">
+              <div class="contact-links">{contact_html}</div>
+            </div>
+          </div>
+        </div>
       </div>
-      <div class="contact-links">{contact_html}</div>
     </section>
   </main>
-  <footer>{footer_text}</footer>
+  <footer>
+    <div class="container d-flex flex-wrap justify-content-between gap-2">
+      <span>{footer_text}</span>
+      <span>Responsive landing page preview</span>
+    </div>
+  </footer>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js"></script>
+  <script>
+    window.addEventListener("DOMContentLoaded", function () {{
+      if (window.gsap) {{
+        gsap.from(".hero-content > *", {{ y: 18, opacity: 0, duration: 0.75, ease: "power2.out", stagger: 0.08 }});
+        gsap.from(".hero-image", {{ y: 24, opacity: 0, duration: 0.8, ease: "power2.out", delay: 0.15 }});
+        gsap.from(".service-card, .about-band .row, .contact-card", {{ y: 22, opacity: 0, duration: 0.7, ease: "power2.out", stagger: 0.08, delay: 0.25 }});
+      }}
+    }});
+  </script>
 </body>
 </html>"""
 
@@ -3001,6 +3501,22 @@ def export_site_to_github(
     return result
 
 
+def deployment_mode_label(publish_mode: Optional[str]) -> str:
+    if publish_mode == "direct-netlify-fallback":
+        return "Direct Netlify fallback"
+    if publish_mode == "failed":
+        return "Failed"
+    return "GitHub \u2192 Netlify"
+
+
+def zip_site_html(site_html: str) -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("index.html", site_html)
+        archive.writestr("_headers", "/*\n  Content-Type: text/html; charset=utf-8\n")
+    return buffer.getvalue()
+
+
 def deploy_github_repo_to_netlify_for_lead(
     canonical_key: str,
     business_name: str,
@@ -3050,6 +3566,7 @@ def deploy_github_repo_to_netlify_for_lead(
             "htmlChecksum": checksum,
             "deploymentHistoryId": None,
             "publishMode": "github-netlify",
+            "deploymentMode": deployment_mode_label("github-netlify"),
             "githubExport": github_export,
             "githubRepoUrl": repo_url,
             "githubRepoFullName": repo_full_name,
@@ -3176,6 +3693,7 @@ def deploy_github_repo_to_netlify_for_lead(
         "htmlChecksum": checksum,
         "deploymentHistoryId": deployment_history_id,
         "publishMode": "github-netlify",
+        "deploymentMode": deployment_mode_label("github-netlify"),
         "githubExport": github_export,
         "githubRepoUrl": repo_url,
         "githubRepoFullName": repo_full_name,
@@ -3257,6 +3775,230 @@ def deploy_github_repo_to_netlify_for_lead(
         )
 
     log_event("info", "provider.netlify.git_deploy_finish", "Netlify Git deployment recorded.", siteName=site_name, state=result["state"], url=result["url"], repository=repo_full_name)
+    return result
+
+
+def deploy_direct_netlify_fallback_for_lead(
+    canonical_key: str,
+    business_name: str,
+    site_html: str,
+    pipeline_id: Optional[str],
+    approval_id: Optional[str],
+    approved_by: Optional[str],
+    github_export: Dict[str, Any],
+    git_error: Exception,
+) -> Dict[str, Any]:
+    token = require_env("NETLIFY_AUTH_TOKEN")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "AI-Site-Factory",
+    }
+    repo_full_name = compact_text(github_export.get("repository"))
+    repo_url = compact_text(github_export.get("repoUrl")) or (f"https://github.com/{repo_full_name}" if repo_full_name else "")
+    commit_sha = compact_text(github_export.get("commitSha"))
+    checksum = html_checksum(site_html)
+    fallback_reason = sanitize_message(git_error)
+
+    with get_pipeline_db() as db:
+        existing_site = db.execute(
+            "SELECT * FROM site_registry WHERE canonical_lead_key = ?",
+            (canonical_key,),
+        ).fetchone()
+
+    site_created = False
+    site_reused = bool(existing_site)
+    deploy_action = "DIRECT_FALLBACK_REDEPLOYED" if existing_site else "DIRECT_FALLBACK_CREATED"
+
+    if existing_site:
+        site_id = existing_site["site_id"]
+        site_name = existing_site["site_name"]
+        site = {
+            "id": site_id,
+            "name": site_name,
+            "ssl_url": existing_site["url"],
+            "url": existing_site["url"],
+            "admin_url": existing_site["admin_url"],
+        }
+    else:
+        site_name = f"ai-site-{slugify(business_name, 32)}-{canonical_key[:8]}"
+        log_event(
+            "warning",
+            "provider.netlify.direct_fallback_site_start",
+            "Creating direct Netlify fallback site after Git-linked deployment failed.",
+            siteName=site_name,
+            repository=repo_full_name,
+            reason=fallback_reason,
+        )
+        create_response = requests.post(
+            "https://api.netlify.com/api/v1/sites",
+            headers={**headers, "Content-Type": "application/json"},
+            json={
+                "name": site_name,
+                "processing_settings": {"html": {"pretty_urls": True}},
+            },
+            timeout=45,
+        )
+        create_response.raise_for_status()
+        site = create_response.json()
+        site_id = site.get("id") or site.get("name")
+        site_name = site.get("name") or site_name
+        site_created = True
+        if not site_id:
+            raise RuntimeError("Netlify did not return a site id for fallback deployment.")
+
+    log_event(
+        "warning",
+        "provider.netlify.direct_fallback_deploy_start",
+        "Uploading direct Netlify fallback deploy after Git-linked deployment failed.",
+        siteName=site_name,
+        repository=repo_full_name,
+        reason=fallback_reason,
+    )
+    deploy_response = requests.post(
+        f"https://api.netlify.com/api/v1/sites/{site_id}/deploys",
+        headers={**headers, "Content-Type": "application/zip"},
+        data=zip_site_html(site_html),
+        timeout=90,
+    )
+    deploy_response.raise_for_status()
+    deploy = deploy_response.json()
+    deploy_id = deploy.get("id")
+    state = deploy.get("state") or "uploaded"
+    poll_until = time.time() + int(os.getenv("NETLIFY_DEPLOY_POLL_SECONDS", "45"))
+
+    while deploy_id and state not in {"ready", "error"} and time.time() < poll_until:
+        time.sleep(2)
+        deploy_poll = requests.get(
+            f"https://api.netlify.com/api/v1/deploys/{deploy_id}",
+            headers=headers,
+            timeout=30,
+        )
+        deploy_poll.raise_for_status()
+        deploy = deploy_poll.json()
+        state = deploy.get("state") or state
+
+    if state == "error":
+        raise RuntimeError(deploy.get("error_message") or "Netlify direct fallback deploy failed.")
+
+    site_url = (
+        deploy.get("ssl_url")
+        or deploy.get("url")
+        or site.get("ssl_url")
+        or site.get("url")
+        or (existing_site["url"] if existing_site else None)
+        or f"https://{site_name}.netlify.app"
+    )
+    admin_url = site.get("admin_url") or (existing_site["admin_url"] if existing_site else None)
+    deployed_at = now_iso()
+    deployment_history_id = str(uuid4())
+
+    result = {
+        "deployAction": deploy_action,
+        "siteCreated": site_created,
+        "siteReused": site_reused,
+        "siteId": site_id,
+        "siteName": site_name,
+        "buildId": None,
+        "deployId": deploy_id,
+        "state": state or "unknown",
+        "url": site_url,
+        "adminUrl": admin_url,
+        "deployedAt": deployed_at,
+        "mode": "production",
+        "htmlChecksum": checksum,
+        "deploymentHistoryId": deployment_history_id,
+        "publishMode": "direct-netlify-fallback",
+        "deploymentMode": deployment_mode_label("direct-netlify-fallback"),
+        "githubExport": github_export,
+        "githubRepoUrl": repo_url,
+        "githubRepoFullName": repo_full_name,
+        "commitSha": commit_sha,
+        "fallbackReason": fallback_reason,
+    }
+
+    with get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT INTO site_registry (
+                canonical_lead_key, site_id, site_name, url, admin_url,
+                github_repo_full_name, github_repo_url, last_commit_sha, last_build_id,
+                created_at, updated_at, last_deploy_id, last_deploy_state, deployment_count
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(canonical_lead_key) DO UPDATE SET
+                site_id = excluded.site_id,
+                site_name = excluded.site_name,
+                url = excluded.url,
+                admin_url = COALESCE(excluded.admin_url, site_registry.admin_url),
+                github_repo_full_name = excluded.github_repo_full_name,
+                github_repo_url = excluded.github_repo_url,
+                last_commit_sha = excluded.last_commit_sha,
+                last_build_id = excluded.last_build_id,
+                updated_at = excluded.updated_at,
+                last_deploy_id = excluded.last_deploy_id,
+                last_deploy_state = excluded.last_deploy_state,
+                deployment_count = site_registry.deployment_count + 1
+            """,
+            (
+                canonical_key,
+                site_id,
+                site_name,
+                site_url,
+                admin_url,
+                repo_full_name,
+                repo_url,
+                commit_sha,
+                None,
+                deployed_at,
+                deployed_at,
+                deploy_id,
+                state or "unknown",
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO deployment_history (
+                id, canonical_lead_key, pipeline_id, approval_id, site_id, site_name,
+                deploy_id, build_id, url, deploy_action, state, html_checksum, deployed_at,
+                approved_by, approval_status, github_repo_full_name, github_repo_url,
+                commit_sha, publish_mode, github_export_json, raw_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                deployment_history_id,
+                canonical_key,
+                pipeline_id,
+                approval_id,
+                site_id,
+                site_name,
+                deploy_id,
+                None,
+                site_url,
+                deploy_action,
+                state or "unknown",
+                checksum,
+                deployed_at,
+                approved_by,
+                "APPROVED",
+                repo_full_name,
+                repo_url,
+                commit_sha,
+                "direct-netlify-fallback",
+                json.dumps(github_export, default=str),
+                json.dumps(result, default=str),
+            ),
+        )
+
+    log_event(
+        "warning",
+        "provider.netlify.direct_fallback_finish",
+        "Direct Netlify fallback deployment recorded.",
+        siteName=site_name,
+        state=result["state"],
+        url=result["url"],
+        repository=repo_full_name,
+    )
     return result
 
 
@@ -4395,6 +5137,7 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
     zendesk: Optional[Dict[str, Any]] = None
     github_export: Optional[Dict[str, Any]] = safe_json_loads(row["github_export_json"], None)
     publish_mode = normalize_publish_mode(request.publishMode)
+    effective_publish_mode = publish_mode
     status = "APPROVED"
 
     if not site_html:
@@ -4436,23 +5179,49 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
         return result
 
     try:
-        deployment = run_approval_step(
-            "netlify_deploy",
-            "netlify",
-            lambda: deploy_github_repo_to_netlify_for_lead(
-                canonical_key=row["canonical_lead_key"],
-                business_name=row["business_name"],
-                pipeline_id=row["pipeline_id"],
-                approval_id=approval_id,
-                approved_by=approved_by,
-                regenerate_existing_site=request.regenerateExistingSite,
-                github_export=github_export,
-            ),
-        )
+        try:
+            deployment = run_approval_step(
+                "netlify_deploy",
+                "netlify",
+                lambda: deploy_github_repo_to_netlify_for_lead(
+                    canonical_key=row["canonical_lead_key"],
+                    business_name=row["business_name"],
+                    pipeline_id=row["pipeline_id"],
+                    approval_id=approval_id,
+                    approved_by=approved_by,
+                    regenerate_existing_site=request.regenerateExistingSite,
+                    github_export=github_export,
+                ),
+            )
+        except Exception as git_deploy_error:
+            errors.append(structured_pipeline_error("netlify_deploy", git_deploy_error, provider="netlify", retryable=True))
+            log_event(
+                "warning",
+                "approval.netlify.git_failed_fallback",
+                "Git-linked Netlify deployment failed; attempting direct deploy fallback.",
+                approvalId=approval_id,
+                reason=sanitize_message(git_deploy_error),
+            )
+            deployment = run_approval_step(
+                "netlify_direct_fallback",
+                "netlify",
+                lambda: deploy_direct_netlify_fallback_for_lead(
+                    canonical_key=row["canonical_lead_key"],
+                    business_name=row["business_name"],
+                    site_html=site_html,
+                    pipeline_id=row["pipeline_id"],
+                    approval_id=approval_id,
+                    approved_by=approved_by,
+                    github_export=github_export,
+                    git_error=git_deploy_error,
+                ),
+            )
+        effective_publish_mode = deployment.get("publishMode", publish_mode)
         deployment_history = deployment_history_row_to_dict(get_deployment_history_row(deployment.get("deploymentHistoryId")))
     except Exception as error:
         status = "DEPLOY_FAILED"
-        errors.append(structured_pipeline_error("netlify_deploy", error, provider="netlify", retryable=True))
+        if not errors or errors[-1].get("message") != sanitize_message(error):
+            errors.append(structured_pipeline_error("netlify_deploy", error, provider="netlify", retryable=True))
         with get_pipeline_db() as db:
             db.execute(
                 """
@@ -4466,7 +5235,7 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
                     now_iso(),
                     approved_by,
                     request.notes,
-                    publish_mode,
+                    effective_publish_mode,
                     json.dumps(github_export, default=str) if github_export else None,
                     json.dumps(errors, default=str),
                     approval_id,
@@ -4514,7 +5283,7 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
                 deployment.get("deploymentHistoryId") if deployment else None,
                 json.dumps(outreach, default=str) if outreach else None,
                 json.dumps(zendesk, default=str) if zendesk else None,
-                publish_mode,
+                effective_publish_mode,
                 json.dumps(github_export, default=str) if github_export else None,
                 json.dumps(errors, default=str),
                 approval_id,
@@ -4542,7 +5311,7 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
         deploymentHistory=deployment_history,
         zendesk=zendesk,
         outreachDraft=outreach,
-        publishMode=publish_mode,
+        publishMode=effective_publish_mode,
         githubExport=github_export,
         errors=errors,
     )
@@ -4794,6 +5563,7 @@ def get_deployment_history(limit: int = 50):
         item["raw"] = safe_json_loads(item.pop("raw_json", None), {})
         item["githubExport"] = safe_json_loads(item.pop("github_export_json", None), None)
         item["publishMode"] = item.pop("publish_mode", None) or "github-netlify"
+        item["deploymentMode"] = deployment_mode_label(item["publishMode"])
         history.append(item)
     return {"deployments": history, "count": len(history)}
 
