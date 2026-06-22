@@ -81,7 +81,7 @@ REQUIRED_PROVIDER_ENV = {
     "github": ["GITHUB_OWNER", "GITHUB_TOKEN"],
 }
 
-VALID_PUBLISH_MODES = {"github-netlify", "direct-netlify-fallback"}
+VALID_PUBLISH_MODES = {"github-netlify", "direct-netlify", "direct-netlify-fallback"}
 
 def redact_value(value: Any) -> Any:
     if isinstance(value, dict):
@@ -3573,15 +3573,27 @@ def deploy_github_repo_to_netlify_for_lead(
             "commitSha": commit_sha,
         }
 
+    netlify_installation_id_raw = compact_text(os.getenv("NETLIFY_GITHUB_INSTALLATION_ID"))
+    netlify_installation_id: Optional[int] = None
+    if netlify_installation_id_raw:
+        try:
+            netlify_installation_id = int(netlify_installation_id_raw)
+        except ValueError as error:
+            raise RuntimeError(
+                "NETLIFY_GITHUB_INSTALLATION_ID must be a numeric Netlify GitHub installation id."
+            ) from error
+
     repo_settings = {
         "provider": "github",
         "repo_path": repo_full_name,
         "repo_branch": branch,
-        "repo_url": repo_url,
+        "repo_url": f"https://github.com/{repo_full_name}.git",
         "dir": "",
         "cmd": "",
         "public_repo": not bool(github_export.get("private")),
     }
+    if netlify_installation_id is not None:
+        repo_settings["installation_id"] = netlify_installation_id
     site_created = False
     site_reused = bool(existing_site)
     deploy_action = "REDEPLOYED" if existing_site else "CREATED"
@@ -3778,6 +3790,49 @@ def deploy_github_repo_to_netlify_for_lead(
     return result
 
 
+
+def deploy_direct_netlify_for_lead(
+    canonical_key: str,
+    business_name: str,
+    site_html: str,
+    pipeline_id: Optional[str],
+    approval_id: Optional[str],
+    approved_by: Optional[str],
+    github_export: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Deploy generated HTML directly to Netlify while retaining GitHub as the source archive."""
+    result = deploy_direct_netlify_fallback_for_lead(
+        canonical_key=canonical_key,
+        business_name=business_name,
+        site_html=site_html,
+        pipeline_id=pipeline_id,
+        approval_id=approval_id,
+        approved_by=approved_by,
+        github_export=github_export,
+        git_error=RuntimeError("Direct Netlify deployment selected by pipeline configuration."),
+    )
+    result["publishMode"] = "direct-netlify"
+    result["deploymentMode"] = "Direct Netlify"
+    result.pop("fallbackReason", None)
+
+    deployment_history_id = result.get("deploymentHistoryId")
+    if deployment_history_id:
+        with get_pipeline_db() as db:
+            db.execute(
+                "UPDATE deployment_history SET publish_mode = ?, raw_json = ? WHERE id = ?",
+                ("direct-netlify", json.dumps(result, default=str), deployment_history_id),
+            )
+
+    log_event(
+        "info",
+        "provider.netlify.direct_deploy_finish",
+        "Direct Netlify deployment recorded.",
+        siteName=result.get("siteName"),
+        state=result.get("state"),
+        url=result.get("url"),
+    )
+    return result
+
 def deploy_direct_netlify_fallback_for_lead(
     canonical_key: str,
     business_name: str,
@@ -3838,13 +3893,36 @@ def deploy_direct_netlify_fallback_for_lead(
             },
             timeout=45,
         )
-        create_response.raise_for_status()
-        site = create_response.json()
-        site_id = site.get("id") or site.get("name")
-        site_name = site.get("name") or site_name
-        site_created = True
+        if create_response.status_code == 422:
+            # A previous Git-linked attempt may have created the site but failed before
+            # our database recorded it. Reuse that Netlify site instead of treating the
+            # duplicate name as a second deployment failure.
+            sites_response = requests.get(
+                "https://api.netlify.com/api/v1/sites",
+                headers=headers,
+                params={"per_page": 100},
+                timeout=45,
+            )
+            sites_response.raise_for_status()
+            matching_site = next(
+                (item for item in sites_response.json() if item.get("name") == site_name),
+                None,
+            )
+            if not matching_site:
+                create_response.raise_for_status()
+            site = matching_site
+            site_id = site.get("id") or site.get("name")
+            site_name = site.get("name") or site_name
+            site_reused = True
+            deploy_action = "DIRECT_FALLBACK_REDEPLOYED"
+        else:
+            create_response.raise_for_status()
+            site = create_response.json()
+            site_id = site.get("id") or site.get("name")
+            site_name = site.get("name") or site_name
+            site_created = True
         if not site_id:
-            raise RuntimeError("Netlify did not return a site id for fallback deployment.")
+            raise RuntimeError("Netlify did not return a site id for direct deployment.")
 
     log_event(
         "warning",
@@ -5179,44 +5257,20 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
         return result
 
     try:
-        try:
-            deployment = run_approval_step(
-                "netlify_deploy",
-                "netlify",
-                lambda: deploy_github_repo_to_netlify_for_lead(
-                    canonical_key=row["canonical_lead_key"],
-                    business_name=row["business_name"],
-                    pipeline_id=row["pipeline_id"],
-                    approval_id=approval_id,
-                    approved_by=approved_by,
-                    regenerate_existing_site=request.regenerateExistingSite,
-                    github_export=github_export,
-                ),
-            )
-        except Exception as git_deploy_error:
-            errors.append(structured_pipeline_error("netlify_deploy", git_deploy_error, provider="netlify", retryable=True))
-            log_event(
-                "warning",
-                "approval.netlify.git_failed_fallback",
-                "Git-linked Netlify deployment failed; attempting direct deploy fallback.",
-                approvalId=approval_id,
-                reason=sanitize_message(git_deploy_error),
-            )
-            deployment = run_approval_step(
-                "netlify_direct_fallback",
-                "netlify",
-                lambda: deploy_direct_netlify_fallback_for_lead(
-                    canonical_key=row["canonical_lead_key"],
-                    business_name=row["business_name"],
-                    site_html=site_html,
-                    pipeline_id=row["pipeline_id"],
-                    approval_id=approval_id,
-                    approved_by=approved_by,
-                    github_export=github_export,
-                    git_error=git_deploy_error,
-                ),
-            )
-        effective_publish_mode = deployment.get("publishMode", publish_mode)
+        deployment = run_approval_step(
+            "netlify_direct_deploy",
+            "netlify",
+            lambda: deploy_direct_netlify_for_lead(
+                canonical_key=row["canonical_lead_key"],
+                business_name=row["business_name"],
+                site_html=site_html,
+                pipeline_id=row["pipeline_id"],
+                approval_id=approval_id,
+                approved_by=approved_by,
+                github_export=github_export,
+            ),
+        )
+        effective_publish_mode = deployment.get("publishMode", "direct-netlify")
         deployment_history = deployment_history_row_to_dict(get_deployment_history_row(deployment.get("deploymentHistoryId")))
     except Exception as error:
         status = "DEPLOY_FAILED"
