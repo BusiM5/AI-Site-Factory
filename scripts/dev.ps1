@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [switch]$InstallOnly,
-    [int]$BackendPort = 8001,
+    [int]$BackendPort = 8000,
     [int]$FrontendPort = 3000
 )
 
@@ -267,8 +267,8 @@ try {
     }
 
     $script:CancelHandler = [System.ConsoleCancelEventHandler] {
-        param($Sender, $EventArgs)
-        $EventArgs.Cancel = $true
+        param($Source, $CancelEventArgs)
+        $CancelEventArgs.Cancel = $true
         Stop-Servers
     }
     [Console]::add_CancelKeyPress($script:CancelHandler)
@@ -284,8 +284,6 @@ try {
 
     Write-Step "Starting frontend"
     Write-Info "Frontend will use http://127.0.0.1:$BackendPort as its API base by default."
-    $env:REACT_APP_API_BASE = "http://127.0.0.1:$BackendPort"
-    $env:PORT = "$FrontendPort"
     $script:FrontendProcess = Start-ManagedProcess `
         -Name "frontend" `
         -FileName "cmd.exe" `
