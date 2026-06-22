@@ -267,8 +267,8 @@ try {
     }
 
     $script:CancelHandler = [System.ConsoleCancelEventHandler] {
-        param($Sender, $EventArgs)
-        $EventArgs.Cancel = $true
+        param($Source, $CancelEventArgs)
+        $CancelEventArgs.Cancel = $true
         Stop-Servers
     }
     [Console]::add_CancelKeyPress($script:CancelHandler)
