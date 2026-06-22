@@ -11,10 +11,10 @@
   --ink: #122033;
   --muted: #64748b;
   --line: #dbe6f3;
-  --page: #f3f7fb;
+  --page: #f6f9fc;
   --panel: #ffffff;
   --panel-soft: #f8fbff;
-  --shadow: 0 18px 48px rgba(7, 27, 51, 0.1);
+  --shadow: 0 18px 48px rgba(29, 155, 240, 0.09);
 }
 
 * {
@@ -24,7 +24,9 @@
 body {
   margin: 0;
   color: var(--ink);
-  background: var(--page);
+  background:
+    radial-gradient(circle at top left, rgba(29, 155, 240, 0.1), transparent 28%),
+    linear-gradient(180deg, #ffffff 0%, var(--page) 100%);
   font-family: Inter, Segoe UI, Arial, sans-serif;
 }
 
@@ -53,17 +55,19 @@ a:hover {
   flex-direction: column;
   gap: 1.25rem;
   padding: 1rem;
-  background: linear-gradient(180deg, var(--navy), var(--navy-2));
-  color: #ffffff;
+  border-right: 1px solid var(--line);
+  background: linear-gradient(180deg, #ffffff, #eef9ff);
+  color: var(--ink);
 }
 
 .brand-block {
   display: grid;
   gap: 0.25rem;
   padding: 0.95rem;
-  border: 1px solid rgba(255, 255, 255, 0.16);
+  border: 1px solid #ccebf8;
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.06);
+  background: linear-gradient(135deg, #ffffff, #ecfeff);
+  box-shadow: 0 10px 26px rgba(29, 155, 240, 0.08);
 }
 
 .brand-block strong {
@@ -71,7 +75,7 @@ a:hover {
 }
 
 .brand-block span {
-  color: #b8d7ee;
+  color: var(--muted);
   font-size: 0.82rem;
 }
 
@@ -86,14 +90,15 @@ a:hover {
   align-items: center;
   padding: 0 0.9rem;
   border-radius: 8px;
-  color: #d9e8f6;
+  color: var(--navy-2);
   font-weight: 800;
 }
 
 .sidebar a:hover,
 .sidebar a.active {
-  color: #ffffff;
-  background: linear-gradient(90deg, rgba(15, 159, 150, 0.95), rgba(37, 99, 235, 0.88));
+  color: var(--navy);
+  background: linear-gradient(90deg, #dff7ff, #eef2ff);
+  box-shadow: inset 4px 0 0 var(--teal);
   text-decoration: none;
 }
 
@@ -156,11 +161,12 @@ a:hover {
   gap: 1.2rem;
   padding: 1.35rem;
   border-radius: 8px;
+  border: 1px solid #b9ecff;
   background:
-    linear-gradient(135deg, rgba(7, 27, 51, 0.96), rgba(13, 42, 74, 0.94)),
-    linear-gradient(90deg, rgba(15, 159, 150, 0.24), rgba(139, 92, 246, 0.2));
+    radial-gradient(circle at top right, rgba(139, 92, 246, 0.22), transparent 30%),
+    linear-gradient(135deg, #e6fffb 0%, #dff7ff 42%, #eef2ff 100%);
   box-shadow: var(--shadow);
-  color: #ffffff;
+  color: var(--navy);
 }
 
 .workspace-hero h2 {
@@ -175,12 +181,18 @@ a:hover {
 .workspace-hero p {
   max-width: 880px;
   margin: 0;
-  color: #d7e7f5;
+  color: #42566d;
   font-size: 1rem;
 }
 
 .hero-kicker {
-  color: #7dd3fc;
+  display: inline-flex;
+  width: fit-content;
+  padding: 0.45rem 0.65rem;
+  border: 1px solid rgba(15, 159, 150, 0.24);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.76);
+  color: #0f766e;
   font-size: 0.8rem;
   font-weight: 900;
   letter-spacing: 0;
@@ -194,15 +206,15 @@ a:hover {
 }
 
 .hero-metrics .metric-card {
-  color: #ffffff;
-  background: rgba(255, 255, 255, 0.1);
-  border-color: rgba(255, 255, 255, 0.18);
-  box-shadow: none;
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.74);
+  border-color: rgba(29, 155, 240, 0.18);
+  box-shadow: 0 12px 28px rgba(29, 155, 240, 0.08);
 }
 
 .hero-metrics .metric-card span,
 .hero-metrics .metric-card label {
-  color: #ffffff;
+  color: var(--navy);
 }
 
 .metric-card,
@@ -212,6 +224,11 @@ a:hover {
   border-radius: 8px;
   background: var(--panel);
   box-shadow: var(--shadow);
+}
+
+.panel {
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 251, 255, 0.96));
 }
 
 .metric-card {
@@ -239,7 +256,7 @@ dt {
 
 .panel {
   min-width: 0;
-  padding: 1.15rem;
+  padding: 1.25rem;
 }
 
 .panel-head,
@@ -527,7 +544,7 @@ dd {
   padding: 1rem;
   border: 1px solid var(--line);
   border-radius: 8px;
-  background: #ffffff;
+  background: linear-gradient(180deg, #ffffff, #fbfdff);
   box-shadow: 0 10px 28px rgba(7, 27, 51, 0.06);
 }
 
@@ -638,8 +655,9 @@ pre {
   overflow: auto;
   white-space: pre-wrap;
   border-radius: 8px;
-  background: #071b33;
-  color: #dbeafe;
+  border: 1px solid #d7e4f2;
+  background: #f8fbff;
+  color: var(--ink);
 }
 
 .empty-state {
@@ -748,6 +766,31 @@ pre {
 
 .usage-notes p {
   margin: 0;
+}
+
+.error-summary {
+  display: grid;
+  gap: 0.5rem;
+  padding: 0.8rem;
+  border: 1px solid #fecaca;
+  border-radius: 8px;
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.error-summary p {
+  margin: 0;
+  font-weight: 750;
+}
+
+.technical-details {
+  padding: 0.65rem 0 0;
+  border-top: 1px solid rgba(153, 27, 27, 0.18);
+}
+
+.technical-details summary {
+  color: #7f1d1d;
+  font-size: 0.84rem;
 }
 
 @media (max-width: 980px) {

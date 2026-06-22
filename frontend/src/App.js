@@ -61,6 +61,55 @@ function deploymentGithubName(deployment) {
   return deployment?.github_repo_full_name || deployment?.githubRepoFullName || deployment?.githubExport?.repository || deployment?.raw?.githubRepoFullName || deployment?.raw?.githubExport?.repository;
 }
 
+function deploymentModeLabel(item = {}) {
+  const mode = item.deploymentMode || item.deployment_mode || item.publishMode || item.publish_mode || item.raw?.deploymentMode || item.raw?.publishMode;
+  if (mode === "direct-netlify-fallback") return "Direct Netlify fallback";
+  if (String(item.status || item.state || "").toUpperCase().includes("FAILED")) return "Failed";
+  if (String(mode).toLowerCase().includes("fallback")) return "Direct Netlify fallback";
+  return "GitHub \u2192 Netlify";
+}
+
+function deploymentModeBadgeClass(item = {}) {
+  const label = deploymentModeLabel(item);
+  if (label === "Direct Netlify fallback") return "text-bg-warning";
+  if (label === "Failed") return "text-bg-danger";
+  return "text-bg-info";
+}
+
+function netlifyUrlFromApproval(approval = {}) {
+  return approval.deploymentHistory?.url || approval.deployment?.url || approval.raw?.url;
+}
+
+function normalizeErrors(errors) {
+  if (!Array.isArray(errors)) return [];
+  return errors.map((error) => {
+    if (typeof error === "string") return error;
+    return error?.message || error?.detail || error?.error || JSON.stringify(error);
+  });
+}
+
+function TechnicalDetails({ data }) {
+  if (!data || (Array.isArray(data) && !data.length)) return null;
+  if (!Array.isArray(data) && typeof data === "object" && !Object.keys(data).length) return null;
+  return (
+    <details className="technical-details">
+      <summary>View technical details</summary>
+      <pre>{JSON.stringify(data, null, 2)}</pre>
+    </details>
+  );
+}
+
+function ErrorSummary({ errors }) {
+  const messages = normalizeErrors(errors);
+  if (!messages.length) return null;
+  return (
+    <div className="error-summary">
+      {messages.map((message, index) => <p key={`${message}-${index}`}>{message}</p>)}
+      <TechnicalDetails data={errors} />
+    </div>
+  );
+}
+
 function Section({ title, help, action, children }) {
   return (
     <section className="panel entry-animate">
@@ -782,6 +831,7 @@ function PipelineResultCard({ result }) {
 
 function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRetry, onReject, onRegenerate }) {
   const canApprove = approval.status === "PENDING" && approval.githubExport?.repoUrl;
+  const netlifyUrl = netlifyUrlFromApproval(approval);
   return (
     <article className="approval-item">
       <div className="item-head">
@@ -791,6 +841,8 @@ function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRet
       <dl>
         <div><dt>GitHub repo</dt><dd>{approval.githubExport?.repoUrl ? <a href={approval.githubExport.repoUrl} target="_blank" rel="noreferrer">{approval.githubExport.repository}</a> : "Pending export"}</dd></div>
         <div><dt>Commit</dt><dd>{approval.githubExport?.commitSha || "N/A"}</dd></div>
+        <div><dt>Netlify URL</dt><dd>{netlifyUrl ? <a href={netlifyUrl} target="_blank" rel="noreferrer">{netlifyUrl}</a> : "Not deployed yet"}</dd></div>
+        <div><dt>Deployment mode</dt><dd><span className={`badge ${deploymentModeBadgeClass(approval)}`}>{deploymentModeLabel(approval)}</span></dd></div>
         <div><dt>Created</dt><dd>{displayDate(approval.createdAt)}</dd></div>
       </dl>
       <div className="button-row">
@@ -800,7 +852,7 @@ function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRet
         <button className="btn btn-outline-primary btn-sm" type="button" onClick={onRegenerate} disabled={busy}>Regenerate</button>
         <button className="btn btn-outline-danger btn-sm" type="button" onClick={onReject} disabled={busy || !["PENDING", "EXPORT_FAILED"].includes(approval.status)}>Reject</button>
       </div>
-      {approval.errors?.length > 0 && <pre>{JSON.stringify(approval.errors, null, 2)}</pre>}
+      <ErrorSummary errors={approval.errors} />
     </article>
   );
 }
@@ -827,9 +879,13 @@ function DeploymentList({ deployments, detailed = false }) {
             <div><dt>Netlify URL</dt><dd>{deployment.url ? <a href={deployment.url} target="_blank" rel="noreferrer">{deployment.url}</a> : "N/A"}</dd></div>
             <div><dt>GitHub repo</dt><dd>{deploymentGithubUrl(deployment) ? <a href={deploymentGithubUrl(deployment)} target="_blank" rel="noreferrer">{deploymentGithubName(deployment)}</a> : "N/A"}</dd></div>
             <div><dt>Build</dt><dd>{deployment.build_id || deployment.buildId || deployment.raw?.buildId || "N/A"}</dd></div>
+            <div><dt>Commit</dt><dd>{deployment.commit_sha || deployment.commitSha || deployment.raw?.commitSha || "N/A"}</dd></div>
+            <div><dt>Deployment mode</dt><dd><span className={`badge ${deploymentModeBadgeClass(deployment)}`}>{deploymentModeLabel(deployment)}</span></dd></div>
             {detailed && <div><dt>Approved</dt><dd>{displayDate(deployment.deployed_at || deployment.deployedAt)}</dd></div>}
           </dl>
-          {deployment.raw?.errors && <pre>{JSON.stringify(deployment.raw.errors, null, 2)}</pre>}
+          <ErrorSummary errors={deployment.raw?.errors} />
+          {deployment.raw?.fallbackReason && <div className="alert alert-warning">Git-linked deploy failed, so this site used direct Netlify fallback: {deployment.raw.fallbackReason}</div>}
+          <TechnicalDetails data={deployment.raw} />
         </article>
       ))}
     </div>

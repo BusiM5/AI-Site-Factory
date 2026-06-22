@@ -100,6 +100,27 @@ const deploymentsPayload = {
       github_repo_full_name: "owner/ai-site-alpha-plumbing",
       commit_sha: "commit-1",
       publishMode: "github-netlify",
+      deploymentMode: "GitHub \u2192 Netlify",
+      deployed_at: new Date().toISOString(),
+    },
+    {
+      id: "history-2",
+      pipeline_id: "pipeline-2",
+      site_name: "ai-site-beta",
+      build_id: null,
+      deploy_id: "deploy-2",
+      deploy_action: "DIRECT_FALLBACK_CREATED",
+      state: "ready",
+      url: "https://beta-fallback.netlify.app",
+      github_repo_url: "https://github.com/owner/ai-site-beta",
+      github_repo_full_name: "owner/ai-site-beta",
+      commit_sha: "commit-2",
+      publishMode: "direct-netlify-fallback",
+      deploymentMode: "Direct Netlify fallback",
+      raw: {
+        fallbackReason: "Host key verification failed / Could not read from remote repository",
+        errors: [{ message: "Git-linked deploy failed before fallback." }],
+      },
       deployed_at: new Date().toISOString(),
     },
   ],
@@ -208,6 +229,8 @@ beforeEach(() => {
         deployment: {
           url: "https://alpha.netlify.app",
           buildId: "build-1",
+          publishMode: "github-netlify",
+          deploymentMode: "GitHub \u2192 Netlify",
           githubRepoUrl: "https://github.com/owner/ai-site-alpha-plumbing",
           githubRepoFullName: "owner/ai-site-alpha-plumbing",
         },
@@ -318,6 +341,7 @@ test("previews and approves a GitHub-based Netlify deployment", async () => {
   expect(await screen.findByText("https://alpha.netlify.app")).toBeInTheDocument();
   expect(screen.getByText("build-1")).toBeInTheDocument();
   expect(screen.getByText("owner/ai-site-alpha-plumbing")).toBeInTheDocument();
+  expect(screen.getAllByText("GitHub \u2192 Netlify").length).toBeGreaterThan(0);
 });
 
 test("supports retry export, regenerate, and reject actions from approval queue", async () => {
@@ -342,6 +366,10 @@ test("shows deployments, pipeline run details, and merged backend admin settings
   fireEvent.click(await screen.findByRole("link", { name: "Deployments" }));
   expect(await screen.findByText("https://alpha.netlify.app")).toBeInTheDocument();
   expect(screen.getByText("owner/ai-site-alpha-plumbing")).toBeInTheDocument();
+  expect(screen.getByText("https://beta-fallback.netlify.app")).toBeInTheDocument();
+  expect(screen.getByText("Direct Netlify fallback")).toBeInTheDocument();
+  expect(screen.getAllByText(/Git-linked deploy failed before fallback/i).length).toBeGreaterThan(0);
+  expect(screen.getAllByText("View technical details").length).toBeGreaterThan(0);
 
   fireEvent.click(await screen.findByRole("link", { name: "Pipeline Runs" }));
   fireEvent.click(await screen.findByText("pipeline-1"));

@@ -278,8 +278,9 @@ def test_fallback_landing_page_renderer_is_bootstrap_gsap_and_polished():
     )
 
     lower = html.lower()
-    assert "bootstrap@5.3.3" in lower
-    assert "gsap@3.12.5" in lower
+    assert "bootstrap@5.3.8" in lower
+    assert "sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" in html
+    assert "gsap@3.15" in lower
     assert "class=\"hero hero-section\"" in lower
     assert "btn-brand" in lower
     assert lower.count("service-card") >= 4
@@ -336,7 +337,11 @@ def test_failed_github_netlify_deployment_keeps_generated_html(monkeypatch):
     def failed_deploy(*args, **kwargs):
         raise RuntimeError("netlify build failed")
 
+    def failed_fallback(*args, **kwargs):
+        raise RuntimeError("direct fallback failed")
+
     monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", failed_deploy)
+    monkeypatch.setattr(main, "deploy_direct_netlify_fallback_for_lead", failed_fallback)
     pipeline = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead_payload()]}).json()
     approval_id = pipeline["results"][0]["pendingApprovalId"]
 
@@ -348,6 +353,99 @@ def test_failed_github_netlify_deployment_keeps_generated_html(monkeypatch):
     assert detail["pendingPreviewHtml"]
     assert detail["previewAvailable"] is True
     assert detail["errors"][0]["retryable"] is True
+
+
+def test_approval_falls_back_to_direct_netlify_deploy_when_git_clone_fails(monkeypatch):
+    stub_generation(monkeypatch)
+
+    def failed_git_deploy(*args, **kwargs):
+        raise RuntimeError("Host key verification failed / Could not read from remote repository")
+
+    def direct_fallback(
+        canonical_key,
+        business_name,
+        site_html,
+        pipeline_id,
+        approval_id,
+        approved_by,
+        github_export,
+        git_error,
+    ):
+        history_id = f"fallback-{canonical_key}"
+        result = {
+            "deployAction": "DIRECT_FALLBACK_CREATED",
+            "siteCreated": True,
+            "siteReused": False,
+            "siteId": f"site-{canonical_key}",
+            "siteName": "ai-site-alpha",
+            "buildId": None,
+            "deployId": f"deploy-{canonical_key}",
+            "state": "ready",
+            "url": "https://alpha-fallback.netlify.app",
+            "deploymentHistoryId": history_id,
+            "publishMode": "direct-netlify-fallback",
+            "deploymentMode": "Direct Netlify fallback",
+            "githubExport": github_export,
+            "githubRepoUrl": github_export["repoUrl"],
+            "githubRepoFullName": github_export["repository"],
+            "commitSha": github_export["commitSha"],
+            "fallbackReason": main.sanitize_message(git_error),
+        }
+        with main.get_pipeline_db() as db:
+            db.execute(
+                """
+                INSERT INTO deployment_history (
+                    id, canonical_lead_key, pipeline_id, approval_id, site_id, site_name,
+                    deploy_id, build_id, url, deploy_action, state, html_checksum, deployed_at,
+                    approved_by, approval_status, github_repo_full_name, github_repo_url,
+                    commit_sha, publish_mode, github_export_json, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    history_id,
+                    canonical_key,
+                    pipeline_id,
+                    approval_id,
+                    result["siteId"],
+                    result["siteName"],
+                    result["deployId"],
+                    None,
+                    result["url"],
+                    result["deployAction"],
+                    result["state"],
+                    main.html_checksum(site_html),
+                    main.now_iso(),
+                    approved_by,
+                    "APPROVED",
+                    github_export["repository"],
+                    github_export["repoUrl"],
+                    github_export["commitSha"],
+                    "direct-netlify-fallback",
+                    main.json.dumps(github_export, default=str),
+                    main.json.dumps(result, default=str),
+                ),
+            )
+        return result
+
+    monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", failed_git_deploy)
+    monkeypatch.setattr(main, "deploy_direct_netlify_fallback_for_lead", direct_fallback)
+    monkeypatch.setattr(main, "generate_outreach_with_groq", lambda context, site_url: {"subject": "Preview", "body": f"See {site_url}"})
+    monkeypatch.setattr(main, "create_zendesk_outreach_ticket", lambda context, deployment, outreach, pipeline_id: {"syncStatus": "TICKET_CREATED", "ticketId": 456})
+
+    pipeline = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead_payload()]}).json()
+    approval_id = pipeline["results"][0]["pendingApprovalId"]
+    approved = client.post(f"/api/approvals/{approval_id}/approve", json={"approvedBy": "Ops"}).json()
+
+    assert approved["status"] == "APPROVED"
+    assert approved["publishMode"] == "direct-netlify-fallback"
+    assert approved["deployment"]["deploymentMode"] == "Direct Netlify fallback"
+    assert approved["deployment"]["githubRepoUrl"].startswith("https://github.com/")
+    assert approved["deployment"]["url"] == "https://alpha-fallback.netlify.app"
+    assert "Host key verification failed" in approved["errors"][0]["message"]
+    detail = client.get(f"/api/approvals/{approval_id}").json()
+    assert detail["publishMode"] == "direct-netlify-fallback"
+    assert detail["deploymentHistory"]["github_repo_url"].startswith("https://github.com/")
 
 
 def test_pipeline_reuses_pending_github_export_without_model_calls(monkeypatch):
