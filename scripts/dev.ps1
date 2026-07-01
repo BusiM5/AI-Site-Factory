@@ -13,13 +13,24 @@ $BackendDir = Join-Path $RootDir "backend"
 $FrontendDir = Join-Path $RootDir "frontend"
 $VenvDir = Join-Path $RootDir ".venv"
 $VenvPython = Join-Path $VenvDir "Scripts\python.exe"
-$BackendUrl = "http://127.0.0.1:$BackendPort/"
-$FrontendUrl = "http://127.0.0.1:$FrontendPort/"
+$RunStatePath = Join-Path $RootDir ".dev-ports.json"
+$ConfiguredBackendPort = $BackendPort
+$ConfiguredFrontendPort = $FrontendPort
+$BackendUrl = $null
+$FrontendUrl = $null
 
 $script:BackendProcess = $null
 $script:FrontendProcess = $null
 $script:Stopping = $false
 $script:CancelHandler = $null
+$script:PortCleanupEnabled = $false
+
+function Set-ServerUrls {
+    $script:BackendUrl = "http://127.0.0.1:$BackendPort/"
+    $script:FrontendUrl = "http://127.0.0.1:$FrontendPort/"
+}
+
+Set-ServerUrls
 
 function Write-Step {
     param([string]$Message)
@@ -51,6 +62,11 @@ function Invoke-Npm {
     else {
         & npm @Arguments
     }
+
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "npm $($Arguments -join ' ') failed with exit code $exitCode."
+    }
 }
 
 function Test-PortInUse {
@@ -71,6 +87,189 @@ function Test-PortInUse {
     finally {
         $client.Dispose()
     }
+}
+
+function Get-PortListenerProcessIds {
+    param([int]$Port)
+
+    if (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue) {
+        return @(
+            Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue |
+                Select-Object -ExpandProperty OwningProcess -Unique
+        )
+    }
+
+    $rows = & netstat -ano -p tcp | Select-String -Pattern "LISTENING"
+    return @(
+        $rows |
+            ForEach-Object {
+                $line = $_.Line.Trim()
+                if ($line -match "[:\.]$Port\s+.*LISTENING\s+(\d+)$") {
+                    [int]$Matches[1]
+                }
+            } |
+            Select-Object -Unique
+    )
+}
+
+function Clear-Port {
+    param(
+        [int]$Port,
+        [string]$Name,
+        [string]$Reason
+    )
+
+    $processIds = @(Get-PortListenerProcessIds -Port $Port | Where-Object { $_ -and $_ -ne $PID })
+    if (-not $processIds.Count) {
+        Write-Info "Port $Port is clear for $Name."
+        return
+    }
+
+    foreach ($processId in $processIds) {
+        try {
+            $process = Get-Process -Id $processId -ErrorAction Stop
+            Write-Info "Clearing port $Port for $Name ($Reason): stopping PID $processId ($($process.ProcessName))."
+            Stop-Process -Id $processId -Force -ErrorAction Stop
+            Start-Sleep -Milliseconds 300
+        }
+        catch {
+            Write-Warning "Could not clear port $Port for PID ${processId}: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Get-RecordedDevelopmentPorts {
+    if (-not (Test-Path -LiteralPath $RunStatePath)) {
+        return @()
+    }
+
+    try {
+        $state = Get-Content -LiteralPath $RunStatePath -Raw | ConvertFrom-Json
+        $ports = @()
+        foreach ($propertyName in @("backendPort", "frontendPort")) {
+            if ($state.PSObject.Properties.Name -contains $propertyName) {
+                $port = [int]$state.$propertyName
+                if ($port -gt 0) {
+                    $ports += [pscustomobject]@{
+                        Port = $port
+                        Name = "recorded $propertyName"
+                    }
+                }
+            }
+        }
+        return $ports
+    }
+    catch {
+        Write-Warning "Could not read recorded development ports: $($_.Exception.Message)"
+        return @()
+    }
+}
+
+function Clear-DevelopmentPorts {
+    param([string]$Reason)
+
+    $portSpecs = @(
+        [pscustomobject]@{ Port = $ConfiguredBackendPort; Name = "configured backend" },
+        [pscustomobject]@{ Port = $ConfiguredFrontendPort; Name = "configured frontend" },
+        [pscustomobject]@{ Port = $BackendPort; Name = "backend" },
+        [pscustomobject]@{ Port = $FrontendPort; Name = "frontend" }
+    )
+    $portSpecs += @(Get-RecordedDevelopmentPorts)
+
+    $seenPorts = @{}
+    foreach ($spec in $portSpecs) {
+        if (-not $spec.Port -or $seenPorts.ContainsKey($spec.Port)) {
+            continue
+        }
+
+        $seenPorts[$spec.Port] = $true
+        Clear-Port -Port $spec.Port -Name $spec.Name -Reason $Reason
+    }
+}
+
+function Save-DevelopmentPorts {
+    $state = [ordered]@{
+        backendPort = $BackendPort
+        frontendPort = $FrontendPort
+        backendUrl = $BackendUrl
+        frontendUrl = $FrontendUrl
+        updatedAt = (Get-Date).ToString("o")
+    }
+
+    $state | ConvertTo-Json | Set-Content -LiteralPath $RunStatePath -Encoding UTF8
+}
+
+function Clear-DevelopmentPortState {
+    Remove-Item -LiteralPath $RunStatePath -ErrorAction SilentlyContinue
+}
+
+function Remove-FrontendPathWithRetry {
+    param(
+        [string]$Path,
+        [string]$Description
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return
+    }
+
+    $frontendFullPath = [System.IO.Path]::GetFullPath($FrontendDir).TrimEnd('\')
+    $targetFullPath = [System.IO.Path]::GetFullPath($Path)
+    if (-not $targetFullPath.StartsWith($frontendFullPath, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Refusing to remove $Description outside frontend directory: $targetFullPath"
+    }
+
+    for ($attempt = 1; $attempt -le 3; $attempt++) {
+        try {
+            Write-Info "Removing $Description at $targetFullPath"
+            Remove-Item -LiteralPath $targetFullPath -Recurse -Force -ErrorAction Stop
+            return
+        }
+        catch {
+            if ($attempt -eq 3) {
+                throw
+            }
+
+            Write-Warning "Could not remove $Description yet: $($_.Exception.Message). Retrying..."
+            Start-Sleep -Seconds 1
+        }
+    }
+}
+
+function Test-PortListening {
+    param([int]$Port)
+
+    return @(Get-PortListenerProcessIds -Port $Port).Count -gt 0
+}
+
+function Find-AvailablePort {
+    param(
+        [int]$StartingPort,
+        [string]$Name
+    )
+
+    for ($candidate = $StartingPort; $candidate -lt ($StartingPort + 100); $candidate++) {
+        if (-not (Test-PortListening -Port $candidate) -and -not (Test-PortInUse -Port $candidate)) {
+            return $candidate
+        }
+    }
+
+    throw "Could not find an available $Name port starting at $StartingPort."
+}
+
+function Resolve-UsablePort {
+    param(
+        [int]$Port,
+        [string]$Name
+    )
+
+    if (-not (Test-PortListening -Port $Port) -and -not (Test-PortInUse -Port $Port)) {
+        return $Port
+    }
+
+    $fallbackPort = Find-AvailablePort -StartingPort ($Port + 1) -Name $Name
+    Write-Warning "Configured $Name port $Port is still busy after cleanup; using $fallbackPort for this run."
+    return $fallbackPort
 }
 
 function New-VirtualEnvironment {
@@ -110,10 +309,40 @@ function Install-FrontendDependencies {
     Push-Location $FrontendDir
     try {
         if (Test-Path "package-lock.json") {
-            Invoke-Npm @("ci")
+            $installArgs = @("ci")
         }
         else {
-            Invoke-Npm @("install")
+            $installArgs = @("install")
+        }
+
+        try {
+            Invoke-Npm $installArgs
+        }
+        catch {
+            Write-Warning "Frontend dependency install failed: $($_.Exception.Message)"
+            Write-Warning "Clearing frontend build cache and retrying once."
+            Remove-FrontendPathWithRetry -Path (Join-Path $FrontendDir "node_modules\.cache") -Description "frontend build cache"
+
+            try {
+                Invoke-Npm $installArgs
+            }
+            catch {
+                Write-Warning "Frontend dependency retry failed: $($_.Exception.Message)"
+                Write-Warning "Removing frontend node_modules and retrying a clean install."
+                Remove-FrontendPathWithRetry -Path (Join-Path $FrontendDir "node_modules") -Description "frontend node_modules"
+                Invoke-Npm $installArgs
+            }
+        }
+
+        $reactScriptsCommand = Join-Path $FrontendDir "node_modules\.bin\react-scripts.cmd"
+        if ($env:OS -ne "Windows_NT") {
+            $reactScriptsCommand = Join-Path $FrontendDir "node_modules/.bin/react-scripts"
+        }
+
+        if (-not (Test-Path -LiteralPath $reactScriptsCommand)) {
+            Write-Warning "react-scripts was not installed; retrying frontend dependency install."
+            Remove-FrontendPathWithRetry -Path (Join-Path $FrontendDir "node_modules") -Description "frontend node_modules"
+            Invoke-Npm $installArgs
         }
     }
     finally {
@@ -254,6 +483,12 @@ function Wait-ForFrontend {
 }
 
 try {
+    if (-not $InstallOnly) {
+        Write-Step "Clearing configured development ports before dependency install"
+        $script:PortCleanupEnabled = $true
+        Clear-DevelopmentPorts -Reason "preinstall"
+    }
+
     Install-BackendDependencies
     Install-FrontendDependencies
 
@@ -262,9 +497,12 @@ try {
         exit 0
     }
 
-    if (Test-PortInUse -Port $BackendPort) {
-        throw "Port $BackendPort is already in use. Stop the process using it, then run this command again."
-    }
+    Write-Step "Clearing configured development ports"
+    Clear-DevelopmentPorts -Reason "startup"
+    $BackendPort = Resolve-UsablePort -Port $BackendPort -Name "backend"
+    $FrontendPort = Resolve-UsablePort -Port $FrontendPort -Name "frontend"
+    Set-ServerUrls
+    Save-DevelopmentPorts
 
     $script:CancelHandler = [System.ConsoleCancelEventHandler] {
         param($Source, $CancelEventArgs)
@@ -284,10 +522,11 @@ try {
 
     Write-Step "Starting frontend"
     Write-Info "Frontend will use http://127.0.0.1:$BackendPort as its API base by default."
+    $frontendStartCommand = "set PORT=$FrontendPort&& set REACT_APP_API_BASE=http://127.0.0.1:$BackendPort&& npm.cmd start"
     $script:FrontendProcess = Start-ManagedProcess `
         -Name "frontend" `
         -FileName "cmd.exe" `
-        -Arguments @("/d", "/s", "/c", "npm.cmd start") `
+        -Arguments @("/d", "/s", "/c", $frontendStartCommand) `
         -WorkingDirectory $FrontendDir
 
     Wait-ForFrontend
@@ -313,6 +552,10 @@ try {
 }
 finally {
     Stop-Servers
+    if ($script:PortCleanupEnabled) {
+        Clear-DevelopmentPorts -Reason "shutdown"
+        Clear-DevelopmentPortState
+    }
     if ($script:CancelHandler) {
         [Console]::remove_CancelKeyPress($script:CancelHandler)
     }

@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 from uuid import uuid4
 import base64
 from collections import deque
@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 
@@ -46,6 +46,7 @@ app.add_middleware(
         "http://127.0.0.1:8000",
         "https://ai-site-factory-frontend.vercel.app",
     ],
+    allow_origin_regex=r"^http://(localhost|127\.0\.0\.1):\d+$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -82,6 +83,29 @@ REQUIRED_PROVIDER_ENV = {
 }
 
 VALID_PUBLISH_MODES = {"github-netlify", "direct-netlify", "direct-netlify-fallback"}
+FREEFORM_TEMPLATE_ID = "gemini-freeform"
+
+FREEFORM_SITE_SPEC = {
+    "id": FREEFORM_TEMPLATE_ID,
+    "name": "Gemini Freeform",
+    "description": "Gemini controls page structure and visual direction; backend enforces required libraries and safety features.",
+    "accent": "#0f9f96",
+    "background": "#f8fbff",
+}
+
+LANDING_PAGE_PROMPT_HEADER = """
+You are creating a production-ready, single-file HTML landing page for a business with no current website.
+Return strict JSON with keys: html, qaNotes, structureNotes, stylingLibraries.
+The html value must be a complete <!doctype html> document.
+
+Rules:
+- Use only the supplied public lead/business information. Do not invent awards, prices, guarantees, team members, certifications, or unavailable services.
+- Gemini may choose the page structure, copy hierarchy, and styling direction.
+- The page must include Bootstrap 5.3.8 and at least two additional styling libraries. Prefer Bootstrap 5.3.8, Tailwind browser CDN, and Animate.css when unsure.
+- Include a visible dynamic color/theme widget that lets visitors change site colors and persists selections with localStorage.
+- Include accessible semantic sections, mobile-first responsive layout, clear contact options, and grounded calls to action.
+- Do not include external tracking pixels, forms that submit data, or claims of consent.
+""".strip()
 
 def redact_value(value: Any) -> Any:
     if isinstance(value, dict):
@@ -488,7 +512,7 @@ class DiscoverLeadsResponse(BaseModel):
 
 class PipelineRunRequest(BaseModel):
     leads: List[DiscoveredLead]
-    templateId: str = "default-service"
+    templateId: Optional[str] = FREEFORM_TEMPLATE_ID
     sourceBatchId: Optional[str] = None
     regenerateExistingSites: bool = True
     resumeExisting: bool = True
@@ -695,6 +719,38 @@ def domain_from_url(value: Optional[str]) -> Optional[str]:
     return urlparse(url).netloc.replace("www.", "")
 
 
+def normalize_domain(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    domain = domain_from_url(value) or compact_text(value).lower().replace("www.", "")
+    domain = re.sub(r"^https?://", "", domain).split("/", 1)[0].strip()
+    return domain if domain and "." in domain else None
+
+
+def normalize_email_identity(value: Optional[str]) -> Optional[str]:
+    email = compact_text(value).lower()
+    return email if email and "@" in email else None
+
+
+def normalize_phone_identity(value: Optional[str]) -> Optional[str]:
+    phone = re.sub(r"\D+", "", compact_text(value))
+    if not phone:
+        return None
+    if phone.startswith("27") and len(phone) >= 11:
+        return phone
+    if phone.startswith("0") and len(phone) == 10:
+        return "27" + phone[1:]
+    return phone if len(phone) >= 7 else None
+
+
+def normalize_identity_text(value: Optional[str]) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", compact_text(value).lower()).strip()
+
+
+def lead_has_website(lead: DiscoveredLead) -> bool:
+    return bool(normalize_url(lead.website) or normalize_domain(lead.domain))
+
+
 def first_present(data: Dict[str, Any], keys: List[str], fallback: Optional[str] = None) -> Optional[str]:
     for key in keys:
         value = data.get(key)
@@ -853,6 +909,20 @@ def init_pipeline_db() -> None:
                 last_seen_at TEXT NOT NULL,
                 discovery_count INTEGER NOT NULL DEFAULT 1
             );
+
+            CREATE TABLE IF NOT EXISTS lead_identity_index (
+                identity_key TEXT PRIMARY KEY,
+                identity_type TEXT NOT NULL,
+                canonical_lead_key TEXT NOT NULL,
+                lead_key TEXT,
+                business_name TEXT,
+                source TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_lead_identity_canonical
+            ON lead_identity_index(canonical_lead_key);
 
             CREATE TABLE IF NOT EXISTS discovery_batches (
                 batch_id TEXT PRIMARY KEY,
@@ -1041,6 +1111,44 @@ def canonical_lead_key_for_lead(lead: DiscoveredLead) -> str:
     )
 
 
+def lead_identity_pairs(lead: DiscoveredLead) -> List[Tuple[str, str]]:
+    pairs: List[Tuple[str, str]] = []
+    raw = lead.raw or {}
+
+    email = normalize_email_identity(lead.email)
+    if email:
+        pairs.append(("email", f"email:{email}"))
+
+    phone = normalize_phone_identity(lead.phone)
+    if phone:
+        pairs.append(("phone", f"phone:{phone}"))
+
+    domain = normalize_domain(lead.website) or normalize_domain(lead.domain)
+    if domain:
+        pairs.append(("domain", f"domain:{domain}"))
+
+    place_id = first_present(raw, ["placeId", "place_id", "googlePlaceId", "googleId", "cid", "fid", "id"])
+    if place_id:
+        pairs.append(("source_place", f"source_place:{compact_text(place_id).lower()}"))
+
+    source_url = compact_text(lead.sourceUrl)
+    if source_url and ("google" in source_url.lower() or "maps" in source_url.lower()):
+        pairs.append(("source_url", f"source_url:{source_url.lower()}"))
+
+    business = normalize_identity_text(lead.businessName)
+    location = normalize_identity_text(lead.address or lead.location)
+    if business and location:
+        pairs.append(("business_location", f"business_location:{stable_lead_key(business, location)}"))
+
+    unique: List[Tuple[str, str]] = []
+    seen: Set[str] = set()
+    for identity_type, identity_key in pairs:
+        if identity_key not in seen:
+            seen.add(identity_key)
+            unique.append((identity_type, identity_key))
+    return unique
+
+
 def existing_canonical_lead_keys(keys: List[str]) -> set:
     if not keys:
         return set()
@@ -1051,6 +1159,57 @@ def existing_canonical_lead_keys(keys: List[str]) -> set:
             keys,
         ).fetchall()
     return {row["canonical_lead_key"] for row in rows}
+
+
+def existing_lead_identity_keys(identity_keys: List[str]) -> Dict[str, str]:
+    if not identity_keys:
+        return {}
+    placeholders = ",".join("?" for _ in identity_keys)
+    with get_pipeline_db() as db:
+        rows = db.execute(
+            f"SELECT identity_key, canonical_lead_key FROM lead_identity_index WHERE identity_key IN ({placeholders})",
+            identity_keys,
+        ).fetchall()
+    return {row["identity_key"]: row["canonical_lead_key"] for row in rows}
+
+
+def upsert_lead_identity_index(db: sqlite3.Connection, lead: DiscoveredLead, canonical_key: str, timestamp: str) -> None:
+    for identity_type, identity_key in lead_identity_pairs(lead):
+        db.execute(
+            """
+            INSERT INTO lead_identity_index (
+                identity_key, identity_type, canonical_lead_key, lead_key,
+                business_name, source, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(identity_key) DO UPDATE SET
+                canonical_lead_key = excluded.canonical_lead_key,
+                lead_key = excluded.lead_key,
+                business_name = excluded.business_name,
+                source = excluded.source,
+                updated_at = excluded.updated_at
+            """,
+            (
+                identity_key,
+                identity_type,
+                canonical_key,
+                lead.leadKey,
+                lead.businessName,
+                lead.source,
+                timestamp,
+                timestamp,
+            ),
+        )
+
+
+def lead_identity_conflicts(lead: DiscoveredLead, canonical_key: str) -> Dict[str, str]:
+    identities = [identity_key for _identity_type, identity_key in lead_identity_pairs(lead)]
+    existing = existing_lead_identity_keys(identities)
+    return {
+        identity_key: existing_key
+        for identity_key, existing_key in existing.items()
+        if existing_key != canonical_key
+    }
 
 
 def upsert_lead_registry(lead: DiscoveredLead) -> None:
@@ -1111,6 +1270,7 @@ def upsert_lead_registry(lead: DiscoveredLead) -> None:
                 timestamp,
             ),
         )
+        upsert_lead_identity_index(db, lead, canonical_key, timestamp)
 
 
 def record_discovery_batch(
@@ -1174,6 +1334,7 @@ def cached_discovery_response(
         DiscoveredLead(**lead)
         for lead in safe_json_loads(row["leads_json"], [])[:limit]
     ]
+    leads = [lead for lead in leads if not lead_has_website(lead)]
     if not leads:
         return None
 
@@ -1380,6 +1541,45 @@ def structured_pipeline_error(
         "retryable": retryable,
         "details": redact_value(details or {}),
     }
+
+
+def skipped_pipeline_result(
+    lead: DiscoveredLead,
+    canonical_key: str,
+    pipeline_id: str,
+    status: str,
+    message: str,
+    details: Optional[Dict[str, Any]] = None,
+) -> PipelineLeadResult:
+    step_name = status.lower()
+    step_history = [
+        record_skipped_pipeline_step(
+            pipeline_id,
+            canonical_key,
+            step_name,
+            message,
+            details=details,
+        )
+    ]
+    return PipelineLeadResult(
+        leadKey=lead.leadKey,
+        canonicalLeadKey=canonical_key,
+        businessName=lead.businessName,
+        status=status,
+        pipelineStatus=status,
+        currentStep=step_name,
+        stepHistory=step_history,
+        structuredErrors=[
+            {
+                "step": step_name,
+                "provider": None,
+                "message": sanitize_message(message),
+                "retryable": False,
+                "details": redact_value(details or {}),
+            }
+        ],
+        errors=[sanitize_message(message)],
+    )
 
 
 def html_checksum(site_html: str) -> str:
@@ -1827,7 +2027,7 @@ def normalize_apify_items(
         if not business_name:
             continue
 
-        website = normalize_url(first_present(item, ["website", "url", "site", "homepage"]))
+        website = normalize_url(first_present(item, ["website", "site", "homepage"]))
         domain = domain_from_url(website)
         address = first_present(item, ["address", "street", "fullAddress", "formattedAddress"])
         phone = first_present(item, ["phone", "phoneUnformatted", "contactPhone", "telephone"])
@@ -2003,6 +2203,19 @@ def gemini_text_json(prompt: str, model: Optional[str] = None) -> Dict[str, Any]
                 time.sleep(wait_time)
                 continue
 
+            if response.status_code in {401, 403}:
+                log_event(
+                    "error",
+                    "provider.gemini_text.auth_failed",
+                    "Gemini rejected the configured API key.",
+                    model=model_name,
+                    statusCode=response.status_code,
+                )
+                raise RuntimeError(
+                    "Gemini authentication failed. Replace GEMINI_API_KEY with a current "
+                    "Gemini auth key from Google AI Studio."
+                )
+
             response.raise_for_status()
 
             data = response.json()
@@ -2052,6 +2265,11 @@ def groq_chat_json(prompt: str, system_prompt: str) -> Dict[str, Any]:
             },
             timeout=60,
         )
+        if response.status_code in {401, 403}:
+            raise RuntimeError(
+                "Groq authentication failed. Replace GROQ_API_KEY with an active key "
+                "from the Groq console."
+            )
         response.raise_for_status()
     except requests.RequestException as error:
         log_event("error", "provider.groq.error", "GroqCloud request failed.", model=model, reason=str(error))
@@ -2146,6 +2364,113 @@ def generate_site_content_with_groq(context: Dict[str, Any], template: Dict[str,
     content.setdefault("footerText", f"{context.get('businessName')} | {context.get('location')}")
 
     return content
+
+
+def build_public_lead_context(
+    lead: DiscoveredLead,
+    contact_details: Dict[str, Any],
+    canonical_key: str,
+) -> Dict[str, Any]:
+    email = contact_details.get("email") or lead.email
+    phone = contact_details.get("phone") or lead.phone
+    website = contact_details.get("website") or lead.website
+    return {
+        "canonicalLeadKey": canonical_key,
+        "leadKey": lead.leadKey,
+        "businessName": lead.businessName,
+        "industry": lead.category,
+        "category": lead.category,
+        "location": lead.location,
+        "province": lead.province,
+        "address": lead.address,
+        "email": email,
+        "phone": phone,
+        "website": website,
+        "domain": lead.domain,
+        "hasWebsite": bool(normalize_url(website) or normalize_domain(lead.domain)),
+        "rating": lead.rating,
+        "reviewsCount": lead.reviewsCount,
+        "source": lead.source,
+        "sourceUrl": lead.sourceUrl,
+        "notes": contact_details.get("notes") or lead.notes,
+        "summary": contact_details.get("notes") or lead.notes or f"{lead.businessName} is a local {lead.category} business.",
+        "targetCustomers": "Local customers",
+        "differentiators": [],
+        "serviceKeywords": [lead.category],
+        "sourceNote": "Public Google Maps, business listing, and website context.",
+        "rawLead": lead.raw or {},
+        "noWebsiteLead": not bool(normalize_url(website) or normalize_domain(lead.domain)),
+    }
+
+
+def compact_lead_with_groq(context: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = (
+        "Compact this public lead into a concise business brief for Gemini to build a landing page. "
+        "Use as much of the lead as is useful, including raw listing fields, but remove repetition. "
+        "Return strict JSON with keys: businessName, industry, location, address, email, phone, "
+        "summary, serviceKeywords, differentiators, proofPoints, sourceLabel, sourceUrl, noWebsiteLead, "
+        "contactType, designHints, complianceNotes. Arrays must be arrays. "
+        "Do not invent private facts, services, guarantees, prices, awards, or consent.\n\n"
+        f"Lead context: {model_safe_json(context)}"
+    )
+
+    brief = groq_chat_json(
+        prompt,
+        "You compact public business lead records into factual, source-grounded JSON briefs. Return valid JSON only.",
+    )
+
+    service_keywords = brief.get("serviceKeywords")
+    if not isinstance(service_keywords, list) or not service_keywords:
+        service_keywords = context.get("serviceKeywords") or [context.get("industry", "Local service")]
+
+    differentiators = brief.get("differentiators")
+    if not isinstance(differentiators, list):
+        differentiators = []
+
+    proof_points = brief.get("proofPoints")
+    if not isinstance(proof_points, list):
+        proof_points = []
+
+    contact_type = "email" if context.get("email") else "phone" if context.get("phone") else "unknown"
+
+    brief.setdefault("businessName", context.get("businessName"))
+    brief.setdefault("industry", context.get("industry") or context.get("category"))
+    brief.setdefault("location", context.get("location"))
+    brief.setdefault("address", context.get("address"))
+    brief.setdefault("email", context.get("email"))
+    brief.setdefault("phone", context.get("phone"))
+    brief.setdefault("summary", context.get("summary"))
+    brief.setdefault("sourceLabel", context.get("source") or "public business listing")
+    brief.setdefault("sourceUrl", context.get("sourceUrl"))
+    brief.setdefault("noWebsiteLead", True)
+    brief.setdefault("designHints", [])
+    brief.setdefault("complianceNotes", "Use public lead details only; outreach requires opt-in or agent consent handling.")
+    brief["serviceKeywords"] = service_keywords[:12]
+    brief["differentiators"] = differentiators[:8]
+    brief["proofPoints"] = proof_points[:8]
+    brief["contactType"] = contact_type
+    brief["rawLeadSnapshot"] = model_safe_value(context.get("rawLead", {}), chunk_size=900, max_chunks=2)
+    return brief
+
+
+def generate_final_html_with_gemini(lead_brief: Dict[str, Any]) -> Dict[str, Any]:
+    prompt = (
+        f"{LANDING_PAGE_PROMPT_HEADER}\n\n"
+        "Business information to append to the predefined prompt header:\n"
+        f"{model_safe_json(lead_brief)}"
+    )
+    result = gemini_text_json(prompt)
+    site_html = result.get("html") or result.get("siteHtml") or result.get("finalHtml")
+    if not site_html:
+        raise RuntimeError("Gemini did not return an html field.")
+    final_html = ensure_required_site_features(str(site_html))
+    return {
+        "html": final_html,
+        "qaNotes": result.get("qaNotes") or "Gemini generated final HTML; backend enforced required assets and color widget.",
+        "structureNotes": result.get("structureNotes"),
+        "stylingLibraries": result.get("stylingLibraries") or ["Bootstrap", "Tailwind CSS", "Animate.css"],
+        "promptHeader": LANDING_PAGE_PROMPT_HEADER,
+    }
 
 
 def generate_page_prompt_with_gemini(context: Dict[str, Any], template: Dict[str, Any]) -> Dict[str, Any]:
@@ -2252,7 +2577,7 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
     if not contact_buttons:
         contact_buttons = '<a class="btn btn-light btn-lg rounded-pill px-4" href="#contact">Get in touch</a>'
 
-    return f"""<!doctype html>
+    site_html = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -2656,6 +2981,7 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
   </script>
 </body>
 </html>"""
+    return ensure_required_site_features(site_html)
 
 def generate_draft_html_with_groq(
     context: Dict[str, Any],
@@ -2680,7 +3006,16 @@ def finalize_html_with_gemini(
     }
 
 
-def ensure_bootstrap_gsap_assets(site_html: str) -> str:
+def inject_before_closing_tag(site_html: str, tag: str, content: str) -> str:
+    html_value = site_html
+    lower_html = html_value.lower()
+    closing_tag = f"</{tag}>"
+    if closing_tag in lower_html:
+        return re.sub(closing_tag, f"{content}\n{closing_tag}", html_value, count=1, flags=re.IGNORECASE)
+    return f"{html_value}\n{content}"
+
+
+def ensure_required_site_features(site_html: str) -> str:
     html_value = site_html
     lower_html = html_value.lower()
 
@@ -2689,10 +3024,126 @@ def ensure_bootstrap_gsap_assets(site_html: str) -> str:
         'rel="stylesheet" '
         'integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">'
     )
+    tailwind_js = '<script src="https://cdn.tailwindcss.com"></script>'
+    animate_css = '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css">'
     bootstrap_js = (
         '<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>'
     )
     gsap_js = '<script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js"></script>'
+    widget_css = """
+<style id="ai-site-theme-widget-style">
+  :root {
+    --ai-primary: #0f9f96;
+    --ai-secondary: #2563eb;
+    --ai-accent: #f59e0b;
+  }
+  body { accent-color: var(--ai-primary); }
+  a { color: var(--ai-primary); }
+  .btn-primary,
+  .btn-brand,
+  button[type="submit"] {
+    background-color: var(--ai-primary) !important;
+    border-color: var(--ai-primary) !important;
+  }
+  .ai-site-theme-widget {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    z-index: 2147483000;
+    width: min(290px, calc(100vw - 32px));
+    padding: 12px;
+    border: 1px solid rgba(15, 23, 42, 0.14);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.94);
+    color: #0f172a;
+    box-shadow: 0 18px 42px rgba(15, 23, 42, 0.2);
+    backdrop-filter: blur(10px);
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  }
+  .ai-site-theme-widget strong {
+    display: block;
+    margin-bottom: 8px;
+    font-size: 13px;
+  }
+  .ai-site-theme-controls {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+  }
+  .ai-site-theme-controls label {
+    display: grid;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 700;
+  }
+  .ai-site-theme-controls input {
+    width: 100%;
+    min-height: 34px;
+    border: 0;
+    padding: 0;
+    background: transparent;
+  }
+  .ai-site-theme-reset {
+    width: 100%;
+    margin-top: 8px;
+    border: 1px solid rgba(15, 23, 42, 0.18);
+    border-radius: 8px;
+    background: #f8fafc;
+    color: #0f172a;
+    font-weight: 800;
+    min-height: 34px;
+  }
+</style>"""
+    widget_html = """
+<aside class="ai-site-theme-widget" data-ai-site-theme-widget aria-label="Site color controls">
+  <strong>Site colors</strong>
+  <div class="ai-site-theme-controls">
+    <label>Primary<input type="color" data-theme-color="primary" value="#0f9f96"></label>
+    <label>Accent<input type="color" data-theme-color="accent" value="#f59e0b"></label>
+    <label>Deep<input type="color" data-theme-color="secondary" value="#2563eb"></label>
+  </div>
+  <button class="ai-site-theme-reset" type="button" data-theme-reset>Reset colors</button>
+</aside>"""
+    widget_js = """
+<script id="ai-site-theme-widget-script">
+  window.addEventListener("DOMContentLoaded", function () {
+    var storageKey = "ai-site-factory-theme";
+    var defaults = { primary: "#0f9f96", secondary: "#2563eb", accent: "#f59e0b" };
+    var root = document.documentElement;
+    function readTheme() {
+      try { return Object.assign({}, defaults, JSON.parse(localStorage.getItem(storageKey) || "{}")); }
+      catch (error) { return Object.assign({}, defaults); }
+    }
+    function applyTheme(theme) {
+      root.style.setProperty("--ai-primary", theme.primary || defaults.primary);
+      root.style.setProperty("--ai-secondary", theme.secondary || defaults.secondary);
+      root.style.setProperty("--ai-accent", theme.accent || defaults.accent);
+      document.querySelectorAll("[data-theme-color]").forEach(function (input) {
+        input.value = theme[input.dataset.themeColor] || defaults[input.dataset.themeColor];
+      });
+    }
+    function saveTheme(theme) {
+      localStorage.setItem(storageKey, JSON.stringify(theme));
+      applyTheme(theme);
+    }
+    var theme = readTheme();
+    applyTheme(theme);
+    document.querySelectorAll("[data-theme-color]").forEach(function (input) {
+      input.addEventListener("input", function () {
+        theme[input.dataset.themeColor] = input.value;
+        saveTheme(theme);
+      });
+    });
+    var reset = document.querySelector("[data-theme-reset]");
+    if (reset) {
+      reset.addEventListener("click", function () {
+        theme = Object.assign({}, defaults);
+        localStorage.removeItem(storageKey);
+        applyTheme(theme);
+      });
+    }
+  });
+</script>"""
     animation_js = """
 <script>
   window.addEventListener("DOMContentLoaded", function () {
@@ -2709,10 +3160,19 @@ def ensure_bootstrap_gsap_assets(site_html: str) -> str:
 </script>"""
 
     if "bootstrap@5.3.8/dist/css/bootstrap.min.css" not in lower_html:
-        if "</head>" in lower_html:
-            html_value = re.sub(r"</head>", f"  {bootstrap_css}\n</head>", html_value, count=1, flags=re.IGNORECASE)
-        else:
-            html_value = f"{bootstrap_css}\n{html_value}"
+        html_value = inject_before_closing_tag(html_value, "head", f"  {bootstrap_css}")
+
+    lower_html = html_value.lower()
+    if "cdn.tailwindcss.com" not in lower_html:
+        html_value = inject_before_closing_tag(html_value, "head", f"  {tailwind_js}")
+
+    lower_html = html_value.lower()
+    if "animate.css" not in lower_html and "animate.min.css" not in lower_html:
+        html_value = inject_before_closing_tag(html_value, "head", f"  {animate_css}")
+
+    lower_html = html_value.lower()
+    if "ai-site-theme-widget-style" not in lower_html:
+        html_value = inject_before_closing_tag(html_value, "head", widget_css)
 
     lower_html = html_value.lower()
     scripts = []
@@ -2722,44 +3182,71 @@ def ensure_bootstrap_gsap_assets(site_html: str) -> str:
         scripts.append(gsap_js)
     if "gsap.from" not in lower_html:
         scripts.append(animation_js)
+    if "data-ai-site-theme-widget" not in lower_html:
+        scripts.append(widget_html)
+    if "ai-site-theme-widget-script" not in lower_html:
+        scripts.append(widget_js)
 
     if scripts:
         injection = "\n".join(scripts)
-        if "</body>" in lower_html:
-            html_value = re.sub(r"</body>", f"{injection}\n</body>", html_value, count=1, flags=re.IGNORECASE)
-        else:
-            html_value = f"{html_value}\n{injection}"
+        html_value = inject_before_closing_tag(html_value, "body", injection)
 
     return html_value
 
 
-def generate_outreach_with_groq(context: Dict[str, Any], site_url: str) -> Dict[str, Any]:
-    prompt = (
-        "Create a concise outreach email draft for a business owner. Return strict JSON with keys subject and body. "
-        "Mention that the business was found through public Google Maps/business listing research, include the live "
-        "preview website URL, and position the offer as web design and marketing support. Keep it professional and "
-        "do not imply an existing relationship.\n\n"
-        f"Live site URL: {site_url}\n"
-        f"Lead context: {model_safe_json(context)}"
-    )
+def ensure_bootstrap_gsap_assets(site_html: str) -> str:
+    return ensure_required_site_features(site_html)
 
-    outreach = groq_chat_json(
-        prompt,
-        "You write ethical B2B outreach drafts. Return valid JSON only.",
-    )
-    outreach.setdefault("subject", f"Website preview for {context.get('businessName')}")
-    outreach.setdefault(
-        "body",
-        (
-            f"Hi {context.get('businessName')} Team,\n\n"
-            f"We found your business through public Google Maps research and created a website preview here: {site_url}\n\n"
-            "We help local businesses with web design and marketing support.\n\n"
-            "Kind regards,\nAI Site Factory Team"
-        ),
-    )
-    outreach["recipientEmail"] = context.get("email")
-    outreach["siteUrl"] = site_url
-    return outreach
+
+def generate_outreach_with_groq(context: Dict[str, Any], site_url: str) -> Dict[str, Any]:
+    business_name = compact_text(context.get("businessName"), "your business")
+    source_label = compact_text(context.get("source") or context.get("sourceLabel"), "a public business listing")
+    source_url = compact_text(context.get("sourceUrl"))
+    email = normalize_email_identity(context.get("email"))
+    phone = compact_text(context.get("phone"))
+    contact_type = "email" if email else "phone" if phone else "unknown"
+
+    if contact_type == "email":
+        body = (
+            f"Hi {business_name} team,\n\n"
+            f"We found your business through {source_label}"
+            f"{f' ({source_url})' if source_url else ''}.\n\n"
+            "If you are interested in exploring a simple website for your business, please reply to this email to opt in. "
+            "An agent can then follow up with details.\n\n"
+            f"Preview link: {site_url}\n\n"
+            "Kind regards,\nAI Site Factory"
+        )
+        subject = f"Website preview for {business_name}"
+    elif contact_type == "phone":
+        body = (
+            "Private agent note: phone-only no-website lead.\n\n"
+            f"Business: {business_name}\n"
+            f"Phone: {phone}\n"
+            f"Source: {source_label}{f' ({source_url})' if source_url else ''}\n"
+            f"Live link: {site_url}\n\n"
+            "Agent action: call the business, explain where the public listing was found, ask for consent to discuss the site, "
+            "and only continue if they opt in."
+        )
+        subject = f"Consent call needed for {business_name}"
+    else:
+        body = (
+            "Private agent note: no email or phone was available for this no-website lead.\n\n"
+            f"Business: {business_name}\n"
+            f"Source: {source_label}{f' ({source_url})' if source_url else ''}\n"
+            f"Live link: {site_url}\n\n"
+            "Agent action: research a lawful contact path before any outreach."
+        )
+        subject = f"Review contact path for {business_name}"
+
+    return {
+        "subject": subject,
+        "body": body,
+        "recipientEmail": email,
+        "phone": phone or None,
+        "siteUrl": site_url,
+        "contactType": contact_type,
+        "publicComment": False,
+    }
 
 
 def fallback_image_data_uri(label: str, accent: str) -> str:
@@ -2890,7 +3377,7 @@ def render_site_html(
         contact_links.append(f"<a href=\"{html.escape(website)}\" target=\"_blank\" rel=\"noreferrer\">Website</a>")
     contact_html = " ".join(contact_links) or "<span>Contact details available on request</span>"
 
-    return f"""<!doctype html>
+    site_html = f"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
@@ -3221,6 +3708,7 @@ def render_site_html(
   </script>
 </body>
 </html>"""
+    return ensure_required_site_features(site_html)
 
 
 def github_headers() -> Dict[str, str]:
@@ -3502,6 +3990,8 @@ def export_site_to_github(
 
 
 def deployment_mode_label(publish_mode: Optional[str]) -> str:
+    if publish_mode == "direct-netlify":
+        return "Direct Netlify"
     if publish_mode == "direct-netlify-fallback":
         return "Direct Netlify fallback"
     if publish_mode == "failed":
@@ -4094,11 +4584,29 @@ def create_zendesk_outreach_ticket(
     base_url = f"https://{zendesk_subdomain}.zendesk.com/api/v2"
     headers = {"Content-Type": "application/json"}
     business_name = compact_text(context.get("businessName"), "AI Site Factory Lead")
-    lead_email = compact_text(context.get("email"))
-    if not lead_email:
-        domain = domain_from_url(context.get("website")) or "example.com"
-        lead_email = f"info@{domain}"
-    log_event("info", "provider.zendesk.start", "Creating Zendesk outreach ticket.", businessName=business_name, pipelineId=pipeline_id, email=lead_email)
+    lead_email = normalize_email_identity(context.get("email"))
+    lead_phone = compact_text(context.get("phone"))
+    live_link = compact_text(deployment.get("url"))
+    contact_type = outreach.get("contactType") or ("email" if lead_email else "phone" if lead_phone else "unknown")
+    contact_tag = "ai_site_email_lead" if contact_type == "email" else "ai_site_phone_lead" if contact_type == "phone" else "ai_site_contact_unknown"
+    tags = [
+        "ai_site_factory",
+        "ai_site_ready",
+        "ai_site_no_website",
+        "outreach_draft",
+        "netlify_production_site",
+        contact_tag,
+    ]
+    log_event(
+        "info",
+        "provider.zendesk.start",
+        "Creating Zendesk private outreach ticket.",
+        businessName=business_name,
+        pipelineId=pipeline_id,
+        contactType=contact_type,
+        hasEmail=bool(lead_email),
+        hasPhone=bool(lead_phone),
+    )
 
     org_response = requests.post(
         f"{base_url}/organizations.json",
@@ -4109,9 +4617,10 @@ def create_zendesk_outreach_ticket(
                     f"Created from AI Site Factory pipeline.\n"
                     f"Pipeline ID: {pipeline_id}\n"
                     f"Industry: {context.get('industry')}\n"
-                    f"Website: {deployment.get('url')}"
+                    f"Live link: {live_link}\n"
+                    f"Contact type: {contact_type}"
                 ),
-                "tags": ["ai_site_factory", "pipeline_lead"],
+                "tags": tags,
             }
         },
         auth=auth,
@@ -4136,66 +4645,71 @@ def create_zendesk_outreach_ticket(
         organization = org_response.json().get("organization", {})
 
     organization_id = organization.get("id")
+    user: Dict[str, Any] = {}
 
-    user_search_response = requests.get(
-        f"{base_url}/users/search.json",
-        params={"query": lead_email},
-        auth=auth,
-        headers=headers,
-        timeout=30,
-    )
-    user_search_response.raise_for_status()
-    users = user_search_response.json().get("users", [])
-
-    if users:
-        user = users[0]
-    else:
-        user_create_response = requests.post(
-            f"{base_url}/users.json",
-            json={
-                "user": {
-                    "name": business_name,
-                    "email": lead_email,
-                    "organization_id": organization_id,
-                    "role": "end-user",
-                    "tags": ["ai_site_factory", "lead_contact"],
-                }
-            },
+    if lead_email:
+        user_search_response = requests.get(
+            f"{base_url}/users/search.json",
+            params={"query": lead_email},
             auth=auth,
             headers=headers,
             timeout=30,
         )
-        user_create_response.raise_for_status()
-        user = user_create_response.json().get("user", {})
+        user_search_response.raise_for_status()
+        users = user_search_response.json().get("users", [])
+
+        if users:
+            user = users[0]
+        else:
+            user_create_response = requests.post(
+                f"{base_url}/users.json",
+                json={
+                    "user": {
+                        "name": business_name,
+                        "email": lead_email,
+                        "organization_id": organization_id,
+                        "role": "end-user",
+                        "tags": tags,
+                    }
+                },
+                auth=auth,
+                headers=headers,
+                timeout=30,
+            )
+            user_create_response.raise_for_status()
+            user = user_create_response.json().get("user", {})
+
+    ticket_payload: Dict[str, Any] = {
+        "ticket": {
+            "subject": outreach.get("subject") or f"Website preview for {business_name}",
+            "comment": {
+                "body": (
+                    f"AI Site Factory private draft\n\n"
+                    f"Pipeline ID: {pipeline_id}\n"
+                    f"Business: {business_name}\n"
+                    f"Industry: {context.get('industry')}\n"
+                    f"Location: {context.get('location')}\n"
+                    f"Contact type: {contact_type}\n"
+                    f"Email: {lead_email or 'N/A'}\n"
+                    f"Phone: {lead_phone or 'N/A'}\n"
+                    f"Live link: {live_link}\n\n"
+                    f"Draft:\n{outreach.get('body')}"
+                ),
+                "public": False,
+            },
+            "organization_id": organization_id,
+            "priority": "normal",
+            "type": "task",
+            "status": "new",
+            "tags": tags,
+        }
+    }
+    if user.get("id"):
+        ticket_payload["ticket"]["requester_id"] = user.get("id")
 
     ticket_response = requests.post(
         f"{base_url}/tickets.json",
-        json={
-            "ticket": {
-                "subject": outreach.get("subject") or f"Website preview for {business_name}",
-                "comment": {
-                    "body": (
-                        f"AI Site Factory pipeline result\n\n"
-                        f"Pipeline ID: {pipeline_id}\n"
-                        f"Business: {business_name}\n"
-                        f"Industry: {context.get('industry')}\n"
-                        f"Location: {context.get('location')}\n"
-                        f"Live Netlify URL: {deployment.get('url')}\n\n"
-                        f"Outreach Draft:\n{outreach.get('body')}"
-                    ),
-                    "public": False,
-                },
-                "requester_id": user.get("id"),
-                "organization_id": organization_id,
-                "priority": "normal",
-                "type": "task",
-                "tags": [
-                    "ai_site_factory",
-                    "outreach_draft",
-                    "netlify_production_site",
-                ],
-            }
-        },
+        json=ticket_payload,
         auth=auth,
         headers=headers,
         timeout=30,
@@ -4214,6 +4728,10 @@ def create_zendesk_outreach_ticket(
         "organizationId": organization_id,
         "userId": user.get("id"),
         "userEmail": user.get("email"),
+        "liveLink": live_link,
+        "contactType": contact_type,
+        "tags": tags,
+        "status": ticket.get("status") or "new",
         "syncedAt": datetime.now().isoformat(),
     }
     log_event("info", "provider.zendesk.finish", "Zendesk ticket created.", businessName=business_name, ticketId=result["ticketId"])
@@ -4400,7 +4918,8 @@ def probe_gemini() -> Dict[str, Any]:
     api_key = require_env("GEMINI_API_KEY")
     model_name = os.getenv("GEMINI_TEXT_MODEL", "gemini-2.0-flash")
     response = requests.get(
-        f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}?key={api_key}",
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}",
+        headers={"x-goog-api-key": api_key},
         timeout=20,
     )
     response.raise_for_status()
@@ -4545,7 +5064,7 @@ def get_lead_presets():
 
 @app.get("/api/templates")
 def get_site_templates():
-    return {"templates": SITE_TEMPLATES}
+    return {"templates": [FREEFORM_SITE_SPEC], "deprecated": True}
 
 @app.post("/api/leads/discover", response_model=DiscoverLeadsResponse)
 def discover_leads(request: DiscoverLeadsRequest):
@@ -4579,6 +5098,7 @@ def discover_leads(request: DiscoverLeadsRequest):
             "normalized": 0,
             "selected": 0,
             "duplicatesSkipped": 0,
+            "websitesSkipped": 0,
         }
     }
 
@@ -4593,32 +5113,46 @@ def discover_leads(request: DiscoverLeadsRequest):
     )
 
     try:
-        query_items = run_apify_google_maps(primary_query, limit, location)
+        fetch_limit = min(max(limit * 5, limit + 8), 30)
+        query_items = run_apify_google_maps(primary_query, fetch_limit, location)
         province_stats[location]["rawItems"] = len(query_items)
 
         normalized = normalize_apify_items(
             query_items,
             preset["industry"],
             location,
-            limit,
+            fetch_limit,
         )
         province_stats[location]["normalized"] = len(normalized)
 
         candidate_keys = [canonical_lead_key_for_lead(lead) for lead in normalized]
         existing_keys = existing_canonical_lead_keys(candidate_keys)
         seen_batch_keys = set()
+        seen_batch_identities: Set[str] = set()
 
         for lead in normalized:
             canonical_key = canonical_lead_key_for_lead(lead)
             lead.canonicalLeadKey = canonical_key
             lead.location = location
+            identity_keys = [identity_key for _identity_type, identity_key in lead_identity_pairs(lead)]
+            identity_conflicts = lead_identity_conflicts(lead, canonical_key)
 
-            if canonical_key in existing_keys or canonical_key in seen_batch_keys:
+            if lead_has_website(lead):
+                province_stats[location]["websitesSkipped"] += 1
+                continue
+
+            if (
+                canonical_key in existing_keys
+                or canonical_key in seen_batch_keys
+                or identity_conflicts
+                or any(identity_key in seen_batch_identities for identity_key in identity_keys)
+            ):
                 duplicates_skipped += 1
                 province_stats[location]["duplicatesSkipped"] += 1
                 continue
 
             seen_batch_keys.add(canonical_key)
+            seen_batch_identities.update(identity_keys)
             selected_leads.append(lead)
 
             if len(selected_leads) >= limit:
@@ -4634,12 +5168,12 @@ def discover_leads(request: DiscoverLeadsRequest):
             f"Quick Help {demo_category}",
         ]
 
-        for business_name in demo_businesses[:limit]:
+        for index, business_name in enumerate(demo_businesses[:limit], start=1):
             lead = DiscoveredLead(
                 leadKey=stable_lead_key(business_name, location, demo_category),
                 canonicalLeadKey=stable_lead_key("demo", business_name, location, demo_category),
                 businessName=business_name,
-                email="info@example.com",
+                email=f"demo{index}@example.com",
                 phone="+27 31 000 0000",
                 website=None,
                 domain=None,
@@ -4720,18 +5254,21 @@ def discover_leads(request: DiscoverLeadsRequest):
 
 @app.post("/api/pipeline/run", response_model=PipelineRunResponse)
 def run_pipeline(request: PipelineRunRequest):
-    template = get_template_or_404(request.templateId)
+    template = dict(FREEFORM_SITE_SPEC)
+    template_id = FREEFORM_TEMPLATE_ID
     if not request.leads:
         raise HTTPException(status_code=400, detail="Select at least one lead.")
 
     pipeline_id = str(uuid4())
     results: List[PipelineLeadResult] = []
     pipeline_warnings: List[str] = []
+    seen_request_canonical_keys: Set[str] = set()
+    seen_request_identity_keys: Set[str] = set()
     created_at = now_iso()
     save_pipeline_run(
         pipeline_id=pipeline_id,
         status="PROCESSING",
-        template_id=request.templateId,
+        template_id=template_id,
         source_batch_id=request.sourceBatchId,
         lead_count=len(request.leads),
         completed_count=0,
@@ -4740,7 +5277,7 @@ def run_pipeline(request: PipelineRunRequest):
         warnings=pipeline_warnings,
         created_at=created_at,
     )
-    log_event("info", "pipeline.start", "Pipeline run started.", pipelineId=pipeline_id, templateId=request.templateId, leadCount=len(request.leads))
+    log_event("info", "pipeline.start", "Pipeline run started.", pipelineId=pipeline_id, templateId=template_id, leadCount=len(request.leads))
 
     for lead in request.leads:
         errors: List[str] = []
@@ -4753,9 +5290,44 @@ def run_pipeline(request: PipelineRunRequest):
         github_export: Optional[Dict[str, Any]] = None
         canonical_key = canonical_lead_key_for_lead(lead)
         lead.canonicalLeadKey = canonical_key
+        identity_keys = [identity_key for _identity_type, identity_key in lead_identity_pairs(lead)]
         status = "PROCESSING"
         current_step = "start"
         approval_status = None
+
+        if lead_has_website(lead):
+            results.append(
+                skipped_pipeline_result(
+                    lead,
+                    canonical_key,
+                    pipeline_id,
+                    "SKIPPED_WEBSITE_PRESENT",
+                    "Lead already has a website, so the no-website pipeline skipped it.",
+                    {"website": lead.website, "domain": lead.domain},
+                )
+            )
+            continue
+
+        identity_conflicts = lead_identity_conflicts(lead, canonical_key)
+        if (
+            canonical_key in seen_request_canonical_keys
+            or any(identity_key in seen_request_identity_keys for identity_key in identity_keys)
+            or identity_conflicts
+        ):
+            results.append(
+                skipped_pipeline_result(
+                    lead,
+                    canonical_key,
+                    pipeline_id,
+                    "SKIPPED_DUPLICATE",
+                    "Lead matched a duplicate identity, so generation was skipped.",
+                    {"identityConflicts": identity_conflicts, "identityKeys": identity_keys},
+                )
+            )
+            continue
+
+        seen_request_canonical_keys.add(canonical_key)
+        seen_request_identity_keys.update(identity_keys)
 
         def run_step(step: str, provider: Optional[str], callback, retryable: bool = False):
             nonlocal current_step
@@ -4830,47 +5402,40 @@ def run_pipeline(request: PipelineRunRequest):
 
             contact_details = run_step("scrape_contact_details", "website", lambda: scrape_contact_details(lead), retryable=True)
             log_event("info", "pipeline.lead.scraped", "Contact details scraped.", pipelineId=pipeline_id, leadKey=lead.leadKey, hasEmail=bool(contact_details.get("email")), hasWebsite=bool(contact_details.get("website")))
-            cleaned_context = {
-                "canonicalLeadKey": canonical_key,
-                "businessName": lead.businessName,
-                "industry": lead.category,
-                "location": lead.location,
-                "province": lead.province,
-                "email": contact_details.get("email") or lead.email,
-                "phone": contact_details.get("phone") or lead.phone,
-                "website": contact_details.get("website") or lead.website,
-                "summary": contact_details.get("notes") or lead.notes or f"{lead.businessName} is a local {lead.category} business.",
-                "targetCustomers": "Local customers",
-                "differentiators": [],
-                "serviceKeywords": [lead.category],
-                "sourceNote": "Public Google Maps, business listing, and website context.",
-            }
+            cleaned_context = build_public_lead_context(lead, contact_details, canonical_key)
+            if cleaned_context.get("hasWebsite"):
+                results.append(
+                    skipped_pipeline_result(
+                        lead,
+                        canonical_key,
+                        pipeline_id,
+                        "SKIPPED_WEBSITE_PRESENT",
+                        "Contact enrichment found a website, so the no-website pipeline skipped it.",
+                        {"website": cleaned_context.get("website"), "domain": cleaned_context.get("domain")},
+                    )
+                )
+                continue
             log_event("info", "pipeline.lead.context_ready", "Lead context prepared.", pipelineId=pipeline_id, leadKey=lead.leadKey)
 
-            page_prompt = run_step(
-                "gemini_page_prompt",
-                "gemini",
-                lambda: generate_page_prompt_with_gemini(cleaned_context, template),
-                retryable=True,
-            )
-            groq_draft = run_step(
-                "groq_draft_html",
+            groq_brief = run_step(
+                "groq_compact_lead",
                 "groq",
-                lambda: generate_draft_html_with_groq(cleaned_context, template, page_prompt),
+                lambda: compact_lead_with_groq(cleaned_context),
                 retryable=True,
             )
             final_html_result = run_step(
                 "gemini_final_html",
                 "gemini",
-                lambda: finalize_html_with_gemini(cleaned_context, template, page_prompt, groq_draft["html"]),
+                lambda: generate_final_html_with_gemini(groq_brief),
                 retryable=True,
             )
-            pending_html = ensure_bootstrap_gsap_assets(final_html_result["html"])
+            pending_html = ensure_required_site_features(final_html_result["html"])
             site_content = {
-                "pagePrompt": page_prompt,
-                "groqDraftNotes": groq_draft.get("notes"),
-                "groqDraftHtmlChecksum": html_checksum(groq_draft["html"]),
+                "promptHeader": LANDING_PAGE_PROMPT_HEADER,
+                "groqBrief": groq_brief,
                 "geminiQaNotes": final_html_result.get("qaNotes"),
+                "structureNotes": final_html_result.get("structureNotes"),
+                "stylingLibraries": final_html_result.get("stylingLibraries"),
                 "finalHtmlChecksum": html_checksum(pending_html),
             }
             approval_id = create_approval_record(
@@ -4983,7 +5548,7 @@ def run_pipeline(request: PipelineRunRequest):
         )
 
     pending_count = sum(1 for result in results if result.status == "PENDING_APPROVAL")
-    failed_count = sum(1 for result in results if result.status in {"FAILED", "EXPORT_FAILED"})
+    failed_count = sum(1 for result in results if result.status in {"FAILED", "EXPORT_FAILED", "SKIPPED_DUPLICATE", "SKIPPED_WEBSITE_PRESENT"})
     completed_count = sum(1 for result in results if result.status.startswith("COMPLETED"))
     if failed_count and (pending_count or completed_count):
         response_status = "PARTIAL_FAILURE"
@@ -4998,7 +5563,7 @@ def run_pipeline(request: PipelineRunRequest):
     response = PipelineRunResponse(
         pipelineId=pipeline_id,
         status=response_status,
-        templateId=request.templateId,
+        templateId=template_id,
         createdAt=created_at,
         results=results,
         warnings=pipeline_warnings,
@@ -5007,7 +5572,7 @@ def run_pipeline(request: PipelineRunRequest):
     save_pipeline_run(
         pipeline_id=pipeline_id,
         status=response_status,
-        template_id=request.templateId,
+        template_id=template_id,
         source_batch_id=request.sourceBatchId,
         lead_count=len(request.leads),
         completed_count=completed_count,
@@ -5051,6 +5616,106 @@ def list_approvals(status: Optional[str] = "PENDING", limit: int = 50):
 def get_approval_detail(approval_id: str, includeHtml: bool = True):
     row = get_approval_or_404(approval_id)
     return approval_row_to_dict(row, include_html=includeHtml)
+
+
+def contact_type_from_context(context: Dict[str, Any]) -> str:
+    if normalize_email_identity(context.get("email")):
+        return "email"
+    if compact_text(context.get("phone")):
+        return "phone"
+    return "unknown"
+
+
+def site_status_matches(status_filter: str, status_value: str) -> bool:
+    normalized = compact_text(status_filter, "all").lower()
+    status_upper = compact_text(status_value).upper()
+    if normalized in {"all", ""}:
+        return True
+    if normalized == "pending":
+        return status_upper in {"PENDING", "EXPORTING", "EXPORT_FAILED"}
+    if normalized == "failed":
+        return status_upper in {"FAILED", "EXPORT_FAILED", "DEPLOY_FAILED", "DEPLOYED_ZENDESK_FAILED"}
+    if normalized in {"approved", "deployed", "live"}:
+        return status_upper == "APPROVED"
+    return status_upper == normalized.upper()
+
+
+@app.get("/api/sites")
+def list_sites(
+    q: Optional[str] = None,
+    status: str = "all",
+    contactType: str = "all",
+    noWebsiteOnly: bool = True,
+    page: int = 1,
+    pageSize: int = 20,
+):
+    safe_page = max(1, page)
+    safe_page_size = max(1, min(pageSize, 100))
+    query = compact_text(q).lower()
+    contact_filter = compact_text(contactType, "all").lower()
+
+    with get_pipeline_db() as db:
+        rows = db.execute(
+            """
+            SELECT *
+            FROM approval_records
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+
+    filtered: List[Dict[str, Any]] = []
+    for row in rows:
+        item = approval_row_to_dict(row)
+        context = item.get("context") or {}
+        deployment_history = item.get("deploymentHistory") or {}
+        live_url = deployment_history.get("url")
+        contact_type = contact_type_from_context(context)
+        has_website = bool(normalize_url(context.get("website")) or normalize_domain(context.get("domain")))
+
+        if noWebsiteOnly and has_website:
+            continue
+        if contact_filter != "all" and contact_type != contact_filter:
+            continue
+        if not site_status_matches(status, item.get("status", "")):
+            continue
+
+        searchable = " ".join(
+            compact_text(value).lower()
+            for value in [
+                item.get("businessName"),
+                item.get("status"),
+                context.get("industry"),
+                context.get("location"),
+                context.get("email"),
+                context.get("phone"),
+                live_url,
+            ]
+        )
+        if query and query not in searchable:
+            continue
+
+        item["liveUrl"] = live_url
+        item["contactType"] = contact_type
+        item["hasWebsite"] = has_website
+        filtered.append(item)
+
+    total = len(filtered)
+    start = (safe_page - 1) * safe_page_size
+    end = start + safe_page_size
+    return {
+        "sites": filtered[start:end],
+        "count": len(filtered[start:end]),
+        "total": total,
+        "page": safe_page,
+        "pageSize": safe_page_size,
+        "totalPages": max(1, (total + safe_page_size - 1) // safe_page_size),
+        "filters": {
+            "q": q,
+            "status": status,
+            "contactType": contactType,
+            "noWebsiteOnly": noWebsiteOnly,
+        },
+    }
 
 
 @app.post("/api/approvals/{approval_id}/retry-export", response_model=ApprovalActionResponse)
@@ -5404,7 +6069,7 @@ def reject_generated_site(approval_id: str, request: ApprovalActionRequest):
 def regenerate_generated_site(approval_id: str, request: ApprovalActionRequest):
     row = get_approval_or_404(approval_id)
     context = safe_json_loads(row["context_json"], {})
-    template = safe_json_loads(row["template_json"], {})
+    template = dict(FREEFORM_SITE_SPEC)
     requested_by = compact_text(request.requestedBy, "Dashboard Operator")
     pipeline_id = str(uuid4())
     created_at = now_iso()
@@ -5413,7 +6078,7 @@ def regenerate_generated_site(approval_id: str, request: ApprovalActionRequest):
     save_pipeline_run(
         pipeline_id=pipeline_id,
         status="PROCESSING",
-        template_id=template.get("id", "default-service"),
+        template_id=FREEFORM_TEMPLATE_ID,
         source_batch_id=None,
         lead_count=1,
         completed_count=0,
@@ -5457,27 +6122,23 @@ def regenerate_generated_site(approval_id: str, request: ApprovalActionRequest):
         return result
 
     try:
-        page_prompt = run_regenerate_step(
-            "gemini_page_prompt",
-            "gemini",
-            lambda: generate_page_prompt_with_gemini(context, template),
-        )
-        groq_draft = run_regenerate_step(
-            "groq_draft_html",
+        groq_brief = run_regenerate_step(
+            "groq_compact_lead",
             "groq",
-            lambda: generate_draft_html_with_groq(context, template, page_prompt),
+            lambda: compact_lead_with_groq(context),
         )
         final_html_result = run_regenerate_step(
             "gemini_final_html",
             "gemini",
-            lambda: finalize_html_with_gemini(context, template, page_prompt, groq_draft["html"]),
+            lambda: generate_final_html_with_gemini(groq_brief),
         )
-        final_html = ensure_bootstrap_gsap_assets(final_html_result["html"])
+        final_html = ensure_required_site_features(final_html_result["html"])
         site_content = {
-            "pagePrompt": page_prompt,
-            "groqDraftNotes": groq_draft.get("notes"),
-            "groqDraftHtmlChecksum": html_checksum(groq_draft["html"]),
+            "promptHeader": LANDING_PAGE_PROMPT_HEADER,
+            "groqBrief": groq_brief,
             "geminiQaNotes": final_html_result.get("qaNotes"),
+            "structureNotes": final_html_result.get("structureNotes"),
+            "stylingLibraries": final_html_result.get("stylingLibraries"),
             "finalHtmlChecksum": html_checksum(final_html),
             "regeneratedFromApprovalId": approval_id,
             "requestedBy": requested_by,
@@ -5519,7 +6180,7 @@ def regenerate_generated_site(approval_id: str, request: ApprovalActionRequest):
             save_pipeline_run(
                 pipeline_id=pipeline_id,
                 status="FAILED",
-                template_id=template.get("id", "default-service"),
+                template_id=FREEFORM_TEMPLATE_ID,
                 source_batch_id=None,
                 lead_count=1,
                 completed_count=0,
@@ -5560,7 +6221,7 @@ def regenerate_generated_site(approval_id: str, request: ApprovalActionRequest):
         save_pipeline_run(
             pipeline_id=pipeline_id,
             status="PENDING_APPROVAL",
-            template_id=template.get("id", "default-service"),
+            template_id=FREEFORM_TEMPLATE_ID,
             source_batch_id=None,
             lead_count=1,
             completed_count=0,
@@ -5575,7 +6236,7 @@ def regenerate_generated_site(approval_id: str, request: ApprovalActionRequest):
         save_pipeline_run(
             pipeline_id=pipeline_id,
             status="FAILED",
-            template_id=template.get("id", "default-service"),
+            template_id=FREEFORM_TEMPLATE_ID,
             source_batch_id=None,
             lead_count=1,
             completed_count=0,
@@ -5669,6 +6330,12 @@ def health_check():
         "message": "AI Site Factory Backend is running",
         "status": "online",
     }
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    """Avoid a noisy 404 when the backend root is opened in a browser."""
+    return Response(status_code=204)
 
 
 @app.post("/api/scrape/lead")

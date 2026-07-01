@@ -4,7 +4,7 @@ import axios from "axios";
 import { gsap } from "gsap";
 import "./App.css";
 
-const API_BASE = "http://127.0.0.1:8000";
+const API_BASE = (process.env.REACT_APP_API_BASE || "http://127.0.0.1:8000").replace(/\/$/, "");
 const MAX_UI_LOGS = 80;
 
 const FALLBACK_PRESETS = [
@@ -13,12 +13,6 @@ const FALLBACK_PRESETS = [
   { id: "dentists", label: "Dentists", industry: "Dental", description: "Dental practices and oral care providers." },
   { id: "beauty-salons", label: "Beauty Salons", industry: "Beauty", description: "Beauty salons, spas, and care studios." },
   { id: "gyms-fitness", label: "Gyms/Fitness", industry: "Fitness", description: "Gyms, trainers, and wellness studios." },
-];
-
-const FALLBACK_TEMPLATES = [
-  { id: "default-service", name: "Default Service", description: "Clean landing page with hero, services, about, contact, and footer." },
-  { id: "bold-local", name: "Bold Local", description: "High-contrast local business page." },
-  { id: "premium-trust", name: "Premium Trust", description: "Polished trust-led page for professional services." },
 ];
 
 const NAV_ITEMS = [
@@ -139,9 +133,7 @@ function AppShell() {
   const contentRef = useRef(null);
 
   const [presets, setPresets] = useState(FALLBACK_PRESETS);
-  const [templates, setTemplates] = useState(FALLBACK_TEMPLATES);
   const [selectedPresetId, setSelectedPresetId] = useState("restaurants");
-  const [selectedTemplateId, setSelectedTemplateId] = useState("default-service");
   const [location, setLocation] = useState("Durban, South Africa");
   const [customQuery, setCustomQuery] = useState("");
   const [leadCount, setLeadCount] = useState(3);
@@ -159,6 +151,9 @@ function AppShell() {
   const [approvals, setApprovals] = useState([]);
   const [approvalPreviews, setApprovalPreviews] = useState({});
   const [deployments, setDeployments] = useState([]);
+  const [sites, setSites] = useState([]);
+  const [siteMeta, setSiteMeta] = useState({ page: 1, pageSize: 8, total: 0, totalPages: 1 });
+  const [siteFilters, setSiteFilters] = useState({ q: "", status: "all", contactType: "all", page: 1, pageSize: 8 });
   const [pipelineRuns, setPipelineRuns] = useState([]);
   const [selectedRunDetail, setSelectedRunDetail] = useState(null);
   const [debugStatus, setDebugStatus] = useState(null);
@@ -231,16 +226,32 @@ function AppShell() {
   const refreshOperations = useCallback(
     async (silent = false) => {
       try {
-        const [summaryResponse, approvalsResponse, deploymentsResponse, runsResponse] = await Promise.all([
+        const siteParams = new URLSearchParams({
+          q: siteFilters.q || "",
+          status: siteFilters.status || "all",
+          contactType: siteFilters.contactType || "all",
+          page: String(siteFilters.page || 1),
+          pageSize: String(siteFilters.pageSize || 8),
+          noWebsiteOnly: "true",
+        });
+        const [summaryResponse, approvalsResponse, deploymentsResponse, runsResponse, sitesResponse] = await Promise.all([
           axios.get(`${API_BASE}/api/reporting/summary`, { timeout: 15000 }),
           axios.get(`${API_BASE}/api/approvals?status=ALL&limit=80`, { timeout: 15000 }),
           axios.get(`${API_BASE}/api/deployments/history?limit=80`, { timeout: 15000 }),
           axios.get(`${API_BASE}/api/pipeline/runs?limit=40`, { timeout: 15000 }),
+          axios.get(`${API_BASE}/api/sites?${siteParams.toString()}`, { timeout: 15000 }),
         ]);
         setReportingSummary(summaryResponse.data);
         setApprovals(approvalsResponse.data.approvals || []);
         setDeployments(deploymentsResponse.data.deployments || []);
         setPipelineRuns(runsResponse.data.runs || []);
+        setSites(sitesResponse.data.sites || []);
+        setSiteMeta({
+          page: sitesResponse.data.page || 1,
+          pageSize: sitesResponse.data.pageSize || 8,
+          total: sitesResponse.data.total || 0,
+          totalPages: sitesResponse.data.totalPages || 1,
+        });
         if (!silent) addUiLog("success", "operations.refresh", "Pipeline reporting refreshed.", { pendingApprovals: summaryResponse.data.metrics?.pendingApprovals || 0 });
       } catch (error) {
         if (!silent) {
@@ -249,18 +260,14 @@ function AppShell() {
         }
       }
     },
-    [addUiLog, formatApiError]
+    [addUiLog, formatApiError, siteFilters]
   );
 
   useEffect(() => {
     const loadConfig = async () => {
       try {
-        const [presetResponse, templateResponse] = await Promise.all([
-          callApi("Preset API", "get", "/api/presets", null, { timeout: 15000 }),
-          callApi("Template API", "get", "/api/templates", null, { timeout: 15000 }),
-        ]);
+        const presetResponse = await callApi("Preset API", "get", "/api/presets", null, { timeout: 15000 });
         setPresets(presetResponse.presets || FALLBACK_PRESETS);
-        setTemplates(templateResponse.templates || FALLBACK_TEMPLATES);
         setNotice("Backend configuration loaded.", "success");
       } catch (error) {
         setNotice("Backend configuration could not be loaded.", "warning");
@@ -281,16 +288,21 @@ function AppShell() {
   }, [refreshDiagnostics, refreshOperations]);
 
   useEffect(() => {
+    refreshOperations(true);
+  }, [refreshOperations]);
+
+  useEffect(() => {
     if (!contentRef.current) return;
     try {
-      gsap.fromTo(contentRef.current.querySelectorAll(".entry-animate"), { y: 12, opacity: 0 }, { y: 0, opacity: 1, duration: 0.42, ease: "power2.out", stagger: 0.04 });
+      const targets = contentRef.current.querySelectorAll(".entry-animate");
+      if (!targets.length) return;
+      gsap.fromTo(targets, { y: 12, opacity: 0 }, { y: 0, opacity: 1, duration: 0.42, ease: "power2.out", stagger: 0.04 });
     } catch (error) {
       addUiLog("warning", "animation.skipped", "Entry animation skipped.", { reason: error.message });
     }
   }, [addUiLog, locationPath.pathname]);
 
   const selectedPreset = useMemo(() => presets.find((preset) => preset.id === selectedPresetId) || presets[0], [presets, selectedPresetId]);
-  const selectedTemplate = useMemo(() => templates.find((template) => template.id === selectedTemplateId) || templates[0], [templates, selectedTemplateId]);
   const selectedLeads = useMemo(() => leads.filter((lead) => selectedLeadKeys.includes(lead.leadKey)), [leads, selectedLeadKeys]);
   const pendingApprovals = approvals.filter((approval) => ["PENDING", "EXPORT_FAILED", "EXPORTING"].includes(approval.status));
 
@@ -354,7 +366,6 @@ function AppShell() {
         "/api/pipeline/run",
         {
           sourceBatchId: batchId,
-          templateId: selectedTemplate.id,
           leads: selectedLeads,
           resumeExisting: true,
           forceRegenerate,
@@ -490,13 +501,9 @@ function AppShell() {
 
   const shared = {
     presets,
-    templates,
     selectedPresetId,
     setSelectedPresetId,
-    selectedTemplateId,
-    setSelectedTemplateId,
     selectedPreset,
-    selectedTemplate,
     location,
     setLocation,
     customQuery,
@@ -523,6 +530,10 @@ function AppShell() {
     pendingApprovals,
     approvalPreviews,
     deployments,
+    sites,
+    siteMeta,
+    siteFilters,
+    setSiteFilters,
     pipelineRuns,
     selectedRunDetail,
     debugStatus,
@@ -590,11 +601,8 @@ function AppShell() {
 function PipelineWorkspacePage(props) {
   const {
     presets,
-    templates,
     selectedPresetId,
     setSelectedPresetId,
-    selectedTemplateId,
-    setSelectedTemplateId,
     location,
     setLocation,
     customQuery,
@@ -629,7 +637,12 @@ function PipelineWorkspacePage(props) {
     retryExport,
     rejectSite,
     regenerateSite,
+    refreshOperations,
     deployments,
+    sites,
+    siteMeta,
+    siteFilters,
+    setSiteFilters,
   } = props;
   const metrics = reportingSummary?.metrics || {};
   const visiblePreviewApprovals = approvals.filter((approval) => approvalPreviews[approval.approvalId]);
@@ -699,13 +712,13 @@ function PipelineWorkspacePage(props) {
 
       <Section
         title="Section 3: Generate Landing Page"
-        help="Generate reusable landing pages, export them to GitHub, and prepare approval records."
+        help="Groq compacts the public lead details, then Gemini creates a freeform landing page with enforced Bootstrap, extra styling libraries, and a color widget."
         action={<button className="btn btn-primary" type="button" onClick={runPipeline} disabled={running || !selectedLeads.length}>{running ? "Running..." : "Run Pipeline"}</button>}
       >
         <div className="control-grid">
-          <label>Template<select className="form-select" value={selectedTemplateId} onChange={(event) => setSelectedTemplateId(event.target.value)}>{templates.map((template) => <option key={template.id} value={template.id}>{template.name}</option>)}</select></label>
           <label className="checkline"><input type="checkbox" checked={forceRegenerate} onChange={(event) => setForceRegenerate(event.target.checked)} />Force regenerate</label>
           <div className="stat-box"><strong>{selectedLeads.length}</strong><span>leads ready</span></div>
+          <div className="stat-box"><strong>Freeform</strong><span>Gemini controls layout</span></div>
         </div>
         {pipelineResult?.results?.length ? (
           <div className="result-grid mt-3">
@@ -739,6 +752,14 @@ function PipelineWorkspacePage(props) {
         ) : (
           <EmptyState title="No approvals" text="Generated pages appear here after a successful GitHub export." />
         )}
+      </Section>
+
+      <Section
+        title="Site Queue"
+        help="Search and filter no-website sites across pending, failed, and deployed records."
+        action={<button className="btn btn-outline-secondary" type="button" onClick={() => refreshOperations(false)}>Refresh</button>}
+      >
+        <SiteQueuePanel sites={sites} siteMeta={siteMeta} siteFilters={siteFilters} setSiteFilters={setSiteFilters} />
       </Section>
 
       <Section
@@ -785,6 +806,52 @@ function ApprovalPreviewPanel({ approvals, approvalPreviews }) {
   );
 }
 
+function SiteQueuePanel({ sites, siteMeta, siteFilters, setSiteFilters }) {
+  const updateFilter = (patch) => setSiteFilters((current) => ({ ...current, page: 1, ...patch }));
+  const goToPage = (page) => setSiteFilters((current) => ({ ...current, page }));
+  return (
+    <div className="queue-stack">
+      <div className="filter-bar">
+        <label>Search<input className="form-control" value={siteFilters.q} onChange={(event) => updateFilter({ q: event.target.value })} placeholder="Business, email, phone, status..." /></label>
+        <label>Status<select className="form-select" value={siteFilters.status} onChange={(event) => updateFilter({ status: event.target.value })}>
+          <option value="all">All</option>
+          <option value="pending">Pending</option>
+          <option value="failed">Failed</option>
+          <option value="deployed">Live</option>
+        </select></label>
+        <label>Contact<select className="form-select" value={siteFilters.contactType} onChange={(event) => updateFilter({ contactType: event.target.value })}>
+          <option value="all">All</option>
+          <option value="email">Email</option>
+          <option value="phone">Phone</option>
+          <option value="unknown">Unknown</option>
+        </select></label>
+      </div>
+      {sites.length ? (
+        <div className="site-list">
+          {sites.map((site) => (
+            <article className="site-row" key={site.approvalId}>
+              <div>
+                <h3>{site.businessName}</h3>
+                <span>{site.context?.industry || "Local service"} | {site.context?.location || "No location"}</span>
+              </div>
+              <span className={`badge ${statusBadgeClass(site.status)}`}>{site.status}</span>
+              <span className="badge text-bg-info">{site.contactType}</span>
+              <div className="site-row-link">{site.liveUrl ? <a href={site.liveUrl} target="_blank" rel="noreferrer">{site.liveUrl}</a> : "No live link yet"}</div>
+            </article>
+          ))}
+        </div>
+      ) : (
+        <EmptyState title="No matching sites" text="Adjust the search or filters." />
+      )}
+      <div className="pagination-row">
+        <button className="btn btn-outline-secondary btn-sm" type="button" disabled={siteMeta.page <= 1} onClick={() => goToPage(siteMeta.page - 1)}>Previous</button>
+        <span>Page {siteMeta.page} of {siteMeta.totalPages} | {siteMeta.total} records</span>
+        <button className="btn btn-outline-secondary btn-sm" type="button" disabled={siteMeta.page >= siteMeta.totalPages} onClick={() => goToPage(siteMeta.page + 1)}>Next</button>
+      </div>
+    </div>
+  );
+}
+
 function LeadTable({ leads, selectedLeadKeys, toggleLead }) {
   if (!leads.length) return <EmptyState title="No leads loaded" text="Run a search from the selected location." />;
   return (
@@ -820,8 +887,7 @@ function PipelineResultCard({ result }) {
       </div>
       <dl>
         <div><dt>Approval</dt><dd>{result.approvalStatus || "N/A"} {result.pendingApprovalId ? `| ${result.pendingApprovalId}` : ""}</dd></div>
-        <div><dt>GitHub</dt><dd>{result.githubExport?.repoUrl ? <a href={result.githubExport.repoUrl} target="_blank" rel="noreferrer">{result.githubExport.repository}</a> : "No repository"}</dd></div>
-        <div><dt>Commit</dt><dd>{result.githubExport?.commitSha || "N/A"}</dd></div>
+        <div><dt>Generation</dt><dd>{result.siteContent?.stylingLibraries?.join(", ") || "Gemini freeform with enforced libraries"}</dd></div>
       </dl>
       {result.stepHistory?.length > 0 && <StepList steps={result.stepHistory} />}
       {result.errors?.length > 0 && <div className="alert alert-danger">{result.errors.join(" ")}</div>}
@@ -839,10 +905,9 @@ function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRet
         <span className={`badge ${statusBadgeClass(approval.status)}`}>{approval.status}</span>
       </div>
       <dl>
-        <div><dt>GitHub repo</dt><dd>{approval.githubExport?.repoUrl ? <a href={approval.githubExport.repoUrl} target="_blank" rel="noreferrer">{approval.githubExport.repository}</a> : "Pending export"}</dd></div>
-        <div><dt>Commit</dt><dd>{approval.githubExport?.commitSha || "N/A"}</dd></div>
         <div><dt>Netlify URL</dt><dd>{netlifyUrl ? <a href={netlifyUrl} target="_blank" rel="noreferrer">{netlifyUrl}</a> : "Not deployed yet"}</dd></div>
         <div><dt>Deployment mode</dt><dd><span className={`badge ${deploymentModeBadgeClass(approval)}`}>{deploymentModeLabel(approval)}</span></dd></div>
+        <div><dt>Contact</dt><dd>{approval.context?.email ? "Email lead" : approval.context?.phone ? "Phone lead" : "No contact yet"}</dd></div>
         <div><dt>Created</dt><dd>{displayDate(approval.createdAt)}</dd></div>
       </dl>
       <div className="button-row">
@@ -853,6 +918,7 @@ function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRet
         <button className="btn btn-outline-danger btn-sm" type="button" onClick={onReject} disabled={busy || !["PENDING", "EXPORT_FAILED"].includes(approval.status)}>Reject</button>
       </div>
       <ErrorSummary errors={approval.errors} />
+      <TechnicalDetails data={{ githubExport: approval.githubExport, siteContent: approval.siteContent, zendesk: approval.zendesk }} />
     </article>
   );
 }
@@ -932,7 +998,7 @@ function RunList({ runs, onSelect, compact = false }) {
 function StepList({ steps }) {
   if (!steps?.length) return null;
   return (
-    <details open>
+    <details>
       <summary>Step history</summary>
       <div className="step-list">
         {steps.map((step, index) => (

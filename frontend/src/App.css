@@ -294,6 +294,7 @@ dt {
 .preset-grid,
 .provider-grid,
 .probe-grid,
+.filter-bar,
 .control-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
@@ -581,9 +582,58 @@ dd {
 .run-list,
 .step-list,
 .detail-stack,
+.queue-stack,
+.site-list,
 .preview-stack {
   display: grid;
   gap: 0.85rem;
+}
+
+.filter-bar {
+  align-items: end;
+}
+
+.filter-bar label {
+  display: grid;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.84rem;
+  font-weight: 800;
+}
+
+.site-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto auto minmax(220px, 1.1fr);
+  gap: 0.85rem;
+  align-items: center;
+  padding: 0.95rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #ffffff;
+  box-shadow: 0 8px 22px rgba(7, 27, 51, 0.05);
+}
+
+.site-row h3 {
+  margin: 0;
+  color: var(--navy);
+  font-size: 0.98rem;
+  font-weight: 900;
+}
+
+.site-row span:not(.badge),
+.site-row-link {
+  color: var(--muted);
+  font-size: 0.82rem;
+  overflow-wrap: anywhere;
+}
+
+.pagination-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 0.75rem;
+  color: var(--muted);
+  font-size: 0.86rem;
 }
 
 dl {
@@ -839,6 +889,11 @@ pre {
 
   .run-row {
     grid-template-columns: 1fr;
+  }
+
+  .site-row {
+    grid-template-columns: 1fr;
+    align-items: start;
   }
 
   .selection-summary {

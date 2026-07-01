@@ -14,6 +14,7 @@ __pycache__/
 *.pyc
 
 *.log
+.dev-ports.json
 
 dist/
 build/
