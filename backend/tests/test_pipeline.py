@@ -44,6 +44,47 @@ def test_groq_auth_failure_is_actionable(monkeypatch):
         main.groq_chat_json("prompt", "system")
 
 
+def test_gemini_rate_limit_uses_local_final_html_fallback(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "gemini_text_json",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            main.GeminiRateLimitError("Gemini rate limit reached.")
+        ),
+    )
+
+    result = main.generate_final_html_with_gemini(
+        {
+            "businessName": "STYLE BY RN",
+            "industry": "Beauty",
+            "location": "Durban",
+            "summary": "Local beauty services.",
+            "serviceKeywords": ["Beauty"],
+        }
+    )
+
+    assert result["html"].lower().startswith("<!doctype html>")
+    assert "bootstrap@5.3.8" in result["html"].lower()
+    assert "gsap@3.15" in result["html"].lower()
+    assert "fallback" in result["qaNotes"].lower()
+
+
+def test_existing_theme_widget_is_upgraded_to_control_site_variables():
+    legacy_html = """<!doctype html><html><head>
+    <style id="ai-site-theme-widget-style">old</style>
+    </head><body>
+    <aside data-ai-site-theme-widget></aside>
+    <script id="ai-site-theme-widget-script">old</script>
+    </body></html>"""
+
+    upgraded = main.ensure_required_site_features(legacy_html)
+
+    assert upgraded.count('id="ai-site-theme-widget-style"') == 1
+    assert upgraded.count('id="ai-site-theme-widget-script"') == 1
+    assert 'root.style.setProperty("--primary", primary)' in upgraded
+    assert 'root.style.setProperty("--dark", secondary)' in upgraded
+
+
 @pytest.fixture(autouse=True)
 def isolated_pipeline_db(tmp_path, monkeypatch):
     monkeypatch.setenv("PIPELINE_DB_PATH", str(tmp_path / "pipeline.db"))
@@ -460,6 +501,15 @@ def test_failed_github_netlify_deployment_keeps_generated_html(monkeypatch):
     assert detail["previewAvailable"] is True
     assert detail["errors"][0]["retryable"] is True
 
+    monkeypatch.setattr(main, "deploy_direct_netlify_for_lead", fake_direct_deploy_with_history)
+    monkeypatch.setattr(main, "generate_outreach_with_groq", lambda context, site_url: {"subject": "Preview", "body": f"See {site_url}"})
+    monkeypatch.setattr(main, "create_zendesk_outreach_ticket", lambda *args, **kwargs: {"syncStatus": "TICKET_CREATED", "ticketId": 123})
+
+    retry = client.post(f"/api/approvals/{approval_id}/approve", json={"approvedBy": "Ops"})
+
+    assert retry.status_code == 200
+    assert retry.json()["status"] == "APPROVED"
+
 
 def test_approval_falls_back_to_direct_netlify_deploy_when_git_clone_fails(monkeypatch):
     stub_generation(monkeypatch)
@@ -743,6 +793,97 @@ def test_netlify_git_deploy_uses_build_api_not_zip_upload(monkeypatch):
     history = client.get("/api/deployments/history").json()["deployments"]
     assert history[0]["github_repo_url"] == github_export["repoUrl"]
     assert history[0]["build_id"] == "build-1"
+
+
+def test_direct_netlify_deploy_migrates_stale_site_to_current_account(monkeypatch):
+    monkeypatch.setenv("NETLIFY_AUTH_TOKEN", "new-account-token")
+    now = main.now_iso()
+    with main.get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT INTO site_registry (
+                canonical_lead_key, site_id, site_name, url, admin_url,
+                github_repo_full_name, github_repo_url, last_commit_sha, last_build_id,
+                created_at, updated_at, last_deploy_id, last_deploy_state, deployment_count
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "canonical-one",
+                "old-account-site",
+                "ai-site-alpha-plumbing-canonical",
+                "https://old-account.netlify.app",
+                "https://app.netlify.com/sites/old-account",
+                "owner/ai-site-alpha",
+                "https://github.com/owner/ai-site-alpha",
+                "old-commit",
+                None,
+                now,
+                now,
+                None,
+                "ready",
+                1,
+            ),
+        )
+
+    create_names = []
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        if url.endswith("/sites/old-account-site"):
+            return FakeResponse(403, {})
+        if url.endswith("/api/v1/sites"):
+            return FakeResponse(200, [])
+        raise AssertionError(url)
+
+    def fake_post(url, headers=None, json=None, data=None, timeout=None):
+        if url.endswith("/api/v1/sites"):
+            create_names.append(json["name"])
+            if len(create_names) == 1:
+                return FakeResponse(422, {})
+            return FakeResponse(
+                201,
+                {
+                    "id": "new-account-site",
+                    "name": json["name"],
+                    "ssl_url": "https://new-account.netlify.app",
+                    "admin_url": "https://app.netlify.com/sites/new-account",
+                },
+            )
+        if url.endswith("/sites/new-account-site/deploys"):
+            return FakeResponse(
+                201,
+                {
+                    "id": "new-deploy",
+                    "state": "ready",
+                    "ssl_url": "https://new-account.netlify.app",
+                },
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    monkeypatch.setattr(main.requests, "post", fake_post)
+
+    result = main.deploy_direct_netlify_for_lead(
+        canonical_key="canonical-one",
+        business_name="Alpha Plumbing",
+        site_html="<!doctype html><html><body>Alpha</body></html>",
+        pipeline_id="pipeline-one",
+        approval_id="approval-one",
+        approved_by="Ops",
+        github_export=fake_github_export("canonical-one", "Alpha Plumbing", "<html>Alpha</html>"),
+    )
+
+    assert result["accountMigration"] is True
+    assert result["siteId"] == "new-account-site"
+    assert result["url"] == "https://new-account.netlify.app"
+    assert len(create_names) == 2
+    assert create_names[1] != create_names[0]
+    with main.get_pipeline_db() as db:
+        registry = db.execute(
+            "SELECT site_id, url FROM site_registry WHERE canonical_lead_key = ?",
+            ("canonical-one",),
+        ).fetchone()
+    assert registry["site_id"] == "new-account-site"
+    assert registry["url"] == "https://new-account.netlify.app"
 
 
 def test_no_owner_fields_in_responses(monkeypatch):

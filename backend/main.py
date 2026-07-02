@@ -73,6 +73,15 @@ SENSITIVE_KEY_PATTERN = re.compile(r"(token|key|secret|password|authorization|au
 MODEL_CHUNK_CHARS = int(os.getenv("MODEL_CHUNK_CHARS", "1800"))
 MODEL_MAX_CHUNKS = int(os.getenv("MODEL_MAX_CHUNKS", "4"))
 
+
+class GeminiRateLimitError(RuntimeError):
+    """Gemini quota is temporarily unavailable."""
+
+
+class GeminiTransientError(RuntimeError):
+    """Gemini failed after retryable transport or server errors."""
+
+
 REQUIRED_PROVIDER_ENV = {
     "apify": ["APIFY_API_TOKEN"],
     "gemini": ["GEMINI_API_KEY"],
@@ -1661,7 +1670,7 @@ def approval_row_to_dict(row: sqlite3.Row, include_html: bool = False) -> Dict[s
         "errors": safe_json_loads(row["errors_json"], []),
     }
     if include_html:
-        approval["pendingPreviewHtml"] = row["html"]
+        approval["pendingPreviewHtml"] = ensure_required_site_features(row["html"]) if row["html"] else None
     return approval
 
 
@@ -2170,6 +2179,7 @@ def gemini_text_json(prompt: str, model: Optional[str] = None) -> Dict[str, Any]
     api_key = require_env("GEMINI_API_KEY")
     model_name = model or os.getenv("GEMINI_TEXT_MODEL", "gemini-2.0-flash")
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
+    max_attempts = max(1, min(int(os.getenv("GEMINI_MAX_ATTEMPTS", "2")), 5))
 
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
@@ -2179,7 +2189,7 @@ def gemini_text_json(prompt: str, model: Optional[str] = None) -> Dict[str, Any]
         },
     }
 
-    for attempt in range(5):
+    for attempt in range(max_attempts):
         try:
             response = requests.post(
                 url,
@@ -2192,7 +2202,11 @@ def gemini_text_json(prompt: str, model: Optional[str] = None) -> Dict[str, Any]
             )
 
             if response.status_code == 429:
-                wait_time = 10 * (attempt + 1)
+                if attempt == max_attempts - 1:
+                    raise GeminiRateLimitError(
+                        "Gemini rate limit reached; using the local landing-page fallback."
+                    )
+                wait_time = 5 * (attempt + 1)
                 log_event(
                     "warning",
                     "provider.gemini.rate_limited",
@@ -2228,7 +2242,7 @@ def gemini_text_json(prompt: str, model: Optional[str] = None) -> Dict[str, Any]
             return parse_json_response(text)
 
         except requests.RequestException as error:
-            if attempt == 4:
+            if attempt == max_attempts - 1:
                 log_event(
                     "error",
                     "provider.gemini_text.error",
@@ -2236,11 +2250,15 @@ def gemini_text_json(prompt: str, model: Optional[str] = None) -> Dict[str, Any]
                     model=model_name,
                     reason=error.__class__.__name__,
                 )
-                raise RuntimeError("Gemini request failed after retries.")
+                raise GeminiTransientError(
+                    "Gemini request failed after retries; using the local landing-page fallback."
+                ) from error
 
             time.sleep(5 * (attempt + 1))
 
-    raise RuntimeError("Gemini request failed after retries.")
+    raise GeminiTransientError(
+        "Gemini request failed after retries; using the local landing-page fallback."
+    )
 
 def groq_chat_json(prompt: str, system_prompt: str) -> Dict[str, Any]:
     api_key = require_env("GROQ_API_KEY")
@@ -2459,7 +2477,28 @@ def generate_final_html_with_gemini(lead_brief: Dict[str, Any]) -> Dict[str, Any
         "Business information to append to the predefined prompt header:\n"
         f"{model_safe_json(lead_brief)}"
     )
-    result = gemini_text_json(prompt)
+    try:
+        result = gemini_text_json(prompt)
+    except (GeminiRateLimitError, GeminiTransientError) as error:
+        log_event(
+            "warning",
+            "provider.gemini_final_html.fallback",
+            "Gemini final HTML was unavailable. Using the local Bootstrap/GSAP renderer.",
+            reason=str(error),
+        )
+        fallback_html = build_bootstrap_gsap_landing_html(
+            lead_brief,
+            dict(FREEFORM_SITE_SPEC),
+        )
+        return {
+            "html": fallback_html,
+            "qaNotes": "Gemini was temporarily unavailable; backend generated the validated local fallback.",
+            "structureNotes": "Deterministic hero, services, about, contact, and footer layout.",
+            "stylingLibraries": ["Bootstrap", "GSAP"],
+            "promptHeader": LANDING_PAGE_PROMPT_HEADER,
+            "fallbackReason": sanitize_message(error),
+        }
+
     site_html = result.get("html") or result.get("siteHtml") or result.get("finalHtml")
     if not site_html:
         raise RuntimeError("Gemini did not return an html field.")
@@ -3015,6 +3054,14 @@ def inject_before_closing_tag(site_html: str, tag: str, content: str) -> str:
     return f"{html_value}\n{content}"
 
 
+def replace_element_by_id(site_html: str, tag: str, element_id: str, replacement: str) -> str:
+    pattern = (
+        rf"<{tag}\b[^>]*\bid=[\"']{re.escape(element_id)}[\"'][^>]*>"
+        rf".*?</{tag}>"
+    )
+    return re.sub(pattern, replacement, site_html, count=1, flags=re.IGNORECASE | re.DOTALL)
+
+
 def ensure_required_site_features(site_html: str) -> str:
     html_value = site_html
     lower_html = html_value.lower()
@@ -3115,9 +3162,17 @@ def ensure_required_site_features(site_html: str) -> str:
       catch (error) { return Object.assign({}, defaults); }
     }
     function applyTheme(theme) {
-      root.style.setProperty("--ai-primary", theme.primary || defaults.primary);
-      root.style.setProperty("--ai-secondary", theme.secondary || defaults.secondary);
-      root.style.setProperty("--ai-accent", theme.accent || defaults.accent);
+      var primary = theme.primary || defaults.primary;
+      var secondary = theme.secondary || defaults.secondary;
+      var accent = theme.accent || defaults.accent;
+      root.style.setProperty("--ai-primary", primary);
+      root.style.setProperty("--ai-secondary", secondary);
+      root.style.setProperty("--ai-accent", accent);
+      root.style.setProperty("--primary", primary);
+      root.style.setProperty("--secondary", secondary);
+      root.style.setProperty("--accent", accent);
+      root.style.setProperty("--dark", secondary);
+      root.style.setProperty("--template-accent", accent);
       document.querySelectorAll("[data-theme-color]").forEach(function (input) {
         input.value = theme[input.dataset.themeColor] || defaults[input.dataset.themeColor];
       });
@@ -3159,6 +3214,22 @@ def ensure_required_site_features(site_html: str) -> str:
   });
 </script>"""
 
+    if "ai-site-theme-widget-style" in lower_html:
+        html_value = replace_element_by_id(
+            html_value,
+            "style",
+            "ai-site-theme-widget-style",
+            widget_css,
+        )
+    if "ai-site-theme-widget-script" in lower_html:
+        html_value = replace_element_by_id(
+            html_value,
+            "script",
+            "ai-site-theme-widget-script",
+            widget_js,
+        )
+
+    lower_html = html_value.lower()
     if "bootstrap@5.3.8/dist/css/bootstrap.min.css" not in lower_html:
         html_value = inject_before_closing_tag(html_value, "head", f"  {bootstrap_css}")
 
@@ -4350,19 +4421,49 @@ def deploy_direct_netlify_fallback_for_lead(
             (canonical_key,),
         ).fetchone()
 
+    verified_existing_site: Optional[Dict[str, Any]] = None
+    account_migration = False
+    if existing_site:
+        verify_response = requests.get(
+            f"https://api.netlify.com/api/v1/sites/{existing_site['site_id']}",
+            headers=headers,
+            timeout=30,
+        )
+        if verify_response.status_code == 200:
+            verified_existing_site = verify_response.json()
+        elif verify_response.status_code in {403, 404}:
+            account_migration = True
+            log_event(
+                "warning",
+                "provider.netlify.site_account_changed",
+                "Stored Netlify site is not available to the current token; a new site will be created.",
+                siteId=existing_site["site_id"],
+                siteName=existing_site["site_name"],
+                statusCode=verify_response.status_code,
+            )
+            existing_site = None
+        else:
+            verify_response.raise_for_status()
+
     site_created = False
     site_reused = bool(existing_site)
-    deploy_action = "DIRECT_FALLBACK_REDEPLOYED" if existing_site else "DIRECT_FALLBACK_CREATED"
+    deploy_action = (
+        "DIRECT_FALLBACK_REDEPLOYED"
+        if existing_site
+        else "DIRECT_FALLBACK_ACCOUNT_MIGRATED"
+        if account_migration
+        else "DIRECT_FALLBACK_CREATED"
+    )
 
     if existing_site:
         site_id = existing_site["site_id"]
-        site_name = existing_site["site_name"]
+        site_name = verified_existing_site.get("name") or existing_site["site_name"]
         site = {
             "id": site_id,
             "name": site_name,
-            "ssl_url": existing_site["url"],
-            "url": existing_site["url"],
-            "admin_url": existing_site["admin_url"],
+            "ssl_url": verified_existing_site.get("ssl_url") or existing_site["url"],
+            "url": verified_existing_site.get("url") or existing_site["url"],
+            "admin_url": verified_existing_site.get("admin_url") or existing_site["admin_url"],
         }
     else:
         site_name = f"ai-site-{slugify(business_name, 32)}-{canonical_key[:8]}"
@@ -4399,12 +4500,26 @@ def deploy_direct_netlify_fallback_for_lead(
                 None,
             )
             if not matching_site:
+                account_suffix = hashlib.sha256(token.encode("utf-8")).hexdigest()[:6]
+                site_name = f"{site_name[:56]}-{account_suffix}"
+                create_response = requests.post(
+                    "https://api.netlify.com/api/v1/sites",
+                    headers={**headers, "Content-Type": "application/json"},
+                    json={
+                        "name": site_name,
+                        "processing_settings": {"html": {"pretty_urls": True}},
+                    },
+                    timeout=45,
+                )
                 create_response.raise_for_status()
-            site = matching_site
+                site = create_response.json()
+                site_created = True
+            else:
+                site = matching_site
+                site_reused = True
+                deploy_action = "DIRECT_FALLBACK_REDEPLOYED"
             site_id = site.get("id") or site.get("name")
             site_name = site.get("name") or site_name
-            site_reused = True
-            deploy_action = "DIRECT_FALLBACK_REDEPLOYED"
         else:
             create_response.raise_for_status()
             site = create_response.json()
@@ -4482,6 +4597,7 @@ def deploy_direct_netlify_fallback_for_lead(
         "githubRepoFullName": repo_full_name,
         "commitSha": commit_sha,
         "fallbackReason": fallback_reason,
+        "accountMigration": account_migration,
     }
 
     with get_pipeline_db() as db:
@@ -5865,13 +5981,16 @@ def get_pipeline_run_detail(pipeline_id: str):
 @app.post("/api/approvals/{approval_id}/approve", response_model=ApprovalActionResponse)
 def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
     row = get_approval_or_404(approval_id)
-    if row["status"] != "PENDING":
-        raise HTTPException(status_code=409, detail=f"Approval is {row['status']}, not PENDING.")
+    if row["status"] not in {"PENDING", "DEPLOY_FAILED"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Approval is {row['status']}; only PENDING or DEPLOY_FAILED approvals can deploy.",
+        )
 
     context = safe_json_loads(row["context_json"], {})
     for key in ["ownerName", "ownerEmail", "ownerStatus"]:
         context.pop(key, None)
-    site_html = row["html"]
+    site_html = ensure_required_site_features(row["html"]) if row["html"] else None
     approved_by = compact_text(request.approvedBy, "Dashboard Operator")
     errors: List[Dict[str, Any]] = []
     deployment: Optional[Dict[str, Any]] = None
@@ -6039,8 +6158,11 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
 @app.post("/api/approvals/{approval_id}/reject", response_model=ApprovalActionResponse)
 def reject_generated_site(approval_id: str, request: ApprovalActionRequest):
     row = get_approval_or_404(approval_id)
-    if row["status"] != "PENDING":
-        raise HTTPException(status_code=409, detail=f"Approval is {row['status']}, not PENDING.")
+    if row["status"] not in {"PENDING", "EXPORT_FAILED", "DEPLOY_FAILED"}:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Approval is {row['status']} and cannot be rejected.",
+        )
 
     rejected_by = compact_text(request.rejectedBy, "Dashboard Operator")
     notes = compact_text(request.reason or request.notes, "Rejected from dashboard.")

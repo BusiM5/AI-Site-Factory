@@ -646,6 +646,7 @@ function PipelineWorkspacePage(props) {
   } = props;
   const metrics = reportingSummary?.metrics || {};
   const visiblePreviewApprovals = approvals.filter((approval) => approvalPreviews[approval.approvalId]);
+  const deploymentFailures = approvals.filter((approval) => approval.status === "DEPLOY_FAILED");
 
   return (
     <div className="page-stack">
@@ -730,8 +731,8 @@ function PipelineWorkspacePage(props) {
       </Section>
 
       <Section
-        title="Section 4: Approval Queue"
-        help="Preview, retry exports, approve GitHub-based Netlify deployment, reject, or regenerate."
+        title="Section 4: Approval & Preview"
+        help="Review generated pages, open previews, approve or retry deployment, reject, or regenerate."
       >
         {approvals.length ? (
           <div className="approval-list">
@@ -752,6 +753,9 @@ function PipelineWorkspacePage(props) {
         ) : (
           <EmptyState title="No approvals" text="Generated pages appear here after a successful GitHub export." />
         )}
+        <div className="mt-4">
+          <ApprovalPreviewPanel approvals={visiblePreviewApprovals} approvalPreviews={approvalPreviews} />
+        </div>
       </Section>
 
       <Section
@@ -763,16 +767,10 @@ function PipelineWorkspacePage(props) {
       </Section>
 
       <Section
-        title="Section 5: Preview"
-        help="Open a preview from the approval queue to inspect the generated landing page before deployment."
+        title="Section 5: Deployments"
+        help="Deployment URLs, modes, failures, repositories, builds, and technical details are kept here."
       >
-        <ApprovalPreviewPanel approvals={visiblePreviewApprovals} approvalPreviews={approvalPreviews} />
-      </Section>
-
-      <Section
-        title="Section 6: Deployment Action"
-        help="Approved pages deploy from GitHub to Netlify. Recent deployments show the live site, repository, build, and status."
-      >
+        <DeploymentFailureList approvals={deploymentFailures} />
         <DeploymentList deployments={deployments.slice(0, 4)} />
       </Section>
     </div>
@@ -896,8 +894,7 @@ function PipelineResultCard({ result }) {
 }
 
 function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRetry, onReject, onRegenerate }) {
-  const canApprove = approval.status === "PENDING" && approval.githubExport?.repoUrl;
-  const netlifyUrl = netlifyUrlFromApproval(approval);
+  const canApprove = ["PENDING", "DEPLOY_FAILED"].includes(approval.status) && approval.githubExport?.repoUrl;
   return (
     <article className="approval-item">
       <div className="item-head">
@@ -905,29 +902,51 @@ function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRet
         <span className={`badge ${statusBadgeClass(approval.status)}`}>{approval.status}</span>
       </div>
       <dl>
-        <div><dt>Netlify URL</dt><dd>{netlifyUrl ? <a href={netlifyUrl} target="_blank" rel="noreferrer">{netlifyUrl}</a> : "Not deployed yet"}</dd></div>
-        <div><dt>Deployment mode</dt><dd><span className={`badge ${deploymentModeBadgeClass(approval)}`}>{deploymentModeLabel(approval)}</span></dd></div>
         <div><dt>Contact</dt><dd>{approval.context?.email ? "Email lead" : approval.context?.phone ? "Phone lead" : "No contact yet"}</dd></div>
         <div><dt>Created</dt><dd>{displayDate(approval.createdAt)}</dd></div>
       </dl>
+      {approval.status === "DEPLOY_FAILED" && <p className="text-danger mb-2">Deployment failed. Update the Netlify token if needed, then retry deployment.</p>}
       <div className="button-row">
         <button className="btn btn-outline-secondary btn-sm" type="button" onClick={onPreview} disabled={busy || !approval.previewAvailable}>{previewHtml ? "Hide Preview" : "Preview"}</button>
         {approval.status === "EXPORT_FAILED" && <button className="btn btn-outline-primary btn-sm" type="button" onClick={onRetry} disabled={busy}>Retry Export</button>}
-        <button className="btn btn-success btn-sm" type="button" onClick={onApprove} disabled={busy || !canApprove}>{busy ? "Working..." : "Approve"}</button>
+        <button className="btn btn-success btn-sm" type="button" onClick={onApprove} disabled={busy || !canApprove}>{busy ? "Working..." : approval.status === "DEPLOY_FAILED" ? "Retry Deploy" : "Approve"}</button>
         <button className="btn btn-outline-primary btn-sm" type="button" onClick={onRegenerate} disabled={busy}>Regenerate</button>
-        <button className="btn btn-outline-danger btn-sm" type="button" onClick={onReject} disabled={busy || !["PENDING", "EXPORT_FAILED"].includes(approval.status)}>Reject</button>
+        <button className="btn btn-outline-danger btn-sm" type="button" onClick={onReject} disabled={busy || !["PENDING", "EXPORT_FAILED", "DEPLOY_FAILED"].includes(approval.status)}>Reject</button>
       </div>
-      <ErrorSummary errors={approval.errors} />
-      <TechnicalDetails data={{ githubExport: approval.githubExport, siteContent: approval.siteContent, zendesk: approval.zendesk }} />
     </article>
   );
 }
 
-function DeploymentsPage({ deployments }) {
+function DeploymentsPage({ deployments, approvals }) {
+  const deploymentFailures = approvals.filter((approval) => approval.status === "DEPLOY_FAILED");
   return (
     <Section title="Deployment History">
+      <DeploymentFailureList approvals={deploymentFailures} />
       <DeploymentList deployments={deployments} detailed />
     </Section>
+  );
+}
+
+function DeploymentFailureList({ approvals }) {
+  if (!approvals.length) return null;
+  return (
+    <div className="deployment-list mb-3">
+      {approvals.map((approval) => (
+        <article className="deployment-item" key={`failed-${approval.approvalId}`}>
+          <div className="item-head">
+            <div><h3>{approval.businessName}</h3><span>{approval.pipelineId}</span></div>
+            <span className={`badge ${statusBadgeClass(approval.status)}`}>{approval.status}</span>
+          </div>
+          <dl>
+            <div><dt>Netlify URL</dt><dd>{netlifyUrlFromApproval(approval) || "Not deployed yet"}</dd></div>
+            <div><dt>Deployment mode</dt><dd><span className={`badge ${deploymentModeBadgeClass(approval)}`}>{deploymentModeLabel(approval)}</span></dd></div>
+            <div><dt>Created</dt><dd>{displayDate(approval.createdAt)}</dd></div>
+          </dl>
+          <ErrorSummary errors={approval.errors} />
+          <TechnicalDetails data={{ errors: approval.errors, githubExport: approval.githubExport }} />
+        </article>
+      ))}
+    </div>
   );
 }
 

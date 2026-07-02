@@ -296,10 +296,11 @@ test("renders four-page Pipeline Workspace with merged sections", async () => {
     "Section 1: Lead Discovery",
     "Section 2: Selected Leads",
     "Section 3: Generate Landing Page",
-    "Section 4: Approval Queue",
-    "Section 5: Preview",
-    "Section 6: Deployment Action",
+    "Section 4: Approval & Preview",
+    "Section 5: Deployments",
   ].forEach((heading) => expect(screen.getByText(heading)).toBeInTheDocument());
+  expect(screen.queryByText("Section 5: Preview")).not.toBeInTheDocument();
+  expect(screen.queryByText("Section 6: Deployment Action")).not.toBeInTheDocument();
   expect(screen.queryByText("All owners")).not.toBeInTheDocument();
   expect(screen.queryByText("Owner Performance")).not.toBeInTheDocument();
   expect(screen.queryByText("Assign Owner")).not.toBeInTheDocument();
@@ -330,7 +331,9 @@ test("previews and approves a GitHub-based Netlify deployment", async () => {
   fireEvent.click(await screen.findByRole("link", { name: "Pipeline Workspace" }));
   expect(await screen.findByText("approval-1")).toBeInTheDocument();
 
-  const queue = screen.getByText("Section 4: Approval Queue").closest("section");
+  const queue = screen.getByText("Section 4: Approval & Preview").closest("section");
+  expect(within(queue).queryByText("Netlify URL")).not.toBeInTheDocument();
+  expect(within(queue).queryByText("Deployment mode")).not.toBeInTheDocument();
   fireEvent.click(within(queue).getAllByText("Preview")[0]);
   expect(await screen.findByTitle("Preview Alpha Plumbing")).toBeInTheDocument();
 
