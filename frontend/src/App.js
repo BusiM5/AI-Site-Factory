@@ -638,16 +638,12 @@ function PipelineWorkspacePage(props) {
     rejectSite,
     regenerateSite,
     refreshOperations,
-    deployments,
     sites,
     siteMeta,
     siteFilters,
     setSiteFilters,
   } = props;
   const metrics = reportingSummary?.metrics || {};
-  const visiblePreviewApprovals = approvals.filter((approval) => approvalPreviews[approval.approvalId]);
-  const deploymentFailures = approvals.filter((approval) => approval.status === "DEPLOY_FAILED");
-
   return (
     <div className="page-stack">
       <section className="workspace-hero entry-animate">
@@ -661,7 +657,7 @@ function PipelineWorkspacePage(props) {
             ["Leads", metrics.leadsDiscovered || leads.length || 0],
             ["Selected", selectedLeads.length],
             ["Approvals", pendingApprovals.length],
-            ["Deployments", metrics.gitDeployments || metrics.approvedDeployments || deployments.length || 0],
+            ["Sites", sites.length || metrics.noWebsiteSites || 0],
           ]}
         />
       </section>
@@ -753,9 +749,6 @@ function PipelineWorkspacePage(props) {
         ) : (
           <EmptyState title="No approvals" text="Generated pages appear here after a successful GitHub export." />
         )}
-        <div className="mt-4">
-          <ApprovalPreviewPanel approvals={visiblePreviewApprovals} approvalPreviews={approvalPreviews} />
-        </div>
       </Section>
 
       <Section
@@ -764,14 +757,6 @@ function PipelineWorkspacePage(props) {
         action={<button className="btn btn-outline-secondary" type="button" onClick={() => refreshOperations(false)}>Refresh</button>}
       >
         <SiteQueuePanel sites={sites} siteMeta={siteMeta} siteFilters={siteFilters} setSiteFilters={setSiteFilters} />
-      </Section>
-
-      <Section
-        title="Section 5: Deployments"
-        help="Deployment URLs, modes, failures, repositories, builds, and technical details are kept here."
-      >
-        <DeploymentFailureList approvals={deploymentFailures} />
-        <DeploymentList deployments={deployments.slice(0, 4)} />
       </Section>
     </div>
   );
@@ -782,23 +767,6 @@ function MetricRail({ metrics }) {
     <div className="metric-grid hero-metrics">
       {metrics.map(([label, value]) => (
         <div className="metric-card" key={label}><span>{value}</span><label>{label}</label></div>
-      ))}
-    </div>
-  );
-}
-
-function ApprovalPreviewPanel({ approvals, approvalPreviews }) {
-  if (!approvals.length) return <EmptyState title="No preview open" text="Use Preview in the approval queue to inspect a generated page here." />;
-  return (
-    <div className="preview-stack">
-      {approvals.map((approval) => (
-        <article className="preview-card" key={approval.approvalId}>
-          <div className="item-head">
-            <div><h3>{approval.businessName}</h3><span>{approval.githubExport?.repository || approval.approvalId}</span></div>
-            <span className={`badge ${statusBadgeClass(approval.status)}`}>{approval.status}</span>
-          </div>
-          <iframe className="approval-preview" title={`Preview ${approval.businessName}`} srcDoc={approvalPreviews[approval.approvalId]} />
-        </article>
       ))}
     </div>
   );
@@ -886,6 +854,8 @@ function PipelineResultCard({ result }) {
       <dl>
         <div><dt>Approval</dt><dd>{result.approvalStatus || "N/A"} {result.pendingApprovalId ? `| ${result.pendingApprovalId}` : ""}</dd></div>
         <div><dt>Generation</dt><dd>{result.siteContent?.stylingLibraries?.join(", ") || "Gemini freeform with enforced libraries"}</dd></div>
+        {result.githubExport?.repository && <div><dt>GitHub repo</dt><dd>{result.githubExport.repository}</dd></div>}
+        {result.githubExport?.commitSha && <div><dt>Commit</dt><dd>{result.githubExport.commitSha}</dd></div>}
       </dl>
       {result.stepHistory?.length > 0 && <StepList steps={result.stepHistory} />}
       {result.errors?.length > 0 && <div className="alert alert-danger">{result.errors.join(" ")}</div>}
@@ -913,6 +883,14 @@ function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRet
         <button className="btn btn-outline-primary btn-sm" type="button" onClick={onRegenerate} disabled={busy}>Regenerate</button>
         <button className="btn btn-outline-danger btn-sm" type="button" onClick={onReject} disabled={busy || !["PENDING", "EXPORT_FAILED", "DEPLOY_FAILED"].includes(approval.status)}>Reject</button>
       </div>
+      {previewHtml && (
+        <div className="approval-inline-preview">
+          <div className="item-head">
+            <div><h4>Preview for {approval.businessName}</h4><span>{approval.githubExport?.repository || approval.approvalId}</span></div>
+          </div>
+          <iframe className="approval-preview" title={`Preview ${approval.businessName}`} srcDoc={previewHtml} />
+        </div>
+      )}
     </article>
   );
 }

@@ -113,6 +113,9 @@ Rules:
 - The page must include Bootstrap 5.3.8 and at least two additional styling libraries. Prefer Bootstrap 5.3.8, Tailwind browser CDN, and Animate.css when unsure.
 - Include a visible dynamic color/theme widget that lets visitors change site colors and persists selections with localStorage.
 - Include accessible semantic sections, mobile-first responsive layout, clear contact options, and grounded calls to action.
+- Include a prominent generated hero/banner image personalised to the business name, industry, location, and public lead context. Prefer an inline SVG or data URI so the page works as a single file; do not rely on stock-photo URLs.
+- Personalise the copy with concrete supplied details such as business name, category/industry, city/location, address, rating/review count, source listing, phone, email, service keywords, differentiators, and proof points when they are present. Avoid generic filler when a supplied detail is available.
+- CTA buttons must have working destinations: use mailto: for email leads, tel: for phone leads, the supplied website URL if present, or valid in-page anchors such as #services and #contact. Do not use empty hrefs, href="#", javascript:void(0), or non-functional buttons.
 - Do not include external tracking pixels, forms that submit data, or claims of consent.
 """.strip()
 
@@ -2471,6 +2474,100 @@ def compact_lead_with_groq(context: Dict[str, Any]) -> Dict[str, Any]:
     return brief
 
 
+def contact_cta_for_context(context: Dict[str, Any]) -> Tuple[str, str]:
+    email = normalize_email_identity(context.get("email"))
+    phone = compact_text(context.get("phone"))
+    website = normalize_url(context.get("website"))
+    if phone:
+        return f"tel:{phone}", "Call now"
+    if email:
+        return f"mailto:{email}", "Email us"
+    if website:
+        return website, "Visit website"
+    return "#contact", "Get in touch"
+
+
+def ensure_generated_hero_and_working_links(site_html: str, context: Dict[str, Any]) -> str:
+    html_value = site_html
+    lower_html = html_value.lower()
+    contact_href, contact_label = contact_cta_for_context(context)
+
+    if "<img" not in lower_html and "<svg" not in lower_html:
+        business_name = compact_text(context.get("businessName"), "Local Business")
+        industry = compact_text(context.get("industry"), "Local Service")
+        location = compact_text(context.get("location"), "South Africa")
+        hero_image = fallback_image_data_uri(
+            business_name,
+            "#0f9f96",
+            f"{industry} in {location}",
+            compact_text(context.get("address") or context.get("sourceLabel") or context.get("source"), "Generated for this business"),
+        )
+        hero_markup = f"""
+<section class="ai-generated-hero-image" aria-label="Generated business banner">
+  <div>
+    <span>{html.escape(industry)} in {html.escape(location)}</span>
+    <h2>{html.escape(business_name)}</h2>
+    <p>Generated visual based on the supplied public business details.</p>
+  </div>
+  <img src="{hero_image}" alt="Generated banner image for {html.escape(business_name)}">
+</section>
+"""
+        hero_css = """
+<style id="ai-generated-hero-image-style">
+  .ai-generated-hero-image {
+    display: grid;
+    grid-template-columns: minmax(0, 0.9fr) minmax(280px, 1.1fr);
+    gap: 1.5rem;
+    align-items: center;
+    width: min(1120px, calc(100% - 32px));
+    margin: 2rem auto;
+    padding: 1.25rem;
+    border-radius: 24px;
+    background: linear-gradient(135deg, rgba(15,159,150,0.12), rgba(37,99,235,0.10));
+    box-shadow: 0 20px 60px rgba(15, 23, 42, 0.12);
+  }
+  .ai-generated-hero-image span {
+    color: var(--ai-primary, #0f9f96);
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    font-size: 0.78rem;
+  }
+  .ai-generated-hero-image h2 {
+    margin: 0.45rem 0;
+    font-size: clamp(1.8rem, 4vw, 3.4rem);
+    font-weight: 900;
+  }
+  .ai-generated-hero-image img {
+    width: 100%;
+    border-radius: 18px;
+    display: block;
+  }
+  @media (max-width: 820px) {
+    .ai-generated-hero-image { grid-template-columns: 1fr; }
+  }
+</style>
+"""
+        html_value = inject_before_closing_tag(html_value, "head", hero_css)
+        html_value = re.sub(r"<body\b[^>]*>", lambda match: f"{match.group(0)}\n{hero_markup}", html_value, count=1, flags=re.IGNORECASE)
+        if hero_markup not in html_value:
+            html_value = inject_before_closing_tag(html_value, "body", hero_markup)
+
+    html_value = re.sub(
+        r'href=(["\'])(?:#|javascript:void\(0\)|javascript:;)?\1',
+        f'href="{html.escape(contact_href)}"',
+        html_value,
+        flags=re.IGNORECASE,
+    )
+    html_value = re.sub(
+        r"<button([^>]*)>\s*(get started|get in touch|contact|contact us|call now|email us)\s*</button>",
+        lambda match: f'<a{match.group(1)} href="{html.escape(contact_href)}">{html.escape(contact_label)}</a>',
+        html_value,
+        flags=re.IGNORECASE,
+    )
+    return html_value
+
+
 def generate_final_html_with_gemini(lead_brief: Dict[str, Any]) -> Dict[str, Any]:
     prompt = (
         f"{LANDING_PAGE_PROMPT_HEADER}\n\n"
@@ -2502,7 +2599,7 @@ def generate_final_html_with_gemini(lead_brief: Dict[str, Any]) -> Dict[str, Any
     site_html = result.get("html") or result.get("siteHtml") or result.get("finalHtml")
     if not site_html:
         raise RuntimeError("Gemini did not return an html field.")
-    final_html = ensure_required_site_features(str(site_html))
+    final_html = ensure_required_site_features(ensure_generated_hero_and_working_links(str(site_html), lead_brief))
     return {
         "html": final_html,
         "qaNotes": result.get("qaNotes") or "Gemini generated final HTML; backend enforced required assets and color widget.",
@@ -2549,48 +2646,99 @@ def generate_page_prompt_with_gemini(context: Dict[str, Any], template: Dict[str
     return result
 
 def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[str, Any]) -> str:
-    business_name = html.escape(compact_text(context.get("businessName"), "Local Business"))
-    industry = html.escape(compact_text(context.get("industry"), "Local Service"))
-    location = html.escape(compact_text(context.get("location"), "South Africa"))
+    business_name_raw = compact_text(context.get("businessName"), "Local Business")
+    industry_raw = compact_text(context.get("industry"), "Local Service")
+    location_raw = compact_text(context.get("location"), "South Africa")
+    address_raw = compact_text(context.get("address"))
+    rating_raw = compact_text(context.get("rating"))
+    reviews_raw = compact_text(context.get("reviewsCount"))
+    source_raw = compact_text(context.get("source") or context.get("sourceLabel"), "public business listing")
+    business_name = html.escape(business_name_raw)
+    industry = html.escape(industry_raw)
+    location = html.escape(location_raw)
+    address = html.escape(address_raw)
+    source = html.escape(source_raw)
+    summary_raw = compact_text(
+        context.get("summary"),
+        f"{business_name_raw} provides reliable {industry_raw.lower()} services for customers in {location_raw}."
+    )
     summary = html.escape(
         compact_text(
-            context.get("summary"),
-            f"{business_name} provides reliable {industry.lower()} services for local customers."
+            summary_raw,
+            f"{business_name_raw} provides reliable {industry_raw.lower()} services for customers in {location_raw}."
         )
     )
 
     email = compact_text(context.get("email"))
     phone = compact_text(context.get("phone"))
-    website = compact_text(context.get("website"))
+    website = normalize_url(context.get("website"))
+    source_url = normalize_url(context.get("sourceUrl"))
 
     accent = compact_text(template.get("accent"), "#00AEEF")
     background = compact_text(template.get("background"), "#F7FAFC")
 
     keywords = context.get("serviceKeywords")
     if not isinstance(keywords, list) or not keywords:
-        keywords = [industry]
+        keywords = [industry_raw]
+    clean_keywords = [compact_text(keyword, industry_raw) for keyword in keywords[:4]]
+    while len(clean_keywords) < 4:
+        clean_keywords.append(industry_raw)
+
+    differentiators = context.get("differentiators")
+    if not isinstance(differentiators, list):
+        differentiators = []
+    proof_points = context.get("proofPoints")
+    if not isinstance(proof_points, list):
+        proof_points = []
+
+    detail_bits = [industry_raw]
+    if address_raw:
+        detail_bits.append(address_raw)
+    else:
+        detail_bits.append(location_raw)
+    if rating_raw:
+        rating_label = f"{rating_raw} rating"
+        if reviews_raw:
+            rating_label += f" from {reviews_raw} reviews"
+        detail_bits.append(rating_label)
+    elif reviews_raw:
+        detail_bits.append(f"{reviews_raw} public reviews")
+
+    hero_image = fallback_image_data_uri(
+        business_name_raw,
+        accent,
+        f"{industry_raw} in {location_raw}",
+        " | ".join(detail_bits[:3]),
+    )
+
+    contact_target = "#contact"
+    contact_label = "Get in touch"
+    if phone:
+        contact_target = f"tel:{phone}"
+        contact_label = "Call now"
+    elif email:
+        contact_target = f"mailto:{email}"
+        contact_label = "Email us"
+    elif website:
+        contact_target = website
+        contact_label = "Visit website"
+
+    service_descriptions = [
+        f"{business_name_raw} presents {clean_keywords[0].lower()} information clearly for customers in {location_raw}.",
+        f"Contact options are surfaced up front so visitors can reach {business_name_raw} without hunting through the page.",
+        f"The page uses public listing context from {source_raw} to keep the message grounded and factual.",
+        f"Customers can quickly review the business focus, location, and available contact route before taking action.",
+    ]
+    if differentiators:
+        service_descriptions[1] = compact_text(differentiators[0], service_descriptions[1])
+    if proof_points:
+        service_descriptions[2] = compact_text(proof_points[0], service_descriptions[2])
 
     default_services = [
-        {
-            "title": f"{industry} Support",
-            "description": f"Reliable {industry.lower()} assistance for customers in {location}.",
-            "icon": "bi-stars",
-        },
-        {
-            "title": "Fast Response",
-            "description": "Clear communication and quick turnaround for customer requests.",
-            "icon": "bi-lightning-charge",
-        },
-        {
-            "title": "Trusted Service",
-            "description": "Professional service built around quality, care, and consistency.",
-            "icon": "bi-shield-check",
-        },
-        {
-            "title": "Local Expertise",
-            "description": f"Focused support for customers around {location}.",
-            "icon": "bi-geo-alt",
-        },
+        {"title": clean_keywords[0], "description": service_descriptions[0]},
+        {"title": clean_keywords[1], "description": service_descriptions[1]},
+        {"title": clean_keywords[2], "description": service_descriptions[2]},
+        {"title": clean_keywords[3], "description": service_descriptions[3]},
     ]
 
     services_html = ""
@@ -2612,9 +2760,24 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
         contact_buttons += f'<a class="btn btn-outline-light btn-lg rounded-pill px-4" href="mailto:{html.escape(email)}">Email us</a>'
     if website:
         contact_buttons += f'<a class="btn btn-outline-dark btn-lg rounded-pill px-4" href="{html.escape(website)}" target="_blank" rel="noreferrer">Visit website</a>'
+    if source_url:
+        contact_buttons += f'<a class="btn btn-outline-light btn-lg rounded-pill px-4" href="{html.escape(source_url)}" target="_blank" rel="noreferrer">View listing</a>'
 
     if not contact_buttons:
         contact_buttons = '<a class="btn btn-light btn-lg rounded-pill px-4" href="#contact">Get in touch</a>'
+
+    hero_cta_attrs = ' target="_blank" rel="noreferrer"' if contact_target.startswith("http") else ""
+    proof_chips = [
+        f"{industry_raw}",
+        address_raw or location_raw,
+        f"{rating_raw} rating" if rating_raw else source_raw,
+        f"{reviews_raw} reviews" if reviews_raw else "Public lead context",
+    ]
+    proof_chips_html = "".join(
+        f'<div class="floating-chip">{html.escape(compact_text(chip, "Business detail"))}</div>'
+        for chip in proof_chips
+        if compact_text(chip)
+    )
 
     site_html = f"""<!doctype html>
 <html lang="en">
@@ -2719,11 +2882,25 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
 
     .hero-card {{
       border-radius: 2rem;
-      padding: 2rem;
+      padding: 1rem;
       background: rgba(255,255,255,0.18);
       border: 1px solid rgba(255,255,255,0.35);
       box-shadow: 0 24px 70px rgba(16, 32, 51, 0.26);
       backdrop-filter: blur(16px);
+    }}
+
+    .hero-card img {{
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      object-fit: cover;
+      display: block;
+      border-radius: 1.35rem;
+      background: white;
+      box-shadow: 0 18px 48px rgba(16, 32, 51, 0.18);
+    }}
+
+    .hero-card-body {{
+      padding: 1.25rem;
     }}
 
     .floating-chip {{
@@ -2876,20 +3053,20 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
           <h1 class="hero-title hero-animate">{business_name}</h1>
           <p class="hero-text hero-animate">{summary}</p>
           <div class="hero-actions hero-animate">
-            <a href="#contact" class="btn btn-light btn-lg rounded-pill px-4 shadow">Get started</a>
+            <a href="{html.escape(contact_target)}" class="btn btn-light btn-lg rounded-pill px-4 shadow"{hero_cta_attrs}>{html.escape(contact_label)}</a>
             <a href="#services" class="btn btn-outline-light btn-lg rounded-pill px-4">View services</a>
           </div>
         </div>
 
         <div class="col-lg-5">
           <div class="hero-card hero-visual">
-            <p class="fw-bold mb-3">Serving {location}</p>
-            <div class="floating-chip">Fast response</div>
-            <div class="floating-chip">Modern service</div>
-            <div class="floating-chip">Local support</div>
-            <div class="floating-chip">Customer focused</div>
-            <hr class="border-light opacity-25 my-4">
-            <p class="mb-0">A polished digital landing page built to help customers understand services, trust the business, and make contact quickly.</p>
+            <img src="{hero_image}" alt="Generated banner image for {business_name}">
+            <div class="hero-card-body">
+              <p class="fw-bold mb-3">Serving {location}</p>
+              {proof_chips_html}
+              <hr class="border-light opacity-25 my-4">
+              <p class="mb-0">Generated for {business_name} from {source} details so customers can quickly understand the business and use the right contact route.</p>
+            </div>
           </div>
         </div>
       </div>
@@ -2902,7 +3079,7 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
         <div class="text-center mb-5">
           <span class="section-kicker">What we offer</span>
           <h2 class="section-title">Services designed for local customers</h2>
-          <p class="text-secondary mx-auto" style="max-width: 720px;">Clear, useful information presented in a modern format so visitors can quickly understand what {business_name} provides.</p>
+          <p class="text-secondary mx-auto" style="max-width: 720px;">Clear, useful information about {business_name}, its {industry.lower()} focus, and its presence in {location}.</p>
         </div>
 
         <div class="row g-4">
@@ -2941,8 +3118,8 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
                 <span class="section-kicker">About</span>
                 <h2 class="section-title">About {business_name}</h2>
                 <p class="about-text">{summary}</p>
-                <p class="about-text">This page highlights the business in a clean, mobile-friendly way using strong calls to action, organised service sections, and easy contact options.</p>
-                <a href="#contact" class="btn btn-primary btn-lg rounded-pill px-4">Contact the business</a>
+                <p class="about-text">This page uses the available public details{f' including {address}' if address_raw else ''} to give customers a fast, mobile-friendly way to understand and contact {business_name}.</p>
+                <a href="{html.escape(contact_target)}" class="btn btn-primary btn-lg rounded-pill px-4"{hero_cta_attrs}>{html.escape(contact_label)}</a>
               </div>
             </div>
           </div>
@@ -3320,16 +3497,34 @@ def generate_outreach_with_groq(context: Dict[str, Any], site_url: str) -> Dict[
     }
 
 
-def fallback_image_data_uri(label: str, accent: str) -> str:
+def fallback_image_data_uri(label: str, accent: str, subtitle: str = "", detail: str = "") -> str:
     safe_label = html.escape(compact_text(label, "Business"))
+    safe_subtitle = html.escape(compact_text(subtitle, "Local service"))
+    safe_detail = html.escape(compact_text(detail, "Customer focused"))
+    safe_accent = compact_text(accent, "#0f9f96")
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", safe_accent):
+        safe_accent = "#0f9f96"
     svg = (
         f"<svg xmlns='http://www.w3.org/2000/svg' width='1200' height='800' viewBox='0 0 1200 800'>"
-        f"<rect width='1200' height='800' fill='#f8fafc'/>"
-        f"<rect x='80' y='80' width='1040' height='640' rx='36' fill='{accent}' opacity='0.12'/>"
-        f"<circle cx='920' cy='230' r='150' fill='{accent}' opacity='0.18'/>"
-        f"<path d='M160 560 C320 430 460 630 650 490 C790 390 910 430 1040 300' "
-        f"fill='none' stroke='{accent}' stroke-width='28' stroke-linecap='round' opacity='0.52'/>"
-        f"<text x='120' y='190' font-family='Arial, sans-serif' font-size='54' font-weight='700' fill='#111827'>{safe_label}</text>"
+        f"<defs>"
+        f"<linearGradient id='bg' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='#ecfeff'/><stop offset='0.55' stop-color='#f8fafc'/><stop offset='1' stop-color='#eef2ff'/></linearGradient>"
+        f"<linearGradient id='accent' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='{safe_accent}'/><stop offset='1' stop-color='#1d9bf0'/></linearGradient>"
+        f"<filter id='shadow' x='-20%' y='-20%' width='140%' height='140%'><feDropShadow dx='0' dy='28' stdDeviation='26' flood-color='#0f172a' flood-opacity='0.18'/></filter>"
+        f"</defs>"
+        f"<rect width='1200' height='800' fill='url(#bg)'/>"
+        f"<circle cx='970' cy='170' r='210' fill='{safe_accent}' opacity='0.13'/>"
+        f"<circle cx='180' cy='650' r='250' fill='#1d9bf0' opacity='0.10'/>"
+        f"<rect x='88' y='96' width='1024' height='608' rx='42' fill='#ffffff' opacity='0.78' filter='url(#shadow)'/>"
+        f"<rect x='138' y='158' width='426' height='300' rx='30' fill='url(#accent)' opacity='0.95'/>"
+        f"<path d='M188 388 C275 302 357 426 438 326 C482 272 524 278 560 238' fill='none' stroke='white' stroke-width='24' stroke-linecap='round' opacity='0.74'/>"
+        f"<circle cx='256' cy='246' r='48' fill='white' opacity='0.85'/>"
+        f"<rect x='626' y='174' width='372' height='34' rx='17' fill='{safe_accent}' opacity='0.20'/>"
+        f"<rect x='626' y='250' width='436' height='26' rx='13' fill='#0f172a' opacity='0.10'/>"
+        f"<rect x='626' y='304' width='328' height='26' rx='13' fill='#0f172a' opacity='0.10'/>"
+        f"<rect x='626' y='544' width='192' height='58' rx='29' fill='url(#accent)'/>"
+        f"<text x='626' y='197' font-family='Arial, sans-serif' font-size='22' font-weight='800' fill='{safe_accent}'>{safe_subtitle}</text>"
+        f"<text x='626' y='408' font-family='Arial, sans-serif' font-size='54' font-weight='800' fill='#102033'>{safe_label}</text>"
+        f"<text x='626' y='472' font-family='Arial, sans-serif' font-size='28' font-weight='600' fill='#475467'>{safe_detail}</text>"
         f"</svg>"
     )
     encoded = base64.b64encode(svg.encode("utf-8")).decode("ascii")
@@ -3338,12 +3533,15 @@ def fallback_image_data_uri(label: str, accent: str) -> str:
 
 def generate_gemini_images(prompts: List[str], accent: str) -> List[str]:
     if os.getenv("ENABLE_GEMINI_IMAGES", "false").lower() != "true":
+        prompt_labels = [compact_text(prompt, f"Generated asset {index + 1}") for index, prompt in enumerate(prompts[:5])]
+        while len(prompt_labels) < 5:
+            prompt_labels.append(f"Generated asset {len(prompt_labels) + 1}")
         return [
-            fallback_image_data_uri("Hero image", accent),
-            fallback_image_data_uri("Service 1", accent),
-            fallback_image_data_uri("Service 2", accent),
-            fallback_image_data_uri("Service 3", accent),
-            fallback_image_data_uri("Service 4", accent),
+            fallback_image_data_uri(prompt_labels[0], accent, "Generated hero", "Business-specific visual"),
+            fallback_image_data_uri(prompt_labels[1], accent, "Service visual", "Practical support"),
+            fallback_image_data_uri(prompt_labels[2], accent, "Service visual", "Customer experience"),
+            fallback_image_data_uri(prompt_labels[3], accent, "Service visual", "Trust and quality"),
+            fallback_image_data_uri(prompt_labels[4], accent, "Service visual", "Contact and booking"),
         ]
 
     api_key = require_env("GEMINI_API_KEY")
@@ -3417,6 +3615,13 @@ def render_site_html(
     email = compact_text(context.get("email"))
     phone = compact_text(context.get("phone"))
     website = normalize_url(context.get("website"))
+    address = html.escape(compact_text(context.get("address")))
+    rating = compact_text(context.get("rating"))
+    reviews_count = compact_text(context.get("reviewsCount"))
+    source_label = html.escape(compact_text(context.get("source") or context.get("sourceLabel"), "public business listing"))
+    source_url = normalize_url(context.get("sourceUrl"))
+    if not images:
+        images = [fallback_image_data_uri(compact_text(context.get("businessName"), "Local Business"), accent, f"{industry} in {location}", "Generated hero visual")]
 
     services_html = []
     services = site_content.get("services") or []
@@ -3440,13 +3645,34 @@ def render_site_html(
         )
 
     contact_links = []
+    contact_target = "#contact"
+    contact_label = "Get in touch"
     if email:
         contact_links.append(f"<a href=\"mailto:{html.escape(email)}\">{html.escape(email)}</a>")
+        contact_target = f"mailto:{email}"
+        contact_label = "Email us"
     if phone:
         contact_links.append(f"<a href=\"tel:{html.escape(phone)}\">{html.escape(phone)}</a>")
+        contact_target = f"tel:{phone}"
+        contact_label = "Call now"
     if website:
         contact_links.append(f"<a href=\"{html.escape(website)}\" target=\"_blank\" rel=\"noreferrer\">Website</a>")
+        if contact_target == "#contact":
+            contact_target = website
+            contact_label = "Visit website"
+    if source_url:
+        contact_links.append(f"<a href=\"{html.escape(source_url)}\" target=\"_blank\" rel=\"noreferrer\">Source listing</a>")
     contact_html = " ".join(contact_links) or "<span>Contact details available on request</span>"
+    contact_attrs = ' target="_blank" rel="noreferrer"' if contact_target.startswith("http") else ""
+    fact_items = [industry, location]
+    if address:
+        fact_items.append(address)
+    if rating:
+        rating_text = html.escape(f"{rating} rating" + (f" ({reviews_count} reviews)" if reviews_count else ""))
+        fact_items.append(rating_text)
+    else:
+        fact_items.append(source_label)
+    facts_html = "".join(f'<div class="col-md-3 col-sm-6"><div class="fact">{fact}</div></div>' for fact in fact_items[:4])
 
     site_html = f"""<!doctype html>
 <html lang="en">
@@ -3700,7 +3926,7 @@ def render_site_html(
           <h1>{headline}</h1>
           <p class="hero-copy">{subheadline}</p>
           <div class="hero-actions">
-            <a class="btn-brand" href="#contact">{cta_label}</a>
+            <a class="btn-brand" href="{html.escape(contact_target)}"{contact_attrs}>{contact_label}</a>
             <a class="btn-ghost" href="#services">View services</a>
           </div>
         </div>
@@ -3716,8 +3942,8 @@ def render_site_html(
     <section id="services">
       <div class="container">
         <div class="section-head">
-          <h2>Services built around local customers</h2>
-          <p>{business_name} presents a practical, customer-focused service experience for people in {location}.</p>
+          <h2>Services built around {location}</h2>
+          <p>{business_name} presents {industry.lower()} information with clear next steps, using details from {source_label}.</p>
         </div>
         <div class="row g-4">
           {''.join(services_html)}
@@ -3730,15 +3956,13 @@ def render_site_html(
           <div class="col-lg-5">
             <div class="section-head mb-0">
               <h2>About {business_name}</h2>
-              <p>Clear information, local context, and a simple path for customers to reach out.</p>
+              <p>Clear information, local context, and a simple path for customers to reach out{f' from {address}' if address else ''}.</p>
             </div>
           </div>
           <div class="col-lg-7">
             <p class="lead">{about}</p>
             <div class="row g-3 mt-2">
-              <div class="col-md-4"><div class="fact">{industry}</div></div>
-              <div class="col-md-4"><div class="fact">{location}</div></div>
-              <div class="col-md-4"><div class="fact">Public business information</div></div>
+              {facts_html}
             </div>
           </div>
         </div>

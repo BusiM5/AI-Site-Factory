@@ -297,8 +297,8 @@ test("renders four-page Pipeline Workspace with merged sections", async () => {
     "Section 2: Selected Leads",
     "Section 3: Generate Landing Page",
     "Section 4: Approval & Preview",
-    "Section 5: Deployments",
   ].forEach((heading) => expect(screen.getByText(heading)).toBeInTheDocument());
+  expect(screen.queryByText("Section 5: Deployments")).not.toBeInTheDocument();
   expect(screen.queryByText("Section 5: Preview")).not.toBeInTheDocument();
   expect(screen.queryByText("Section 6: Deployment Action")).not.toBeInTheDocument();
   expect(screen.queryByText("All owners")).not.toBeInTheDocument();

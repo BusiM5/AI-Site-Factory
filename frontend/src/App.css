@@ -557,6 +557,21 @@ dd {
   border-top: 4px solid var(--orange);
 }
 
+.approval-inline-preview {
+  display: grid;
+  gap: 0.75rem;
+  margin-top: 0.4rem;
+  padding-top: 0.9rem;
+  border-top: 1px solid var(--line);
+}
+
+.approval-inline-preview h4 {
+  margin: 0;
+  color: var(--navy);
+  font-size: 1rem;
+  font-weight: 900;
+}
+
 .deployment-item {
   border-top: 4px solid var(--green);
 }
