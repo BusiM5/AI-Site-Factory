@@ -88,10 +88,17 @@ a:hover {
   min-height: 44px;
   display: flex;
   align-items: center;
+  gap: 0.65rem;
   padding: 0 0.9rem;
   border-radius: 8px;
   color: var(--navy-2);
   font-weight: 800;
+}
+
+.nav-icon {
+  width: 1.2rem;
+  display: inline-grid;
+  place-items: center;
 }
 
 .sidebar a:hover,
@@ -599,9 +606,104 @@ dd {
 .detail-stack,
 .queue-stack,
 .site-list,
-.preview-stack {
+.preview-stack,
+.operation-stack {
   display: grid;
   gap: 0.85rem;
+}
+
+.operation-filter-bar {
+  margin-bottom: 1rem;
+}
+
+.operation-group {
+  display: grid;
+  gap: 0.85rem;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: #ffffff;
+  box-shadow: 0 12px 32px rgba(7, 27, 51, 0.06);
+}
+
+.operation-group-head {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 0.85rem;
+  align-items: center;
+  width: 100%;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.operation-group-head h3 {
+  margin: 0;
+  color: var(--navy);
+  font-size: 1.05rem;
+  font-weight: 900;
+}
+
+.operation-group-head p {
+  margin: 0.15rem 0 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.operation-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 0.6rem;
+}
+
+.operation-stats div {
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+}
+
+.operation-stats strong,
+.operation-stats span {
+  display: block;
+}
+
+.operation-stats span {
+  color: var(--muted);
+  font-size: 0.78rem;
+}
+
+.operation-nested {
+  display: grid;
+  gap: 0.75rem;
+  padding-top: 0.8rem;
+  border-top: 1px solid var(--line);
+}
+
+.channel-chip {
+  display: inline-flex;
+  margin: 0.15rem 0.25rem 0.15rem 0;
+  padding: 0.25rem 0.5rem;
+  border-radius: 999px;
+  background: #eef9ff;
+  color: var(--navy);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.zendesk-field-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+  gap: 0.85rem;
+}
+
+.zendesk-field-grid label {
+  display: grid;
+  gap: 0.4rem;
+  color: var(--muted);
+  font-size: 0.84rem;
+  font-weight: 800;
 }
 
 .filter-bar {

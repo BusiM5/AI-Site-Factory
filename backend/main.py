@@ -481,6 +481,36 @@ class OutreachSendRequest(BaseModel):
     recipientEmail: EmailStr
 
 
+ZENDESK_FIELD_KEYS = [
+    "canonicalLeadKey",
+    "pipelineId",
+    "approvalId",
+    "batchId",
+    "contactChannel",
+    "leadStatus",
+    "deployRequested",
+    "emailSendRequested",
+    "phoneCallStatus",
+    "liveUrl",
+    "sourceUrl",
+]
+
+
+class ZendeskFieldSettingsRequest(BaseModel):
+    fields: Dict[str, Optional[str]] = Field(default_factory=dict)
+
+
+class ZendeskWebhookRequest(BaseModel):
+    action: str
+    approvalId: Optional[str] = None
+    canonicalLeadKey: Optional[str] = None
+    zendeskTicketId: Optional[int] = None
+    channel: Optional[str] = None
+    value: Optional[Any] = None
+    actor: Optional[str] = "Zendesk Webhook"
+    notes: Optional[str] = None
+
+
 class DiscoverLeadsRequest(BaseModel):
     presetId: str
     location: str = "South Africa"
@@ -1064,6 +1094,43 @@ def init_pipeline_db() -> None:
                 github_export_json TEXT,
                 errors_json TEXT
             );
+
+            CREATE TABLE IF NOT EXISTS zendesk_field_settings (
+                field_key TEXT PRIMARY KEY,
+                field_id TEXT,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS zendesk_ticket_links (
+                id TEXT PRIMARY KEY,
+                approval_id TEXT NOT NULL,
+                canonical_lead_key TEXT NOT NULL,
+                pipeline_id TEXT,
+                ticket_id INTEGER,
+                ticket_url TEXT,
+                channel TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                status TEXT,
+                tags_json TEXT,
+                payload_json TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                UNIQUE(approval_id, channel, stage)
+            );
+
+            CREATE TABLE IF NOT EXISTS zendesk_webhook_events (
+                id TEXT PRIMARY KEY,
+                approval_id TEXT,
+                canonical_lead_key TEXT,
+                ticket_id INTEGER,
+                channel TEXT,
+                action TEXT NOT NULL,
+                status TEXT NOT NULL,
+                message TEXT,
+                payload_json TEXT,
+                result_json TEXT,
+                created_at TEXT NOT NULL
+            );
             """
         )
         ensure_db_column(db, "approval_records", "publish_mode", "publish_mode TEXT DEFAULT 'github-netlify'")
@@ -1641,6 +1708,206 @@ def create_approval_record(
     return approval_id
 
 
+def get_zendesk_field_settings() -> Dict[str, Optional[str]]:
+    with get_pipeline_db() as db:
+        rows = db.execute("SELECT field_key, field_id FROM zendesk_field_settings").fetchall()
+    values = {key: None for key in ZENDESK_FIELD_KEYS}
+    for row in rows:
+        if row["field_key"] in values:
+            values[row["field_key"]] = row["field_id"]
+    return values
+
+
+def save_zendesk_field_settings(fields: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
+    timestamp = now_iso()
+    cleaned = {
+        key: compact_text(fields.get(key)) or None
+        for key in ZENDESK_FIELD_KEYS
+    }
+    with get_pipeline_db() as db:
+        for key, value in cleaned.items():
+            db.execute(
+                """
+                INSERT INTO zendesk_field_settings (field_key, field_id, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(field_key) DO UPDATE SET
+                    field_id = excluded.field_id,
+                    updated_at = excluded.updated_at
+                """,
+                (key, value, timestamp),
+            )
+    return get_zendesk_field_settings()
+
+
+def zendesk_custom_fields(values: Dict[str, Any]) -> List[Dict[str, Any]]:
+    settings = get_zendesk_field_settings()
+    fields: List[Dict[str, Any]] = []
+    for key, value in values.items():
+        field_id = compact_text(settings.get(key))
+        if not field_id or value in (None, ""):
+            continue
+        try:
+            parsed_id: Any = int(field_id)
+        except ValueError:
+            parsed_id = field_id
+        fields.append({"id": parsed_id, "value": value})
+    return fields
+
+
+def list_zendesk_ticket_links(approval_id: str) -> List[Dict[str, Any]]:
+    with get_pipeline_db() as db:
+        rows = db.execute(
+            """
+            SELECT *
+            FROM zendesk_ticket_links
+            WHERE approval_id = ?
+            ORDER BY created_at ASC
+            """,
+            (approval_id,),
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "approvalId": row["approval_id"],
+            "canonicalLeadKey": row["canonical_lead_key"],
+            "pipelineId": row["pipeline_id"],
+            "ticketId": row["ticket_id"],
+            "ticketUrl": row["ticket_url"],
+            "channel": row["channel"],
+            "stage": row["stage"],
+            "status": row["status"],
+            "tags": safe_json_loads(row["tags_json"], []),
+            "payload": safe_json_loads(row["payload_json"], {}),
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+        for row in rows
+    ]
+
+
+def get_zendesk_ticket_link(
+    approval_id: str,
+    channel: Optional[str] = None,
+    stage: str = "intake",
+    ticket_id: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    clauses = ["approval_id = ?"]
+    params: List[Any] = [approval_id]
+    if channel:
+        clauses.append("channel = ?")
+        params.append(channel)
+    if stage:
+        clauses.append("stage = ?")
+        params.append(stage)
+    if ticket_id:
+        clauses.append("ticket_id = ?")
+        params.append(ticket_id)
+    with get_pipeline_db() as db:
+        row = db.execute(
+            f"SELECT * FROM zendesk_ticket_links WHERE {' AND '.join(clauses)} ORDER BY created_at DESC LIMIT 1",
+            params,
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "id": row["id"],
+        "approvalId": row["approval_id"],
+        "canonicalLeadKey": row["canonical_lead_key"],
+        "pipelineId": row["pipeline_id"],
+        "ticketId": row["ticket_id"],
+        "ticketUrl": row["ticket_url"],
+        "channel": row["channel"],
+        "stage": row["stage"],
+        "status": row["status"],
+        "tags": safe_json_loads(row["tags_json"], []),
+        "payload": safe_json_loads(row["payload_json"], {}),
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def save_zendesk_ticket_link(
+    approval_id: str,
+    canonical_key: str,
+    pipeline_id: str,
+    channel: str,
+    stage: str,
+    ticket_id: Optional[int],
+    ticket_url: Optional[str],
+    status: str,
+    tags: List[str],
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    timestamp = now_iso()
+    link_id = str(uuid4())
+
+    with get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT INTO zendesk_ticket_links (
+                id, approval_id, canonical_lead_key, pipeline_id, ticket_id, ticket_url,
+                channel, stage, status, tags_json, payload_json, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(approval_id, channel, stage) DO UPDATE SET
+                ticket_id = COALESCE(excluded.ticket_id, zendesk_ticket_links.ticket_id),
+                ticket_url = COALESCE(excluded.ticket_url, zendesk_ticket_links.ticket_url),
+                status = excluded.status,
+                tags_json = excluded.tags_json,
+                payload_json = excluded.payload_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                link_id,
+                approval_id,
+                canonical_key,
+                pipeline_id,
+                ticket_id,
+                ticket_url,
+                channel,
+                stage,
+                status,
+                json.dumps(tags, default=str),
+                json.dumps(payload, default=str),
+                timestamp,
+                timestamp,
+            ),
+        )
+    return get_zendesk_ticket_link(approval_id, channel, stage) or {}
+
+
+def record_zendesk_webhook_event(
+    action: str,
+    status: str,
+    payload: Dict[str, Any],
+    result: Optional[Dict[str, Any]] = None,
+    message: Optional[str] = None,
+) -> None:
+    with get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT INTO zendesk_webhook_events (
+                id, approval_id, canonical_lead_key, ticket_id, channel, action,
+                status, message, payload_json, result_json, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid4()),
+                payload.get("approvalId"),
+                payload.get("canonicalLeadKey"),
+                payload.get("zendeskTicketId"),
+                payload.get("channel"),
+                action,
+                status,
+                sanitize_message(message or ""),
+                json.dumps(redact_value(payload), default=str),
+                json.dumps(redact_value(result or {}), default=str),
+                now_iso(),
+            ),
+        )
+
+
 def approval_row_to_dict(row: sqlite3.Row, include_html: bool = False) -> Dict[str, Any]:
     context = safe_json_loads(row["context_json"], {})
     for key in ["ownerName", "ownerEmail", "ownerStatus"]:
@@ -1670,6 +1937,7 @@ def approval_row_to_dict(row: sqlite3.Row, include_html: bool = False) -> Dict[s
         "deploymentMode": deployment_mode_label(publish_mode),
         "githubExport": safe_json_loads(row["github_export_json"], None),
         "zendesk": safe_json_loads(row["zendesk_json"], None),
+        "zendeskTickets": list_zendesk_ticket_links(row["id"]),
         "errors": safe_json_loads(row["errors_json"], []),
     }
     if include_html:
@@ -3257,17 +3525,46 @@ def ensure_required_site_features(site_html: str) -> str:
     widget_css = """
 <style id="ai-site-theme-widget-style">
   :root {
-    --ai-primary: #0f9f96;
-    --ai-secondary: #2563eb;
-    --ai-accent: #f59e0b;
+    --ai-text: #102033;
+    --ai-background: #f8fbff;
+    --ai-highlight: #0f9f96;
   }
-  body { accent-color: var(--ai-primary); }
-  a { color: var(--ai-primary); }
+  body {
+    color: var(--ai-text) !important;
+    background: var(--ai-background) !important;
+    accent-color: var(--ai-highlight);
+  }
+  main,
+  section,
+  .card,
+  .service-card,
+  .about-panel,
+  .contact-card {
+    color: var(--ai-text);
+  }
+  a,
+  .section-kicker,
+  .service-number {
+    color: var(--ai-highlight);
+  }
   .btn-primary,
   .btn-brand,
+  .badge,
+  .service-icon,
   button[type="submit"] {
-    background-color: var(--ai-primary) !important;
-    border-color: var(--ai-primary) !important;
+    background-color: var(--ai-highlight) !important;
+    border-color: var(--ai-highlight) !important;
+  }
+  .hero,
+  .about-gradient,
+  .cta-band,
+  .ai-generated-hero-image {
+    background-color: var(--ai-highlight);
+  }
+  .floating-chip,
+  .fact,
+  .stat-card {
+    border-color: var(--ai-highlight) !important;
   }
   .ai-site-theme-widget {
     position: fixed;
@@ -3322,34 +3619,37 @@ def ensure_required_site_features(site_html: str) -> str:
 <aside class="ai-site-theme-widget" data-ai-site-theme-widget aria-label="Site color controls">
   <strong>Site colors</strong>
   <div class="ai-site-theme-controls">
-    <label>Primary<input type="color" data-theme-color="primary" value="#0f9f96"></label>
-    <label>Accent<input type="color" data-theme-color="accent" value="#f59e0b"></label>
-    <label>Deep<input type="color" data-theme-color="secondary" value="#2563eb"></label>
+    <label>Text<input type="color" data-theme-color="text" value="#102033"></label>
+    <label>Background<input type="color" data-theme-color="background" value="#f8fbff"></label>
+    <label>Highlights<input type="color" data-theme-color="highlight" value="#0f9f96"></label>
   </div>
   <button class="ai-site-theme-reset" type="button" data-theme-reset>Reset colors</button>
 </aside>"""
     widget_js = """
 <script id="ai-site-theme-widget-script">
   window.addEventListener("DOMContentLoaded", function () {
-    var storageKey = "ai-site-factory-theme";
-    var defaults = { primary: "#0f9f96", secondary: "#2563eb", accent: "#f59e0b" };
+    var storageKey = "ai-site-factory-theme-v2";
+    var defaults = { text: "#102033", background: "#f8fbff", highlight: "#0f9f96" };
     var root = document.documentElement;
     function readTheme() {
       try { return Object.assign({}, defaults, JSON.parse(localStorage.getItem(storageKey) || "{}")); }
       catch (error) { return Object.assign({}, defaults); }
     }
     function applyTheme(theme) {
-      var primary = theme.primary || defaults.primary;
-      var secondary = theme.secondary || defaults.secondary;
-      var accent = theme.accent || defaults.accent;
-      root.style.setProperty("--ai-primary", primary);
-      root.style.setProperty("--ai-secondary", secondary);
-      root.style.setProperty("--ai-accent", accent);
-      root.style.setProperty("--primary", primary);
-      root.style.setProperty("--secondary", secondary);
-      root.style.setProperty("--accent", accent);
-      root.style.setProperty("--dark", secondary);
-      root.style.setProperty("--template-accent", accent);
+      var text = theme.text || defaults.text;
+      var background = theme.background || defaults.background;
+      var highlight = theme.highlight || defaults.highlight;
+      root.style.setProperty("--ai-text", text);
+      root.style.setProperty("--ai-background", background);
+      root.style.setProperty("--ai-highlight", highlight);
+      root.style.setProperty("--ink", text);
+      root.style.setProperty("--dark", text);
+      root.style.setProperty("--background", background);
+      root.style.setProperty("--template-bg", background);
+      root.style.setProperty("--primary", highlight);
+      root.style.setProperty("--secondary", highlight);
+      root.style.setProperty("--accent", highlight);
+      root.style.setProperty("--template-accent", highlight);
       document.querySelectorAll("[data-theme-color]").forEach(function (input) {
         input.value = theme[input.dataset.themeColor] || defaults[input.dataset.themeColor];
       });
@@ -3404,6 +3704,14 @@ def ensure_required_site_features(site_html: str) -> str:
             "script",
             "ai-site-theme-widget-script",
             widget_js,
+        )
+    if "data-ai-site-theme-widget" in lower_html:
+        html_value = re.sub(
+            r"<aside\b[^>]*data-ai-site-theme-widget[^>]*>.*?</aside>",
+            widget_html,
+            html_value,
+            count=1,
+            flags=re.IGNORECASE | re.DOTALL,
         )
 
     lower_html = html_value.lower()
@@ -5078,6 +5386,206 @@ def create_zendesk_outreach_ticket(
     return result
 
 
+def zendesk_channels_for_context(context: Dict[str, Any]) -> List[str]:
+    channels: List[str] = []
+    if normalize_email_identity(context.get("email")):
+        channels.append("email")
+    if compact_text(context.get("phone")):
+        channels.append("phone")
+    if not channels:
+        channels.append("unknown")
+    return channels
+
+
+def create_zendesk_intake_tickets(
+    approval_id: str,
+    context: Dict[str, Any],
+    pipeline_id: str,
+    batch_id: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    zendesk_subdomain = require_env("ZENDESK_SUBDOMAIN")
+    zendesk_email = require_env("ZENDESK_EMAIL")
+    zendesk_token = require_env("ZENDESK_API_TOKEN")
+    auth = (f"{zendesk_email}/token", zendesk_token)
+    base_url = f"https://{zendesk_subdomain}.zendesk.com/api/v2"
+    headers = {"Content-Type": "application/json"}
+    business_name = compact_text(context.get("businessName"), "AI Site Factory Lead")
+    canonical_key = compact_text(context.get("canonicalLeadKey"))
+    lead_email = normalize_email_identity(context.get("email"))
+    lead_phone = compact_text(context.get("phone"))
+    source_url = compact_text(context.get("sourceUrl"))
+    source_label = compact_text(context.get("source") or context.get("sourceLabel"), "public business listing")
+    industry = compact_text(context.get("industry") or context.get("category"), "Local service")
+    location = compact_text(context.get("location"), "South Africa")
+
+    channels = zendesk_channels_for_context(context)
+    created: List[Dict[str, Any]] = []
+
+    org_response = requests.post(
+        f"{base_url}/organizations.json",
+        json={
+            "organization": {
+                "name": business_name,
+                "notes": (
+                    f"AI Site Factory intake organization.\n"
+                    f"Pipeline ID: {pipeline_id}\n"
+                    f"Approval ID: {approval_id}\n"
+                    f"Industry: {industry}\n"
+                    f"Location: {location}"
+                ),
+                "tags": ["ai_site_factory", "ai_site_intake"],
+            }
+        },
+        auth=auth,
+        headers=headers,
+        timeout=30,
+    )
+    if org_response.status_code == 422:
+        search_response = requests.get(
+            f"{base_url}/organizations/search.json",
+            params={"name": business_name},
+            auth=auth,
+            headers=headers,
+            timeout=30,
+        )
+        search_response.raise_for_status()
+        organization = (search_response.json().get("organizations") or [{}])[0]
+    else:
+        org_response.raise_for_status()
+        organization = org_response.json().get("organization", {})
+    organization_id = organization.get("id")
+
+    user: Dict[str, Any] = {}
+    if lead_email:
+        user_search = requests.get(
+            f"{base_url}/users/search.json",
+            params={"query": lead_email},
+            auth=auth,
+            headers=headers,
+            timeout=30,
+        )
+        user_search.raise_for_status()
+        users = user_search.json().get("users", [])
+        if users:
+            user = users[0]
+        else:
+            user_create = requests.post(
+                f"{base_url}/users.json",
+                json={
+                    "user": {
+                        "name": business_name,
+                        "email": lead_email,
+                        "organization_id": organization_id,
+                        "role": "end-user",
+                        "tags": ["ai_site_factory", "ai_site_email_contact"],
+                    }
+                },
+                auth=auth,
+                headers=headers,
+                timeout=30,
+            )
+            user_create.raise_for_status()
+            user = user_create.json().get("user", {})
+
+    for channel in channels:
+        existing = get_zendesk_ticket_link(approval_id, channel, "intake")
+        if existing and existing.get("ticketId"):
+            created.append(existing)
+            continue
+
+        contact_value = lead_email if channel == "email" else lead_phone if channel == "phone" else "No contact found"
+        tags = [
+            "ai_site_factory",
+            "ai_site_intake",
+            f"ai_site_{channel}_lead",
+            "ai_site_generated_site",
+        ]
+        if channel == "email":
+            tags.extend(["ai_site_email_approval_needed", "ai_site_can_deploy"])
+        elif channel == "phone":
+            tags.extend(["ai_site_phone_dialer", "ai_site_call_needed"])
+        else:
+            tags.append("ai_site_contact_unknown")
+
+        custom_fields = zendesk_custom_fields(
+            {
+                "canonicalLeadKey": canonical_key,
+                "pipelineId": pipeline_id,
+                "approvalId": approval_id,
+                "batchId": batch_id,
+                "contactChannel": channel,
+                "leadStatus": "GENERATED",
+                "deployRequested": False,
+                "emailSendRequested": False,
+                "phoneCallStatus": "NEW" if channel == "phone" else None,
+                "sourceUrl": source_url,
+            }
+        )
+        ticket_payload: Dict[str, Any] = {
+            "ticket": {
+                "subject": f"AI Site Factory {channel.title()} Intake: {business_name}",
+                "comment": {
+                    "body": (
+                        f"AI Site Factory intake ticket\n\n"
+                        f"Business: {business_name}\n"
+                        f"Channel: {channel}\n"
+                        f"Contact: {contact_value}\n"
+                        f"Industry: {industry}\n"
+                        f"Location: {location}\n"
+                        f"Pipeline ID: {pipeline_id}\n"
+                        f"Approval ID: {approval_id}\n"
+                        f"Canonical Lead Key: {canonical_key}\n"
+                        f"Source: {source_label}{f' ({source_url})' if source_url else ''}\n\n"
+                        "Webhook actions available: deploy generated site, send approved email, or update phone call status."
+                    ),
+                    "public": False,
+                },
+                "organization_id": organization_id,
+                "priority": "normal",
+                "type": "task",
+                "status": "new",
+                "tags": tags,
+            }
+        }
+        if custom_fields:
+            ticket_payload["ticket"]["custom_fields"] = custom_fields
+        if channel == "email" and user.get("id"):
+            ticket_payload["ticket"]["requester_id"] = user.get("id")
+
+        response = requests.post(
+            f"{base_url}/tickets.json",
+            json=ticket_payload,
+            auth=auth,
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        ticket = response.json().get("ticket", {})
+        created.append(
+            save_zendesk_ticket_link(
+                approval_id=approval_id,
+                canonical_key=canonical_key,
+                pipeline_id=pipeline_id,
+                channel=channel,
+                stage="intake",
+                ticket_id=ticket.get("id"),
+                ticket_url=f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket.get('id')}",
+                status=ticket.get("status") or "new",
+                tags=tags,
+                payload={
+                    "organizationId": organization_id,
+                    "userId": user.get("id") if channel == "email" else None,
+                    "contact": contact_value,
+                    "customFields": custom_fields,
+                    "createdAt": now_iso(),
+                },
+            )
+        )
+
+    log_event("info", "provider.zendesk.intake_finish", "Zendesk intake tickets created.", approvalId=approval_id, ticketCount=len(created))
+    return created
+
+
 def resume_failed_outreach_approval(
     lead: DiscoveredLead,
     row: sqlite3.Row,
@@ -5789,6 +6297,31 @@ def run_pipeline(request: PipelineRunRequest):
                 template=template,
                 status="EXPORTING",
             )
+            try:
+                intake_tickets = run_step(
+                    "zendesk_intake_tickets",
+                    "zendesk",
+                    lambda: create_zendesk_intake_tickets(
+                        approval_id=approval_id,
+                        context=cleaned_context or groq_brief,
+                        pipeline_id=pipeline_id,
+                        batch_id=request.sourceBatchId,
+                    ),
+                    retryable=True,
+                )
+                site_content["zendeskIntakeTickets"] = intake_tickets
+                with get_pipeline_db() as db:
+                    db.execute(
+                        """
+                        UPDATE approval_records
+                        SET site_content_json = ?, updated_at = ?
+                        WHERE id = ?
+                        """,
+                        (json.dumps(site_content, default=str), now_iso(), approval_id),
+                    )
+            except Exception as intake_error:
+                pipeline_warnings.append(f"Zendesk intake ticket creation failed for {lead.businessName}: {sanitize_message(intake_error)}")
+                structured_errors.append(structured_pipeline_error("zendesk_intake_tickets", intake_error, provider="zendesk", retryable=True))
             if request.forceRegenerate:
                 supersede_pending_approvals(canonical_key, approval_id, "pipeline force regenerate")
 
@@ -6058,6 +6591,287 @@ def list_sites(
     }
 
 
+@app.get("/api/settings/zendesk-fields")
+def get_zendesk_fields():
+    return {"fields": get_zendesk_field_settings(), "keys": ZENDESK_FIELD_KEYS, "updatedAt": now_iso()}
+
+
+@app.put("/api/settings/zendesk-fields")
+def put_zendesk_fields(request: ZendeskFieldSettingsRequest):
+    return {"fields": save_zendesk_field_settings(request.fields), "keys": ZENDESK_FIELD_KEYS, "updatedAt": now_iso()}
+
+
+@app.get("/api/operations/groups")
+def list_operation_groups(page: int = 1, pageSize: int = 10, status: str = "all", channel: str = "all"):
+    safe_page = max(1, page)
+    safe_page_size = max(1, min(pageSize, 50))
+    status_filter = compact_text(status, "all").upper()
+    channel_filter = compact_text(channel, "all").lower()
+
+    with get_pipeline_db() as db:
+        run_rows = db.execute(
+            """
+            SELECT *
+            FROM pipeline_runs
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+        batch_rows = db.execute("SELECT * FROM discovery_batches").fetchall()
+        approval_rows = db.execute("SELECT * FROM approval_records ORDER BY created_at DESC").fetchall()
+
+    batches = {row["batch_id"]: row for row in batch_rows}
+    approvals_by_run: Dict[str, List[Dict[str, Any]]] = {}
+    for row in approval_rows:
+        item = approval_row_to_dict(row)
+        context = item.get("context") or {}
+        item["contactType"] = contact_type_from_context(context)
+        if status_filter != "ALL" and item.get("status") != status_filter:
+            continue
+        if channel_filter != "all" and item["contactType"] != channel_filter:
+            continue
+        approvals_by_run.setdefault(item["pipelineId"], []).append(item)
+
+    groups: List[Dict[str, Any]] = []
+    for run in run_rows:
+        approvals = approvals_by_run.get(run["pipeline_id"], [])
+        if (status_filter != "ALL" or channel_filter != "all") and not approvals:
+            continue
+        batch = batches.get(run["source_batch_id"])
+        ticket_count = sum(len(approval.get("zendeskTickets") or []) for approval in approvals)
+        email_count = sum(1 for approval in approvals if approval.get("contactType") == "email")
+        phone_count = sum(1 for approval in approvals if approval.get("contactType") == "phone")
+        live_count = sum(1 for approval in approvals if approval.get("status") == "APPROVED")
+        failed_count = sum(1 for approval in approvals if site_status_matches("failed", approval.get("status", "")))
+        deploy_requested = sum(
+            1
+            for approval in approvals
+            for ticket in approval.get("zendeskTickets") or []
+            if ticket.get("payload", {}).get("deployRequested")
+        )
+        groups.append(
+            {
+                "groupId": run["pipeline_id"],
+                "pipelineId": run["pipeline_id"],
+                "batchId": run["source_batch_id"],
+                "createdAt": run["created_at"],
+                "updatedAt": run["updated_at"],
+                "status": run["status"],
+                "query": batch["query"] if batch else None,
+                "location": batch["location"] if batch else None,
+                "leadCount": run["lead_count"],
+                "duplicatesSkipped": batch["duplicates_skipped"] if batch else 0,
+                "emailLeads": email_count,
+                "phoneLeads": phone_count,
+                "generated": len(approvals),
+                "zendeskPending": max(0, len(approvals) - ticket_count),
+                "deployApproved": deploy_requested,
+                "live": live_count,
+                "failed": failed_count,
+                "approvals": approvals,
+                "warnings": safe_json_loads(run["warnings_json"], []),
+            }
+        )
+
+    total = len(groups)
+    start = (safe_page - 1) * safe_page_size
+    end = start + safe_page_size
+    return {
+        "groups": groups[start:end],
+        "count": len(groups[start:end]),
+        "total": total,
+        "page": safe_page,
+        "pageSize": safe_page_size,
+        "totalPages": max(1, (total + safe_page_size - 1) // safe_page_size),
+    }
+
+
+def zendesk_auth_context() -> Tuple[str, Tuple[str, str]]:
+    zendesk_subdomain = require_env("ZENDESK_SUBDOMAIN")
+    zendesk_email = require_env("ZENDESK_EMAIL")
+    zendesk_token = require_env("ZENDESK_API_TOKEN")
+    return zendesk_subdomain, (f"{zendesk_email}/token", zendesk_token)
+
+
+def update_zendesk_ticket_comment(ticket_id: int, body: str, public: bool, extra_ticket_fields: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    zendesk_subdomain, auth = zendesk_auth_context()
+    payload = {"ticket": {"comment": {"body": body, "public": public}}}
+    if extra_ticket_fields:
+        payload["ticket"].update(extra_ticket_fields)
+    response = requests.put(
+        f"https://{zendesk_subdomain}.zendesk.com/api/v2/tickets/{ticket_id}.json",
+        json=payload,
+        auth=auth,
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json().get("ticket", {})
+
+
+def resolve_webhook_approval(request: ZendeskWebhookRequest) -> sqlite3.Row:
+    if request.approvalId:
+        return get_approval_or_404(request.approvalId)
+    if request.zendeskTicketId:
+        with get_pipeline_db() as db:
+            link = db.execute(
+                "SELECT approval_id FROM zendesk_ticket_links WHERE ticket_id = ? ORDER BY created_at DESC LIMIT 1",
+                (request.zendeskTicketId,),
+            ).fetchone()
+        if link:
+            return get_approval_or_404(link["approval_id"])
+    if request.canonicalLeadKey:
+        existing = latest_reusable_approval_for_lead(request.canonicalLeadKey)
+        if existing:
+            return existing
+    raise HTTPException(status_code=404, detail="Could not resolve approval for Zendesk webhook.")
+
+
+@app.post("/api/zendesk/webhook")
+def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
+    expected_secret = require_env("ZENDESK_WEBHOOK_SECRET")
+    provided_secret = (
+        http_request.headers.get("x-ai-site-factory-secret")
+        or http_request.headers.get("x-webhook-secret")
+        or http_request.headers.get("x-zendesk-webhook-secret")
+    )
+    payload = request.model_dump()
+    if provided_secret != expected_secret:
+        record_zendesk_webhook_event(request.action, "REJECTED", payload, message="Invalid webhook secret.")
+        raise HTTPException(status_code=401, detail="Invalid Zendesk webhook secret.")
+
+    action = compact_text(request.action).lower().replace("-", "_")
+    row = resolve_webhook_approval(request)
+    approval_id = row["id"]
+    context = safe_json_loads(row["context_json"], {})
+    channel = compact_text(request.channel, contact_type_from_context(context)).lower()
+    ticket_link = get_zendesk_ticket_link(approval_id, channel, "intake", request.zendeskTicketId)
+    ticket_id = request.zendeskTicketId or (ticket_link or {}).get("ticketId")
+    result: Dict[str, Any] = {"approvalId": approval_id, "action": action}
+    started = now_iso()
+
+    try:
+        if action in {"deploy", "deploy_site", "approve_deploy", "deploy_requested"}:
+            if row["status"] in {"PENDING", "DEPLOY_FAILED"}:
+                deploy_response = approve_generated_site(
+                    approval_id,
+                    ApprovalActionRequest(
+                        approvedBy=compact_text(request.actor, "Zendesk Webhook"),
+                        notes=request.notes or "Deployment approved from Zendesk webhook.",
+                    ),
+                )
+                result["deployment"] = deploy_response.model_dump()
+            else:
+                result["deployment"] = approval_row_to_dict(row)
+            if ticket_link:
+                payload_update = {**ticket_link.get("payload", {}), "deployRequested": True, "deployWebhookAt": now_iso()}
+                save_zendesk_ticket_link(
+                    approval_id,
+                    row["canonical_lead_key"],
+                    row["pipeline_id"],
+                    ticket_link["channel"],
+                    ticket_link["stage"],
+                    ticket_id,
+                    ticket_link.get("ticketUrl"),
+                    "deploy_requested",
+                    ticket_link.get("tags", []),
+                    payload_update,
+                )
+        elif action in {"send_email", "email_send", "send_approved_email", "email_send_requested"}:
+            if not ticket_id:
+                raise HTTPException(status_code=409, detail="No Zendesk ticket was found for email send.")
+            deployment = deployment_from_history(get_deployment_history_row(row["deployment_history_id"]))
+            site_url = (deployment or {}).get("url") or ""
+            outreach = safe_json_loads(row["outreach_json"], None) or generate_outreach_with_groq(context, site_url)
+            body = f"{outreach.get('body')}\n\n{request.notes or ''}".strip()
+            custom_fields = zendesk_custom_fields({"emailSendRequested": True, "leadStatus": "EMAIL_SENT", "liveUrl": site_url})
+            extra_fields: Dict[str, Any] = {"status": "open", "tags": ["ai_site_factory", "ai_site_email_sent", "ai_site_email_lead"]}
+            if custom_fields:
+                extra_fields["custom_fields"] = custom_fields
+            ticket = update_zendesk_ticket_comment(int(ticket_id), body, public=True, extra_ticket_fields=extra_fields)
+            with get_pipeline_db() as db:
+                db.execute(
+                    "UPDATE approval_records SET outreach_json = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(outreach, default=str), now_iso(), approval_id),
+                )
+            if ticket_link:
+                payload_update = {**ticket_link.get("payload", {}), "emailSendRequested": True, "emailSentAt": now_iso()}
+                save_zendesk_ticket_link(
+                    approval_id,
+                    row["canonical_lead_key"],
+                    row["pipeline_id"],
+                    ticket_link["channel"],
+                    ticket_link["stage"],
+                    ticket_id,
+                    ticket_link.get("ticketUrl"),
+                    ticket.get("status") or "open",
+                    list(set(ticket_link.get("tags", []) + ["ai_site_email_sent"])),
+                    payload_update,
+                )
+            result["email"] = {"ticketId": ticket_id, "status": ticket.get("status") or "open"}
+        elif action in {"phone_status", "update_phone_status", "call_status", "phone_call_status"}:
+            status_value = compact_text(request.value, request.notes or "UPDATED")
+            if ticket_id:
+                custom_fields = zendesk_custom_fields({"phoneCallStatus": status_value, "leadStatus": "PHONE_UPDATED"})
+                extra_fields = {"status": "open"}
+                if custom_fields:
+                    extra_fields["custom_fields"] = custom_fields
+                update_zendesk_ticket_comment(
+                    int(ticket_id),
+                    f"Phone/dialer status updated from AI Site Factory webhook: {status_value}",
+                    public=False,
+                    extra_ticket_fields=extra_fields,
+                )
+            if ticket_link:
+                payload_update = {**ticket_link.get("payload", {}), "phoneCallStatus": status_value, "phoneStatusUpdatedAt": now_iso()}
+                save_zendesk_ticket_link(
+                    approval_id,
+                    row["canonical_lead_key"],
+                    row["pipeline_id"],
+                    ticket_link["channel"],
+                    ticket_link["stage"],
+                    ticket_id,
+                    ticket_link.get("ticketUrl"),
+                    "phone_updated",
+                    list(set(ticket_link.get("tags", []) + ["ai_site_phone_updated"])),
+                    payload_update,
+                )
+            result["phone"] = {"ticketId": ticket_id, "status": status_value}
+        else:
+            raise HTTPException(status_code=400, detail=f"Unsupported Zendesk webhook action: {request.action}")
+
+        record_pipeline_step(
+            pipeline_id=row["pipeline_id"],
+            canonical_key=row["canonical_lead_key"],
+            step=f"zendesk_webhook_{action}",
+            status="COMPLETED",
+            provider="zendesk",
+            message=f"Zendesk webhook action {action} completed.",
+            started_at=started,
+            finished_at=now_iso(),
+            retryable=False,
+            details={"approvalId": approval_id, "ticketId": ticket_id, "channel": channel},
+        )
+        record_zendesk_webhook_event(action, "COMPLETED", payload, result)
+        return {"status": "COMPLETED", "result": result}
+    except HTTPException as error:
+        record_zendesk_webhook_event(action, "FAILED", payload, message=str(error.detail))
+        raise
+    except Exception as error:
+        record_pipeline_step(
+            pipeline_id=row["pipeline_id"],
+            canonical_key=row["canonical_lead_key"],
+            step=f"zendesk_webhook_{action}",
+            status="FAILED",
+            provider="zendesk",
+            message=str(error),
+            started_at=started,
+            finished_at=now_iso(),
+            retryable=True,
+            details={"approvalId": approval_id, "ticketId": ticket_id, "channel": channel},
+        )
+        record_zendesk_webhook_event(action, "FAILED", payload, message=str(error))
+        raise HTTPException(status_code=500, detail=f"Zendesk webhook failed: {sanitize_message(error)}")
+
+
 @app.post("/api/approvals/{approval_id}/retry-export", response_model=ApprovalActionResponse)
 def retry_github_export(approval_id: str, request: ApprovalActionRequest):
     row = get_approval_or_404(approval_id)
@@ -6229,7 +7043,13 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
     if not site_html:
         raise HTTPException(status_code=409, detail="Approval record does not contain generated HTML.")
     if not github_export or not github_export.get("repository") or not github_export.get("commitSha"):
-        raise HTTPException(status_code=409, detail="Approval does not have a successful GitHub export. Retry export before approving.")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Approval does not have a successful GitHub export with repository and commit SHA. "
+                "Retry Export before approving so Netlify can build from the generated GitHub repo."
+            ),
+        )
 
     def run_approval_step(step: str, provider: str, callback, retryable: bool = True):
         started = now_iso()
@@ -6265,20 +7085,50 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
         return result
 
     try:
-        deployment = run_approval_step(
-            "netlify_direct_deploy",
-            "netlify",
-            lambda: deploy_direct_netlify_for_lead(
-                canonical_key=row["canonical_lead_key"],
-                business_name=row["business_name"],
-                site_html=site_html,
-                pipeline_id=row["pipeline_id"],
-                approval_id=approval_id,
-                approved_by=approved_by,
-                github_export=github_export,
-            ),
-        )
-        effective_publish_mode = deployment.get("publishMode", "direct-netlify")
+        if publish_mode == "direct-netlify":
+            deployment = run_approval_step(
+                "netlify_direct_deploy",
+                "netlify",
+                lambda: deploy_direct_netlify_for_lead(
+                    canonical_key=row["canonical_lead_key"],
+                    business_name=row["business_name"],
+                    site_html=site_html,
+                    pipeline_id=row["pipeline_id"],
+                    approval_id=approval_id,
+                    approved_by=approved_by,
+                    github_export=github_export,
+                ),
+            )
+        elif publish_mode == "direct-netlify-fallback":
+            deployment = run_approval_step(
+                "netlify_direct_fallback_deploy",
+                "netlify",
+                lambda: deploy_direct_netlify_fallback_for_lead(
+                    canonical_key=row["canonical_lead_key"],
+                    business_name=row["business_name"],
+                    site_html=site_html,
+                    pipeline_id=row["pipeline_id"],
+                    approval_id=approval_id,
+                    approved_by=approved_by,
+                    github_export=github_export,
+                    git_error=RuntimeError("Direct Netlify fallback explicitly requested by operator."),
+                ),
+            )
+        else:
+            deployment = run_approval_step(
+                "netlify_git_deploy",
+                "netlify",
+                lambda: deploy_github_repo_to_netlify_for_lead(
+                    canonical_key=row["canonical_lead_key"],
+                    business_name=row["business_name"],
+                    pipeline_id=row["pipeline_id"],
+                    approval_id=approval_id,
+                    approved_by=approved_by,
+                    github_export=github_export,
+                    regenerate_existing_site=request.regenerateExistingSite,
+                ),
+            )
+        effective_publish_mode = deployment.get("publishMode", publish_mode)
         deployment_history = deployment_history_row_to_dict(get_deployment_history_row(deployment.get("deploymentHistoryId")))
     except Exception as error:
         status = "DEPLOY_FAILED"
@@ -6327,6 +7177,13 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
         errors.append(structured_pipeline_error("zendesk_ticket", error, provider="zendesk", retryable=True))
         log_event("error", "approval.zendesk.failed", "Zendesk failed after approved deployment.", approvalId=approval_id, reason=str(error))
 
+    clear_pending_html = bool(
+        deployment
+        and deployment.get("state") == "ready"
+        and github_export
+        and deployment.get("deploymentHistoryId")
+    )
+
     with get_pipeline_db() as db:
         db.execute(
             """
@@ -6341,7 +7198,7 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
                 now_iso(),
                 approved_by,
                 request.notes,
-                None if deployment and deployment.get("state") == "ready" else site_html,
+                None if clear_pending_html else site_html,
                 deployment.get("deploymentHistoryId") if deployment else None,
                 json.dumps(outreach, default=str) if outreach else None,
                 json.dumps(zendesk, default=str) if zendesk else None,

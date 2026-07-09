@@ -16,5 +16,8 @@ __pycache__/
 *.log
 .dev-ports.json
 
+backend/data/*.db
+generated-sites/
+
 dist/
 build/

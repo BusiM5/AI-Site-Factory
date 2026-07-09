@@ -81,8 +81,12 @@ def test_existing_theme_widget_is_upgraded_to_control_site_variables():
 
     assert upgraded.count('id="ai-site-theme-widget-style"') == 1
     assert upgraded.count('id="ai-site-theme-widget-script"') == 1
-    assert 'root.style.setProperty("--primary", primary)' in upgraded
-    assert 'root.style.setProperty("--dark", secondary)' in upgraded
+    assert 'data-theme-color="text"' in upgraded
+    assert 'data-theme-color="background"' in upgraded
+    assert 'data-theme-color="highlight"' in upgraded
+    assert 'root.style.setProperty("--ai-text", text)' in upgraded
+    assert 'root.style.setProperty("--ai-background", background)' in upgraded
+    assert 'root.style.setProperty("--ai-highlight", highlight)' in upgraded
 
 
 @pytest.fixture(autouse=True)
@@ -451,7 +455,7 @@ def test_pipeline_skips_duplicate_selected_leads(monkeypatch):
 
 def test_approval_deploys_from_github_and_clears_successful_html(monkeypatch):
     stub_generation(monkeypatch)
-    monkeypatch.setattr(main, "deploy_direct_netlify_for_lead", fake_direct_deploy_with_history)
+    monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", fake_git_deploy_with_history)
     monkeypatch.setattr(main, "generate_outreach_with_groq", lambda context, site_url: {"subject": "Preview", "body": f"See {site_url}"})
     monkeypatch.setattr(
         main,
@@ -467,7 +471,7 @@ def test_approval_deploys_from_github_and_clears_successful_html(monkeypatch):
     assert approved["deployment"]["url"] == "https://alpha.netlify.app"
     assert approved["deployment"]["githubRepoUrl"].startswith("https://github.com/")
     assert approved["deployment"]["buildId"]
-    assert approved["publishMode"] == "direct-netlify"
+    assert approved["publishMode"] == "github-netlify"
     assert approved["zendesk"]["ticketId"] == 123
 
     detail = client.get(f"/api/approvals/{approval_id}?includeHtml=true").json()
@@ -476,7 +480,7 @@ def test_approval_deploys_from_github_and_clears_successful_html(monkeypatch):
 
     steps = client.get(f"/api/pipeline/runs/{pipeline['pipelineId']}").json()["steps"]
     step_names = [step["step"] for step in steps]
-    assert step_names.index("github_export") < step_names.index("netlify_direct_deploy")
+    assert step_names.index("github_export") < step_names.index("netlify_git_deploy")
 
 
 def test_failed_github_netlify_deployment_keeps_generated_html(monkeypatch):
@@ -485,10 +489,7 @@ def test_failed_github_netlify_deployment_keeps_generated_html(monkeypatch):
     def failed_deploy(*args, **kwargs):
         raise RuntimeError("netlify build failed")
 
-    def failed_fallback(*args, **kwargs):
-        raise RuntimeError("direct fallback failed")
-
-    monkeypatch.setattr(main, "deploy_direct_netlify_for_lead", failed_deploy)
+    monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", failed_deploy)
     pipeline = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead_payload()]}).json()
     approval_id = pipeline["results"][0]["pendingApprovalId"]
 
@@ -501,7 +502,7 @@ def test_failed_github_netlify_deployment_keeps_generated_html(monkeypatch):
     assert detail["previewAvailable"] is True
     assert detail["errors"][0]["retryable"] is True
 
-    monkeypatch.setattr(main, "deploy_direct_netlify_for_lead", fake_direct_deploy_with_history)
+    monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", fake_git_deploy_with_history)
     monkeypatch.setattr(main, "generate_outreach_with_groq", lambda context, site_url: {"subject": "Preview", "body": f"See {site_url}"})
     monkeypatch.setattr(main, "create_zendesk_outreach_ticket", lambda *args, **kwargs: {"syncStatus": "TICKET_CREATED", "ticketId": 123})
 
@@ -511,96 +512,61 @@ def test_failed_github_netlify_deployment_keeps_generated_html(monkeypatch):
     assert retry.json()["status"] == "APPROVED"
 
 
-def test_approval_falls_back_to_direct_netlify_deploy_when_git_clone_fails(monkeypatch):
+def test_approval_requires_successful_github_export_before_deploy():
+    approval_id = main.create_approval_record(
+        pipeline_id="pipeline-no-export",
+        canonical_key="canonical-no-export",
+        lead_key="lead-no-export",
+        business_name="No Export Plumbing",
+        site_html="<!doctype html><html><body>No Export</body></html>",
+        context={"businessName": "No Export Plumbing"},
+        site_content={"finalHtmlChecksum": "checksum"},
+        template={"id": "default-service"},
+    )
+
+    response = client.post(f"/api/approvals/{approval_id}/approve", json={"approvedBy": "Ops"})
+
+    assert response.status_code == 409
+    assert "Retry Export" in response.json()["detail"]
+
+
+def test_approval_does_not_auto_fallback_to_direct_netlify_when_git_deploy_fails(monkeypatch):
     stub_generation(monkeypatch)
 
     def failed_git_deploy(*args, **kwargs):
         raise RuntimeError("Host key verification failed / Could not read from remote repository")
 
-    def direct_fallback(
-        canonical_key,
-        business_name,
-        site_html,
-        pipeline_id,
-        approval_id,
-        approved_by,
-        github_export,
-        git_error,
-    ):
-        history_id = f"fallback-{canonical_key}"
-        result = {
-            "deployAction": "DIRECT_FALLBACK_CREATED",
-            "siteCreated": True,
-            "siteReused": False,
-            "siteId": f"site-{canonical_key}",
-            "siteName": "ai-site-alpha",
-            "buildId": None,
-            "deployId": f"deploy-{canonical_key}",
-            "state": "ready",
-            "url": "https://alpha-fallback.netlify.app",
-            "deploymentHistoryId": history_id,
-            "publishMode": "direct-netlify-fallback",
-            "deploymentMode": "Direct Netlify fallback",
-            "githubExport": github_export,
-            "githubRepoUrl": github_export["repoUrl"],
-            "githubRepoFullName": github_export["repository"],
-            "commitSha": github_export["commitSha"],
-            "fallbackReason": main.sanitize_message(git_error),
-        }
-        with main.get_pipeline_db() as db:
-            db.execute(
-                """
-                INSERT INTO deployment_history (
-                    id, canonical_lead_key, pipeline_id, approval_id, site_id, site_name,
-                    deploy_id, build_id, url, deploy_action, state, html_checksum, deployed_at,
-                    approved_by, approval_status, github_repo_full_name, github_repo_url,
-                    commit_sha, publish_mode, github_export_json, raw_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    history_id,
-                    canonical_key,
-                    pipeline_id,
-                    approval_id,
-                    result["siteId"],
-                    result["siteName"],
-                    result["deployId"],
-                    None,
-                    result["url"],
-                    result["deployAction"],
-                    result["state"],
-                    main.html_checksum(site_html),
-                    main.now_iso(),
-                    approved_by,
-                    "APPROVED",
-                    github_export["repository"],
-                    github_export["repoUrl"],
-                    github_export["commitSha"],
-                    "direct-netlify-fallback",
-                    main.json.dumps(github_export, default=str),
-                    main.json.dumps(result, default=str),
-                ),
-            )
-        return result
-
     monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", failed_git_deploy)
-    monkeypatch.setattr(main, "deploy_direct_netlify_fallback_for_lead", direct_fallback)
-    monkeypatch.setattr(main, "generate_outreach_with_groq", lambda context, site_url: {"subject": "Preview", "body": f"See {site_url}"})
-    monkeypatch.setattr(main, "create_zendesk_outreach_ticket", lambda context, deployment, outreach, pipeline_id: {"syncStatus": "TICKET_CREATED", "ticketId": 456})
+    monkeypatch.setattr(
+        main,
+        "deploy_direct_netlify_fallback_for_lead",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("direct fallback must be explicitly requested")),
+    )
 
     pipeline = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead_payload()]}).json()
     approval_id = pipeline["results"][0]["pendingApprovalId"]
-    approved = client.post(f"/api/approvals/{approval_id}/approve", json={"approvedBy": "Ops"}).json()
+    response = client.post(f"/api/approvals/{approval_id}/approve", json={"approvedBy": "Ops"})
+
+    assert response.status_code == 502
+    detail = client.get(f"/api/approvals/{approval_id}").json()
+    assert detail["status"] == "DEPLOY_FAILED"
+    assert detail["publishMode"] == "github-netlify"
+    assert detail["deploymentHistory"] is None
+
+
+def test_direct_netlify_deploy_is_available_only_when_explicitly_requested(monkeypatch):
+    stub_generation(monkeypatch)
+    monkeypatch.setattr(main, "deploy_direct_netlify_for_lead", fake_direct_deploy_with_history)
+    monkeypatch.setattr(main, "generate_outreach_with_groq", lambda context, site_url: {"subject": "Preview", "body": f"See {site_url}"})
+    monkeypatch.setattr(main, "create_zendesk_outreach_ticket", lambda *args, **kwargs: {"syncStatus": "TICKET_CREATED", "ticketId": 456})
+
+    pipeline = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead_payload()]}).json()
+    approval_id = pipeline["results"][0]["pendingApprovalId"]
+    approved = client.post(f"/api/approvals/{approval_id}/approve", json={"approvedBy": "Ops", "publishMode": "direct-netlify"}).json()
 
     assert approved["status"] == "APPROVED"
     assert approved["publishMode"] == "direct-netlify"
     assert approved["deployment"]["deploymentMode"] == "Direct Netlify"
-    assert approved["deployment"]["githubRepoUrl"].startswith("https://github.com/")
-    assert approved["deployment"]["url"] == "https://alpha-fallback.netlify.app"
-    detail = client.get(f"/api/approvals/{approval_id}").json()
-    assert detail["publishMode"] == "direct-netlify"
-    assert detail["deploymentHistory"]["github_repo_url"].startswith("https://github.com/")
 
 
 def test_zendesk_phone_lead_ticket_is_private_tagged_and_has_no_fake_email(monkeypatch):
@@ -649,7 +615,7 @@ def test_zendesk_phone_lead_ticket_is_private_tagged_and_has_no_fake_email(monke
 
 def test_sites_endpoint_filters_by_live_email_leads(monkeypatch):
     stub_generation(monkeypatch)
-    monkeypatch.setattr(main, "deploy_direct_netlify_for_lead", fake_direct_deploy_with_history)
+    monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", fake_git_deploy_with_history)
     monkeypatch.setattr(main, "create_zendesk_outreach_ticket", lambda context, deployment, outreach, pipeline_id: {"syncStatus": "TICKET_CREATED", "ticketId": 123, "liveLink": deployment["url"], "contactType": "email", "tags": ["ai_site_email_lead"]})
 
     pipeline = client.post("/api/pipeline/run", json={"leads": [lead_payload()]}).json()
@@ -908,6 +874,175 @@ def test_no_owner_fields_in_responses(monkeypatch):
     assert "ownerEmail" not in approval["context"]
     summary = client.get("/api/reporting/summary").json()
     assert "ownerPerformance" not in summary
+
+
+def create_pending_approval_for_webhook():
+    approval_id = main.create_approval_record(
+        pipeline_id="pipeline-webhook",
+        canonical_key="canonical-webhook",
+        lead_key="lead-webhook",
+        business_name="Webhook Plumbing",
+        site_html="<!doctype html><html><body>Webhook Plumbing</body></html>",
+        context={
+            "canonicalLeadKey": "canonical-webhook",
+            "businessName": "Webhook Plumbing",
+            "industry": "Plumbing",
+            "location": "Durban",
+            "email": "owner@example.com",
+            "phone": "+27 31 000 0000",
+            "sourceUrl": "https://maps.example.com/webhook",
+        },
+        site_content={"finalHtmlChecksum": "checksum"},
+        template={"id": "default-service"},
+    )
+    with main.get_pipeline_db() as db:
+        db.execute(
+            "UPDATE approval_records SET status = ?, github_export_json = ? WHERE id = ?",
+            ("PENDING", main.json.dumps(fake_github_export("canonical-webhook", "Webhook Plumbing", "html"), default=str), approval_id),
+        )
+    return approval_id
+
+
+def test_zendesk_field_settings_roundtrip():
+    response = client.put(
+        "/api/settings/zendesk-fields",
+        json={"fields": {"canonicalLeadKey": "1001", "pipelineId": "1002", "unknown": "ignored"}},
+    )
+
+    assert response.status_code == 200
+    payload = client.get("/api/settings/zendesk-fields").json()
+    assert payload["fields"]["canonicalLeadKey"] == "1001"
+    assert payload["fields"]["pipelineId"] == "1002"
+    assert "unknown" not in payload["fields"]
+
+
+def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    main.save_zendesk_field_settings({"approvalId": "2001", "contactChannel": "2002"})
+    ticket_posts = []
+
+    def fake_post(url, json=None, auth=None, headers=None, timeout=None):
+        if url.endswith("/organizations.json"):
+            return FakeResponse(201, {"organization": {"id": 42}})
+        if url.endswith("/users.json"):
+            return FakeResponse(201, {"user": {"id": 77, "email": "alpha@example.com"}})
+        if url.endswith("/tickets.json"):
+            ticket_posts.append(json["ticket"])
+            return FakeResponse(201, {"ticket": {"id": 900 + len(ticket_posts), "status": "new"}})
+        raise AssertionError(url)
+
+    def fake_get(url, params=None, auth=None, headers=None, timeout=None):
+        if url.endswith("/users/search.json"):
+            return FakeResponse(200, {"users": []})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    context = {
+        "canonicalLeadKey": "canonical-intake",
+        "businessName": "Alpha Plumbing",
+        "industry": "Plumbing",
+        "location": "Durban",
+        "email": "alpha@example.com",
+        "phone": "+27 31 000 0000",
+        "sourceUrl": "https://maps.example.com/1",
+    }
+
+    first = main.create_zendesk_intake_tickets("approval-intake", context, "pipeline-intake", "batch-1")
+    second = main.create_zendesk_intake_tickets("approval-intake", context, "pipeline-intake", "batch-1")
+
+    assert len(first) == 2
+    assert len(second) == 2
+    assert len(ticket_posts) == 2
+    assert {ticket["tags"][2] for ticket in ticket_posts} == {"ai_site_email_lead", "ai_site_phone_lead"}
+    assert ticket_posts[0]["custom_fields"]
+
+
+def test_zendesk_webhook_rejects_invalid_secret(monkeypatch):
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "expected-secret")
+
+    response = client.post(
+        "/api/zendesk/webhook",
+        json={"action": "phone_status", "approvalId": "missing"},
+        headers={"x-ai-site-factory-secret": "wrong"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_zendesk_webhook_phone_status_updates_ticket_without_deploy(monkeypatch):
+    approval_id = create_pending_approval_for_webhook()
+    main.save_zendesk_ticket_link(approval_id, "canonical-webhook", "pipeline-webhook", "phone", "intake", 321, "https://zendesk.test/321", "new", ["ai_site_phone_lead"], {})
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    captured = {}
+
+    def fake_put(url, json=None, auth=None, timeout=None):
+        captured["url"] = url
+        captured["payload"] = json
+        return FakeResponse(200, {"ticket": {"id": 321, "status": "open"}})
+
+    monkeypatch.setattr(main.requests, "put", fake_put)
+
+    response = client.post(
+        "/api/zendesk/webhook",
+        json={"action": "phone_status", "approvalId": approval_id, "channel": "phone", "zendeskTicketId": 321, "value": "CALL_BACK"},
+        headers={"x-ai-site-factory-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert captured["payload"]["ticket"]["comment"]["public"] is False
+    assert "CALL_BACK" in captured["payload"]["ticket"]["comment"]["body"]
+
+
+def test_zendesk_webhook_email_adds_public_reply(monkeypatch):
+    approval_id = create_pending_approval_for_webhook()
+    main.save_zendesk_ticket_link(approval_id, "canonical-webhook", "pipeline-webhook", "email", "intake", 654, "https://zendesk.test/654", "new", ["ai_site_email_lead"], {})
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "secret")
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    monkeypatch.setattr(main, "generate_outreach_with_groq", lambda context, site_url: {"subject": "Preview", "body": "Public email body"})
+    captured = {}
+
+    def fake_put(url, json=None, auth=None, timeout=None):
+        captured["payload"] = json
+        return FakeResponse(200, {"ticket": {"id": 654, "status": "open"}})
+
+    monkeypatch.setattr(main.requests, "put", fake_put)
+
+    response = client.post(
+        "/api/zendesk/webhook",
+        json={"action": "send_email", "approvalId": approval_id, "channel": "email", "zendeskTicketId": 654},
+        headers={"x-zendesk-webhook-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert captured["payload"]["ticket"]["comment"]["public"] is True
+    assert "Public email body" in captured["payload"]["ticket"]["comment"]["body"]
+
+
+def test_zendesk_webhook_deploy_triggers_existing_approval_path(monkeypatch):
+    approval_id = create_pending_approval_for_webhook()
+    main.save_zendesk_ticket_link(approval_id, "canonical-webhook", "pipeline-webhook", "email", "intake", 777, "https://zendesk.test/777", "new", ["ai_site_email_lead"], {})
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "secret")
+    monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", fake_git_deploy_with_history)
+    monkeypatch.setattr(main, "generate_outreach_with_groq", lambda context, site_url: {"subject": "Preview", "body": "Preview body"})
+    monkeypatch.setattr(main, "create_zendesk_outreach_ticket", lambda context, deployment, outreach, pipeline_id: {"ticketId": 123, "syncStatus": "TICKET_CREATED"})
+
+    response = client.post(
+        "/api/zendesk/webhook",
+        json={"action": "deploy_site", "approvalId": approval_id, "channel": "email", "zendeskTicketId": 777},
+        headers={"x-zendesk-webhook-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"]["deployment"]["status"] == "APPROVED"
+    assert response.json()["result"]["deployment"]["publishMode"] == "github-netlify"
 
 
 def test_model_safe_value_chunks_large_text():

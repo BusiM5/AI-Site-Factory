@@ -20,6 +20,9 @@ This project is an end-to-end automation system that collects business data, cle
 ## Deployment
 - Netlify
 
+## Free POC deployment
+For the live proof-of-concept deployment checklist, strict GitHub -> Netlify artifact flow, Render backend setup, frontend env setup, and Zendesk webhook steps, see [docs/POC_DEPLOYMENT.md](docs/POC_DEPLOYMENT.md).
+
 ## Lead Pipeline API
 - `GET /api/presets` returns the five Google Maps business examples.
 - `GET /api/templates` returns the three landing-page templates.

@@ -142,9 +142,42 @@ const pipelineDetailPayload = {
   run: pipelineRunsPayload.runs[0],
   steps: [
     { step: "github_export", status: "COMPLETED", provider: "github", durationMs: 4 },
-    { step: "netlify_deploy", status: "COMPLETED", provider: "netlify", durationMs: 7 },
+    { step: "netlify_git_deploy", status: "COMPLETED", provider: "netlify", durationMs: 7 },
   ],
   approvals: [approval],
+};
+
+const operationsPayload = {
+  groups: [
+    {
+      groupId: "pipeline-1",
+      pipelineId: "pipeline-1",
+      batchId: "batch-1",
+      createdAt: new Date().toISOString(),
+      status: "PENDING_APPROVAL",
+      query: "Plumbing",
+      location: "KwaZulu-Natal, South Africa",
+      leadCount: 1,
+      duplicatesSkipped: 0,
+      emailLeads: 1,
+      phoneLeads: 0,
+      generated: 1,
+      zendeskPending: 0,
+      deployApproved: 0,
+      live: 0,
+      failed: 0,
+      approvals: [approval],
+    },
+  ],
+  page: 1,
+  pageSize: 10,
+  total: 1,
+  totalPages: 1,
+};
+
+const zendeskFieldsPayload = {
+  keys: ["canonicalLeadKey", "pipelineId", "approvalId", "batchId", "contactChannel", "leadStatus", "deployRequested", "emailSendRequested", "phoneCallStatus", "liveUrl", "sourceUrl"],
+  fields: { canonicalLeadKey: "1001", pipelineId: "1002" },
 };
 
 beforeEach(() => {
@@ -162,6 +195,8 @@ beforeEach(() => {
     if (url.includes("/api/deployments/history")) return response(deploymentsPayload);
     if (url.includes("/api/pipeline/runs/pipeline-1")) return response(pipelineDetailPayload);
     if (url.includes("/api/pipeline/runs")) return response(pipelineRunsPayload);
+    if (url.includes("/api/operations/groups")) return response(operationsPayload);
+    if (url.includes("/api/settings/zendesk-fields")) return response(zendeskFieldsPayload);
     return response({});
   });
 
@@ -170,8 +205,11 @@ beforeEach(() => {
     if (method === "get" && url.includes("/api/approvals/approval-export")) return response({ ...exportFailedApproval, pendingPreviewHtml: "<!doctype html><html><body>Beta Electrical</body></html>" });
     if (method === "get" && url.includes("/api/pipeline/runs/pipeline-1")) return response(pipelineDetailPayload);
     if (method === "get" && url.includes("/api/pipeline/runs")) return response(pipelineRunsPayload);
+    if (method === "get" && url.includes("/api/operations/groups")) return response(operationsPayload);
+    if (method === "get" && url.includes("/api/settings/zendesk-fields")) return response(zendeskFieldsPayload);
     if (method === "get" && url.includes("/api/presets")) return response(presetsPayload);
     if (method === "get" && url.includes("/api/templates")) return response(templatesPayload);
+    if (method === "put" && url.includes("/api/settings/zendesk-fields")) return response({ ...zendeskFieldsPayload, fields: data.fields });
 
     if (method === "post" && url.includes("/api/leads/discover")) {
       expect(data.limit).toBeGreaterThanOrEqual(1);
@@ -278,26 +316,27 @@ beforeEach(() => {
   });
 });
 
-test("renders four-page Pipeline Workspace with merged sections", async () => {
+test("renders Operations Hub with grouped queues and simplified navigation", async () => {
   render(<App />);
 
   expect(await screen.findByText("AI Site Factory")).toBeInTheDocument();
-  expect(screen.getByRole("link", { name: "Pipeline Workspace" })).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Operations Hub" })).toBeInTheDocument();
   expect(screen.getByRole("link", { name: "Deployments" })).toBeInTheDocument();
-  expect(screen.getByRole("link", { name: "Pipeline Runs" })).toBeInTheDocument();
-  expect(screen.getByRole("link", { name: "Admin/Backend" })).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Runs" })).toBeInTheDocument();
+  expect(screen.getByRole("link", { name: "Settings" })).toBeInTheDocument();
   expect(screen.queryByRole("link", { name: "Dashboard" })).not.toBeInTheDocument();
   expect(screen.queryByRole("link", { name: "Lead Discovery" })).not.toBeInTheDocument();
   expect(screen.queryByRole("link", { name: "Generate & Approval" })).not.toBeInTheDocument();
-  expect(screen.queryByRole("link", { name: "Settings" })).not.toBeInTheDocument();
   expect(screen.getByText("GitHub to Netlify")).toBeInTheDocument();
   expect(screen.getByText("Lead Pipeline Control Center")).toBeInTheDocument();
   [
-    "Section 1: Lead Discovery",
-    "Section 2: Selected Leads",
-    "Section 3: Generate Landing Page",
-    "Section 4: Approval & Preview",
+    "Operations Queue",
+    "Create New Batch",
+    "Selected Leads",
+    "Generate Landing Pages",
+    "Approval & Preview",
   ].forEach((heading) => expect(screen.getByText(heading)).toBeInTheDocument());
+  expect(screen.getByText(/Plumbing · KwaZulu-Natal/i)).toBeInTheDocument();
   expect(screen.queryByText("Section 5: Deployments")).not.toBeInTheDocument();
   expect(screen.queryByText("Section 5: Preview")).not.toBeInTheDocument();
   expect(screen.queryByText("Section 6: Deployment Action")).not.toBeInTheDocument();
@@ -309,7 +348,7 @@ test("renders four-page Pipeline Workspace with merged sections", async () => {
 test("discovers leads with selectable count and runs GitHub export pipeline", async () => {
   render(<App />);
 
-  fireEvent.click(await screen.findByRole("link", { name: "Pipeline Workspace" }));
+  fireEvent.click(await screen.findByRole("link", { name: "Operations Hub" }));
   fireEvent.change(screen.getByLabelText("Lead count"), { target: { value: "5" } });
   fireEvent.click(screen.getByText("Search Leads"));
 
@@ -328,10 +367,10 @@ test("discovers leads with selectable count and runs GitHub export pipeline", as
 test("previews and approves a GitHub-based Netlify deployment", async () => {
   render(<App />);
 
-  fireEvent.click(await screen.findByRole("link", { name: "Pipeline Workspace" }));
+  fireEvent.click(await screen.findByRole("link", { name: "Operations Hub" }));
   expect(await screen.findByText("approval-1")).toBeInTheDocument();
 
-  const queue = screen.getByText("Section 4: Approval & Preview").closest("section");
+  const queue = screen.getByText("Approval & Preview").closest("section");
   expect(within(queue).queryByText("Netlify URL")).not.toBeInTheDocument();
   expect(within(queue).queryByText("Deployment mode")).not.toBeInTheDocument();
   fireEvent.click(within(queue).getAllByText("Preview")[0]);
@@ -350,7 +389,7 @@ test("previews and approves a GitHub-based Netlify deployment", async () => {
 test("supports retry export, regenerate, and reject actions from approval queue", async () => {
   render(<App />);
 
-  fireEvent.click(await screen.findByRole("link", { name: "Pipeline Workspace" }));
+  fireEvent.click(await screen.findByRole("link", { name: "Operations Hub" }));
   expect(await screen.findByText("approval-export")).toBeInTheDocument();
 
   fireEvent.click(screen.getByText("Retry Export"));
@@ -374,15 +413,16 @@ test("shows deployments, pipeline run details, and merged backend admin settings
   expect(screen.getAllByText(/Git-linked deploy failed before fallback/i).length).toBeGreaterThan(0);
   expect(screen.getAllByText("View technical details").length).toBeGreaterThan(0);
 
-  fireEvent.click(await screen.findByRole("link", { name: "Pipeline Runs" }));
+  fireEvent.click(await screen.findByRole("link", { name: "Runs" }));
   fireEvent.click(await screen.findByText("pipeline-1"));
 
   expect(await screen.findByText("github_export")).toBeInTheDocument();
-  expect(screen.getByText("netlify_deploy")).toBeInTheDocument();
+  expect(screen.getByText("netlify_git_deploy")).toBeInTheDocument();
 
-  fireEvent.click(screen.getByRole("link", { name: "Admin/Backend" }));
+  fireEvent.click(screen.getByRole("link", { name: "Settings" }));
   expect(await screen.findByText("API Safety Center")).toBeInTheDocument();
   expect(screen.getByText("Workspace Settings")).toBeInTheDocument();
+  expect(screen.getByText("Zendesk Field Mapping")).toBeInTheDocument();
   expect(screen.getByText("Provider Diagnostics")).toBeInTheDocument();
   expect(screen.getByText("Model & API Usage")).toBeInTheDocument();
   expect(screen.getByLabelText("Max leads per search")).toHaveValue("3");

@@ -16,10 +16,10 @@ const FALLBACK_PRESETS = [
 ];
 
 const NAV_ITEMS = [
-  { path: "/pipeline", label: "Pipeline Workspace" },
-  { path: "/deployments", label: "Deployments" },
-  { path: "/pipeline-runs", label: "Pipeline Runs" },
-  { path: "/admin", label: "Admin/Backend" },
+  { path: "/pipeline", label: "Operations Hub", icon: "▦" },
+  { path: "/deployments", label: "Deployments", icon: "↗" },
+  { path: "/pipeline-runs", label: "Runs", icon: "⌁" },
+  { path: "/admin", label: "Settings", icon: "⚙" },
 ];
 
 function statusBadgeClass(status = "") {
@@ -154,6 +154,12 @@ function AppShell() {
   const [sites, setSites] = useState([]);
   const [siteMeta, setSiteMeta] = useState({ page: 1, pageSize: 8, total: 0, totalPages: 1 });
   const [siteFilters, setSiteFilters] = useState({ q: "", status: "all", contactType: "all", page: 1, pageSize: 8 });
+  const [operationGroups, setOperationGroups] = useState([]);
+  const [operationMeta, setOperationMeta] = useState({ page: 1, pageSize: 10, total: 0, totalPages: 1 });
+  const [operationFilters, setOperationFilters] = useState({ status: "all", channel: "all", page: 1, pageSize: 10 });
+  const [expandedGroups, setExpandedGroups] = useState({});
+  const [zendeskFields, setZendeskFields] = useState({});
+  const [zendeskFieldKeys, setZendeskFieldKeys] = useState([]);
   const [pipelineRuns, setPipelineRuns] = useState([]);
   const [selectedRunDetail, setSelectedRunDetail] = useState(null);
   const [debugStatus, setDebugStatus] = useState(null);
@@ -234,18 +240,35 @@ function AppShell() {
           pageSize: String(siteFilters.pageSize || 8),
           noWebsiteOnly: "true",
         });
-        const [summaryResponse, approvalsResponse, deploymentsResponse, runsResponse, sitesResponse] = await Promise.all([
+        const operationParams = new URLSearchParams({
+          status: operationFilters.status || "all",
+          channel: operationFilters.channel || "all",
+          page: String(operationFilters.page || 1),
+          pageSize: String(operationFilters.pageSize || 10),
+        });
+        const [summaryResponse, approvalsResponse, deploymentsResponse, runsResponse, sitesResponse, operationsResponse, zendeskFieldsResponse] = await Promise.all([
           axios.get(`${API_BASE}/api/reporting/summary`, { timeout: 15000 }),
           axios.get(`${API_BASE}/api/approvals?status=ALL&limit=80`, { timeout: 15000 }),
           axios.get(`${API_BASE}/api/deployments/history?limit=80`, { timeout: 15000 }),
           axios.get(`${API_BASE}/api/pipeline/runs?limit=40`, { timeout: 15000 }),
           axios.get(`${API_BASE}/api/sites?${siteParams.toString()}`, { timeout: 15000 }),
+          axios.get(`${API_BASE}/api/operations/groups?${operationParams.toString()}`, { timeout: 15000 }),
+          axios.get(`${API_BASE}/api/settings/zendesk-fields`, { timeout: 15000 }),
         ]);
         setReportingSummary(summaryResponse.data);
         setApprovals(approvalsResponse.data.approvals || []);
         setDeployments(deploymentsResponse.data.deployments || []);
         setPipelineRuns(runsResponse.data.runs || []);
         setSites(sitesResponse.data.sites || []);
+        setOperationGroups(operationsResponse.data.groups || []);
+        setOperationMeta({
+          page: operationsResponse.data.page || 1,
+          pageSize: operationsResponse.data.pageSize || 10,
+          total: operationsResponse.data.total || 0,
+          totalPages: operationsResponse.data.totalPages || 1,
+        });
+        setZendeskFields(zendeskFieldsResponse.data.fields || {});
+        setZendeskFieldKeys(zendeskFieldsResponse.data.keys || []);
         setSiteMeta({
           page: sitesResponse.data.page || 1,
           pageSize: sitesResponse.data.pageSize || 8,
@@ -260,7 +283,7 @@ function AppShell() {
         }
       }
     },
-    [addUiLog, formatApiError, siteFilters]
+    [addUiLog, formatApiError, siteFilters, operationFilters]
   );
 
   useEffect(() => {
@@ -469,6 +492,19 @@ function AppShell() {
     }
   };
 
+  const saveZendeskFields = async () => {
+    try {
+      const data = await callApi("Zendesk Field Settings API", "put", "/api/settings/zendesk-fields", { fields: zendeskFields }, { timeout: 15000 });
+      setZendeskFields(data.fields || {});
+      setZendeskFieldKeys(data.keys || zendeskFieldKeys);
+      setNotice("Zendesk field mapping saved.", "success");
+      refreshOperations(true);
+    } catch (error) {
+      const failure = formatApiError(error);
+      setNotice(failure.message || "Zendesk field mapping save failed.", "danger");
+    }
+  };
+
   const runManualFlow = async () => {
     try {
       setDebugBusy("manual-flow");
@@ -534,6 +570,16 @@ function AppShell() {
     siteMeta,
     siteFilters,
     setSiteFilters,
+    operationGroups,
+    operationMeta,
+    operationFilters,
+    setOperationFilters,
+    expandedGroups,
+    setExpandedGroups,
+    zendeskFields,
+    setZendeskFields,
+    zendeskFieldKeys,
+    saveZendeskFields,
     pipelineRuns,
     selectedRunDetail,
     debugStatus,
@@ -569,6 +615,7 @@ function AppShell() {
         <nav>
           {NAV_ITEMS.map((item) => (
             <NavLink key={item.path} to={item.path} className={({ isActive }) => (isActive ? "active" : "")}>
+              <span className="nav-icon" aria-hidden="true">{item.icon}</span>
               {item.label}
             </NavLink>
           ))}
@@ -642,6 +689,12 @@ function PipelineWorkspacePage(props) {
     siteMeta,
     siteFilters,
     setSiteFilters,
+    operationGroups,
+    operationMeta,
+    operationFilters,
+    setOperationFilters,
+    expandedGroups,
+    setExpandedGroups,
   } = props;
   const metrics = reportingSummary?.metrics || {};
   return (
@@ -649,13 +702,13 @@ function PipelineWorkspacePage(props) {
       <section className="workspace-hero entry-animate">
         <div>
           <span className="hero-kicker">Lead Pipeline Control Center</span>
-          <h2>Find leads, generate polished sites, approve deployment, and track every step.</h2>
-          <p>Work from top to bottom: search one location, choose your leads, generate a Bootstrap and GSAP landing page, review the GitHub export, then approve Netlify deployment.</p>
+          <h2>Operations Hub for batches, Zendesk queues, deployments, and follow-up.</h2>
+          <p>Work in grouped batches instead of long flat lists. Expand each run to review email leads, phone leads, Zendesk tickets, deployment state, and failed items.</p>
         </div>
         <MetricRail
           metrics={[
             ["Leads", metrics.leadsDiscovered || leads.length || 0],
-            ["Selected", selectedLeads.length],
+            ["Batches", operationMeta.total || pipelineResult?.pipelineId ? operationMeta.total || 1 : 0],
             ["Approvals", pendingApprovals.length],
             ["Sites", sites.length || metrics.noWebsiteSites || 0],
           ]}
@@ -663,7 +716,29 @@ function PipelineWorkspacePage(props) {
       </section>
 
       <Section
-        title="Section 1: Lead Discovery"
+        title="Operations Queue"
+        help="Pipeline runs are grouped for high-volume work. Expand a group to inspect its generated businesses, channel tickets, and statuses."
+        action={<button className="btn btn-outline-secondary" type="button" onClick={() => refreshOperations(false)}>Refresh</button>}
+      >
+        <OperationFilters filters={operationFilters} setFilters={setOperationFilters} />
+        <OperationGroupList
+          groups={operationGroups}
+          meta={operationMeta}
+          expandedGroups={expandedGroups}
+          setExpandedGroups={setExpandedGroups}
+          setOperationFilters={setOperationFilters}
+          approvalPreviews={approvalPreviews}
+          approvalBusy={approvalBusy}
+          previewApproval={previewApproval}
+          approveSite={approveSite}
+          retryExport={retryExport}
+          rejectSite={rejectSite}
+          regenerateSite={regenerateSite}
+        />
+      </Section>
+
+      <Section
+        title="Create New Batch"
         help="Choose a business type and city. The search uses the selected location only and reuses cached results unless force refresh is on."
         action={<button className="btn btn-primary" type="button" onClick={discoverLeads} disabled={discovering}>{discovering ? "Searching..." : "Search Leads"}</button>}
       >
@@ -691,7 +766,7 @@ function PipelineWorkspacePage(props) {
       </Section>
 
       <Section
-        title="Section 2: Selected Leads"
+        title="Selected Leads"
         help="Review discovered businesses and tick the leads you want to generate pages for."
         action={
           <div className="button-row">
@@ -708,7 +783,7 @@ function PipelineWorkspacePage(props) {
       </Section>
 
       <Section
-        title="Section 3: Generate Landing Page"
+        title="Generate Landing Pages"
         help="Groq compacts the public lead details, then Gemini creates a freeform landing page with enforced Bootstrap, extra styling libraries, and a color widget."
         action={<button className="btn btn-primary" type="button" onClick={runPipeline} disabled={running || !selectedLeads.length}>{running ? "Running..." : "Run Pipeline"}</button>}
       >
@@ -727,7 +802,7 @@ function PipelineWorkspacePage(props) {
       </Section>
 
       <Section
-        title="Section 4: Approval & Preview"
+        title="Approval & Preview"
         help="Review generated pages, open previews, approve or retry deployment, reject, or regenerate."
       >
         {approvals.length ? (
@@ -768,6 +843,88 @@ function MetricRail({ metrics }) {
       {metrics.map(([label, value]) => (
         <div className="metric-card" key={label}><span>{value}</span><label>{label}</label></div>
       ))}
+    </div>
+  );
+}
+
+function OperationFilters({ filters, setFilters }) {
+  const update = (patch) => setFilters((current) => ({ ...current, page: 1, ...patch }));
+  return (
+    <div className="filter-bar operation-filter-bar">
+      <label>Status<select className="form-select" value={filters.status} onChange={(event) => update({ status: event.target.value })}>
+        <option value="all">All</option>
+        <option value="PENDING">Pending</option>
+        <option value="APPROVED">Live</option>
+        <option value="EXPORT_FAILED">Export failed</option>
+        <option value="DEPLOY_FAILED">Deploy failed</option>
+      </select></label>
+      <label>Channel<select className="form-select" value={filters.channel} onChange={(event) => update({ channel: event.target.value })}>
+        <option value="all">All</option>
+        <option value="email">Email</option>
+        <option value="phone">Phone</option>
+        <option value="unknown">Unknown</option>
+      </select></label>
+    </div>
+  );
+}
+
+function OperationGroupList({ groups, meta, expandedGroups, setExpandedGroups, setOperationFilters, approvalPreviews, approvalBusy, previewApproval, approveSite, retryExport, rejectSite, regenerateSite }) {
+  if (!groups.length) return <EmptyState title="No operation groups" text="Run a batch to see grouped leads and Zendesk work here." />;
+  const toggle = (groupId) => setExpandedGroups((current) => ({ ...current, [groupId]: !current[groupId] }));
+  const goToPage = (page) => setOperationFilters((current) => ({ ...current, page }));
+  return (
+    <div className="operation-stack">
+      {groups.map((group) => (
+        <article className="operation-group" key={group.groupId}>
+          <button className="operation-group-head" type="button" onClick={() => toggle(group.groupId)}>
+            <span className={`badge ${statusBadgeClass(group.status)}`}>{group.status}</span>
+            <div>
+              <h3>{group.query || "Pipeline batch"} · {group.location || "No location"}</h3>
+              <p>{displayDate(group.createdAt)} · {group.pipelineId}</p>
+            </div>
+            <span>{expandedGroups[group.groupId] ? "Hide" : "Open"}</span>
+          </button>
+          <div className="operation-stats">
+            {[
+              ["Leads", group.leadCount],
+              ["Duplicates", group.duplicatesSkipped],
+              ["Email", group.emailLeads],
+              ["Phone", group.phoneLeads],
+              ["Generated", group.generated],
+              ["Zendesk pending", group.zendeskPending],
+              ["Deploy approved", group.deployApproved],
+              ["Live", group.live],
+              ["Failed", group.failed],
+            ].map(([label, value]) => <div key={label}><strong>{value || 0}</strong><span>{label}</span></div>)}
+          </div>
+          {expandedGroups[group.groupId] && (
+            <div className="operation-nested">
+              {(group.approvals || []).length ? (
+                group.approvals.map((approval) => (
+                  <ApprovalItem
+                    key={approval.approvalId}
+                    approval={approval}
+                    previewHtml={approvalPreviews[approval.approvalId]}
+                    busy={approvalBusy === approval.approvalId}
+                    onPreview={() => previewApproval(approval.approvalId)}
+                    onApprove={() => approveSite(approval.approvalId)}
+                    onRetry={() => retryExport(approval.approvalId)}
+                    onReject={() => rejectSite(approval.approvalId)}
+                    onRegenerate={() => regenerateSite(approval.approvalId)}
+                  />
+                ))
+              ) : (
+                <EmptyState title="No matching approvals in this group" />
+              )}
+            </div>
+          )}
+        </article>
+      ))}
+      <div className="pagination-row">
+        <button className="btn btn-outline-secondary btn-sm" type="button" disabled={meta.page <= 1} onClick={() => goToPage(meta.page - 1)}>Previous</button>
+        <span>Page {meta.page} of {meta.totalPages} | {meta.total} groups</span>
+        <button className="btn btn-outline-secondary btn-sm" type="button" disabled={meta.page >= meta.totalPages} onClick={() => goToPage(meta.page + 1)}>Next</button>
+      </div>
     </div>
   );
 }
@@ -864,7 +1021,9 @@ function PipelineResultCard({ result }) {
 }
 
 function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRetry, onReject, onRegenerate }) {
-  const canApprove = ["PENDING", "DEPLOY_FAILED"].includes(approval.status) && approval.githubExport?.repoUrl;
+  const hasSuccessfulGithubExport = Boolean(approval.githubExport?.repoUrl && approval.githubExport?.commitSha);
+  const needsGithubExport = ["PENDING", "DEPLOY_FAILED", "EXPORT_FAILED"].includes(approval.status) && !hasSuccessfulGithubExport;
+  const canApprove = ["PENDING", "DEPLOY_FAILED"].includes(approval.status) && hasSuccessfulGithubExport;
   return (
     <article className="approval-item">
       <div className="item-head">
@@ -874,11 +1033,15 @@ function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRet
       <dl>
         <div><dt>Contact</dt><dd>{approval.context?.email ? "Email lead" : approval.context?.phone ? "Phone lead" : "No contact yet"}</dd></div>
         <div><dt>Created</dt><dd>{displayDate(approval.createdAt)}</dd></div>
+        <div><dt>GitHub artifact</dt><dd>{approval.githubExport?.repoUrl ? <a href={approval.githubExport.repoUrl} target="_blank" rel="noreferrer">{approval.githubExport.repository || approval.githubExport.repoUrl}</a> : "Export required before deploy"}</dd></div>
+        <div><dt>Commit</dt><dd>{approval.githubExport?.commitSha || "No commit yet"}</dd></div>
+        <div><dt>Zendesk</dt><dd>{approval.zendeskTickets?.length ? approval.zendeskTickets.map((ticket) => <span className="channel-chip" key={ticket.id || `${ticket.channel}-${ticket.ticketId}`}>{ticket.channel}: #{ticket.ticketId || "pending"}</span>) : "No intake ticket yet"}</dd></div>
       </dl>
       {approval.status === "DEPLOY_FAILED" && <p className="text-danger mb-2">Deployment failed. Update the Netlify token if needed, then retry deployment.</p>}
+      {needsGithubExport && <p className="text-warning mb-2">GitHub export is required before Netlify can deploy this site. Retry export first.</p>}
       <div className="button-row">
         <button className="btn btn-outline-secondary btn-sm" type="button" onClick={onPreview} disabled={busy || !approval.previewAvailable}>{previewHtml ? "Hide Preview" : "Preview"}</button>
-        {approval.status === "EXPORT_FAILED" && <button className="btn btn-outline-primary btn-sm" type="button" onClick={onRetry} disabled={busy}>Retry Export</button>}
+        {needsGithubExport && <button className="btn btn-outline-primary btn-sm" type="button" onClick={onRetry} disabled={busy}>Retry Export</button>}
         <button className="btn btn-success btn-sm" type="button" onClick={onApprove} disabled={busy || !canApprove}>{busy ? "Working..." : approval.status === "DEPLOY_FAILED" ? "Retry Deploy" : "Approve"}</button>
         <button className="btn btn-outline-primary btn-sm" type="button" onClick={onRegenerate} disabled={busy}>Regenerate</button>
         <button className="btn btn-outline-danger btn-sm" type="button" onClick={onReject} disabled={busy || !["PENDING", "EXPORT_FAILED", "DEPLOY_FAILED"].includes(approval.status)}>Reject</button>
@@ -1010,7 +1173,7 @@ function StepList({ steps }) {
   );
 }
 
-function AdminPage({ debugStatus, backendLogs, uiLogs, apiProbe, debugBusy, runApiProbe, runManualFlow, manualFlow, refreshDiagnostics, leadCount, setLeadCount, forceRegenerate, setForceRegenerate, forceRefresh, setForceRefresh }) {
+function AdminPage({ debugStatus, backendLogs, uiLogs, apiProbe, debugBusy, runApiProbe, runManualFlow, manualFlow, refreshDiagnostics, leadCount, setLeadCount, forceRegenerate, setForceRegenerate, forceRefresh, setForceRefresh, zendeskFields, setZendeskFields, zendeskFieldKeys, saveZendeskFields }) {
   return (
     <div className="page-stack">
       <Section
@@ -1032,6 +1195,13 @@ function AdminPage({ debugStatus, backendLogs, uiLogs, apiProbe, debugBusy, runA
           <div className="stat-box"><strong>Off</strong><span>Gemini images</span></div>
         </div>
       </Section>
+      <Section
+        title="Zendesk Field Mapping"
+        help="Create these custom fields in Zendesk, then paste their numeric field IDs here so tickets and webhooks can exchange structured values."
+        action={<button className="btn btn-primary" type="button" onClick={saveZendeskFields}>Save Zendesk Fields</button>}
+      >
+        <ZendeskFieldSettings fields={zendeskFields} setFields={setZendeskFields} fieldKeys={zendeskFieldKeys} />
+      </Section>
       <Section title="Model & API Usage" help="The default flow saves usage by caching leads, reusing generated pages, and keeping Gemini image generation off unless enabled in backend environment.">
         <div className="priority-flow">
           {["Apify lead search", "Gemini prompt/final polish", "Groq draft fallback", "GitHub export", "Netlify Git build"].map((item, index) => (
@@ -1046,6 +1216,34 @@ function AdminPage({ debugStatus, backendLogs, uiLogs, apiProbe, debugBusy, runA
       <Section title="Live Logs" help="Recent UI actions and backend logs are shown side by side for quick diagnostics.">
         <LogColumns uiLogs={uiLogs} backendLogs={backendLogs} />
       </Section>
+    </div>
+  );
+}
+
+function ZendeskFieldSettings({ fields, setFields, fieldKeys }) {
+  const labels = {
+    canonicalLeadKey: "Canonical lead key",
+    pipelineId: "Pipeline ID",
+    approvalId: "Approval ID",
+    batchId: "Batch ID",
+    contactChannel: "Contact channel",
+    leadStatus: "Lead status",
+    deployRequested: "Deploy requested",
+    emailSendRequested: "Email send requested",
+    phoneCallStatus: "Phone call status",
+    liveUrl: "Live URL",
+    sourceUrl: "Source URL",
+  };
+  const keys = fieldKeys?.length ? fieldKeys : Object.keys(labels);
+  const update = (key, value) => setFields((current) => ({ ...current, [key]: value }));
+  return (
+    <div className="zendesk-field-grid">
+      {keys.map((key) => (
+        <label key={key}>
+          {labels[key] || key}
+          <input className="form-control" value={fields?.[key] || ""} onChange={(event) => update(key, event.target.value)} placeholder="Zendesk custom field ID" />
+        </label>
+      ))}
     </div>
   );
 }
