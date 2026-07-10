@@ -602,6 +602,85 @@ def test_zendesk_phone_lead_ticket_is_private_tagged_and_has_no_fake_email(monke
         "phone": "+27 31 000 0000",
         "source": "Google Maps",
     }
+
+
+def test_discovery_accepts_large_limit_and_returns_contactable_mixed_leads(monkeypatch):
+    items = [
+        {**apify_item(1, "Plumbing"), "email": "one@example.com"},
+        {**apify_item(2, "Plumbing"), "phone": None, "email": "two@example.com"},
+        {**apify_item(3, "Plumbing"), "email": None},
+        {**apify_item(4, "Plumbing"), "website": "https://has-site.example"},
+        {**apify_item(5, "Plumbing"), "phone": None, "email": None},
+    ]
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda query, limit, location: items)
+
+    result = client.post(
+        "/api/leads/discover",
+        json={"presetId": "plumbers", "location": "Durban, South Africa", "limit": 25, "forceRefresh": True},
+    )
+
+    assert result.status_code == 200
+    payload = result.json()
+    assert payload["requestedCount"] == 25
+    assert payload["rawFetched"] == 5
+    assert payload["eligibleReturned"] == 3
+    assert payload["websitesSkipped"] == 1
+    assert payload["noContactSkipped"] == 1
+    assert payload["emailLeads"] == 2
+    assert payload["phoneLeads"] == 2
+    assert payload["emailAndPhoneLeads"] == 1
+    assert [lead["businessName"] for lead in payload["leads"]] == [
+        "Lead Business 1",
+        "Lead Business 2",
+        "Lead Business 3",
+    ]
+
+
+def test_discovered_but_not_generated_lead_can_reappear(monkeypatch):
+    item = {**apify_item(11, "Plumbing"), "email": "repeat@example.com"}
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda query, limit, location: [item])
+
+    first = client.post(
+        "/api/leads/discover",
+        json={"presetId": "plumbers", "location": "Durban, South Africa", "limit": 5, "forceRefresh": True},
+    )
+    second = client.post(
+        "/api/leads/discover",
+        json={"presetId": "plumbers", "location": "Durban, South Africa", "limit": 5, "forceRefresh": True},
+    )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert first.json()["leads"][0]["businessName"] == "Lead Business 11"
+    assert second.json()["leads"][0]["businessName"] == "Lead Business 11"
+
+
+def test_already_generated_lead_is_skipped_in_discovery(monkeypatch):
+    item = {**apify_item(12, "Plumbing"), "email": "generated@example.com"}
+    lead = main.normalize_apify_items([item], "Plumbing", "Durban, South Africa", 1)[0]
+    canonical_key = main.canonical_lead_key_for_lead(lead)
+    main.create_approval_record(
+        pipeline_id="pipeline-generated",
+        canonical_key=canonical_key,
+        lead_key=lead.leadKey,
+        business_name=lead.businessName,
+        site_html="<!doctype html><html><body>Generated</body></html>",
+        context=lead.model_dump(),
+        site_content={},
+        template={},
+        status="PENDING",
+    )
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda query, limit, location: [item])
+
+    result = client.post(
+        "/api/leads/discover",
+        json={"presetId": "plumbers", "location": "Durban, South Africa", "limit": 5, "forceRefresh": True},
+    )
+
+    assert result.status_code == 200
+    payload = result.json()
+    assert payload["leads"] == []
+    assert payload["generatedDuplicatesSkipped"] == 1
     deployment = {"url": "https://alpha.netlify.app"}
     outreach = main.generate_outreach_with_groq(context, deployment["url"])
     result = main.create_zendesk_outreach_ticket(context, deployment, outreach, "pipeline-1")

@@ -162,6 +162,20 @@ const operationsPayload = {
       emailLeads: 1,
       phoneLeads: 0,
       generated: 1,
+      rawFetched: 6,
+      eligible: 1,
+      githubExported: 1,
+      zendeskTickets: 1,
+      chartSteps: [
+        { label: "Fetched", value: 6 },
+        { label: "Eligible", value: 1 },
+        { label: "Generated", value: 1 },
+        { label: "GitHub", value: 1 },
+        { label: "Zendesk", value: 1 },
+        { label: "Pending", value: 1 },
+        { label: "Live", value: 0 },
+        { label: "Failed", value: 0 },
+      ],
       zendeskPending: 0,
       deployApproved: 0,
       live: 0,
@@ -213,12 +227,21 @@ beforeEach(() => {
 
     if (method === "post" && url.includes("/api/leads/discover")) {
       expect(data.limit).toBeGreaterThanOrEqual(1);
-      expect(data.limit).toBeLessThanOrEqual(5);
+      expect(data.limit).toBeLessThanOrEqual(200);
       return response({
         batchId: "batch-1",
         cached: false,
         duplicatesSkipped: 0,
-        provinceStats: { "KwaZulu-Natal, South Africa": { selected: 1 } },
+        requestedCount: data.limit,
+        rawFetched: 6,
+        eligibleReturned: 1,
+        websitesSkipped: 2,
+        noContactSkipped: 1,
+        generatedDuplicatesSkipped: 0,
+        emailLeads: 1,
+        phoneLeads: 1,
+        emailAndPhoneLeads: 1,
+        provinceStats: { "KwaZulu-Natal, South Africa": { selected: 1, rawItems: 6, eligible: 1 } },
         leads: [
           {
             leadKey: "lead-1",
@@ -330,12 +353,14 @@ test("renders Operations Hub with grouped queues and simplified navigation", asy
   expect(screen.getByText("GitHub to Netlify")).toBeInTheDocument();
   expect(screen.getByText("Lead Pipeline Control Center")).toBeInTheDocument();
   [
-    "Operations Queue",
+    "Operations Flow Chart",
     "Create New Batch",
     "Selected Leads",
     "Generate Landing Pages",
     "Approval & Preview",
   ].forEach((heading) => expect(screen.getByText(heading)).toBeInTheDocument());
+  expect(screen.getByText("Fetched")).toBeInTheDocument();
+  expect(screen.getByText("GitHub")).toBeInTheDocument();
   expect(screen.getByText(/Plumbing · KwaZulu-Natal/i)).toBeInTheDocument();
   expect(screen.queryByText("Section 5: Deployments")).not.toBeInTheDocument();
   expect(screen.queryByText("Section 5: Preview")).not.toBeInTheDocument();
@@ -350,14 +375,12 @@ test("discovers leads with selectable count and runs GitHub export pipeline", as
 
   fireEvent.click(await screen.findByRole("link", { name: "Operations Hub" }));
   fireEvent.change(screen.getByLabelText("Lead count"), { target: { value: "5" } });
-  fireEvent.click(screen.getByText("Search Leads"));
+  fireEvent.click(screen.getByText("Search + Auto Generate"));
 
   expect(await screen.findByText("Alpha Plumbing")).toBeInTheDocument();
   expect(screen.getByText("LIVE")).toBeInTheDocument();
+  expect(await screen.findByText(/Pipeline finished with status PENDING_APPROVAL/i)).toBeInTheDocument();
   expect(screen.queryByText(/All provinces/i)).not.toBeInTheDocument();
-
-  fireEvent.click(screen.getByLabelText("Select Alpha Plumbing"));
-  fireEvent.click(screen.getByText("Run Pipeline"));
 
   expect(await screen.findByText("approval-1")).toBeInTheDocument();
   expect(screen.getAllByText("owner/ai-site-alpha-plumbing").length).toBeGreaterThan(0);
@@ -425,7 +448,7 @@ test("shows deployments, pipeline run details, and merged backend admin settings
   expect(screen.getByText("Zendesk Field Mapping")).toBeInTheDocument();
   expect(screen.getByText("Provider Diagnostics")).toBeInTheDocument();
   expect(screen.getByText("Model & API Usage")).toBeInTheDocument();
-  expect(screen.getByLabelText("Max leads per search")).toHaveValue("3");
+  expect(screen.getByLabelText("Max leads per search")).toHaveValue(5);
   expect(screen.getByText("Gemini images")).toBeInTheDocument();
   expect(screen.getByText("Off")).toBeInTheDocument();
   fireEvent.click(screen.getByText("Local Probe"));

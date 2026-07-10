@@ -551,6 +551,15 @@ class DiscoverLeadsResponse(BaseModel):
     warnings: List[str]
     provinceStats: Dict[str, Any] = Field(default_factory=dict)
     duplicatesSkipped: int = 0
+    requestedCount: int = 0
+    rawFetched: int = 0
+    eligibleReturned: int = 0
+    websitesSkipped: int = 0
+    noContactSkipped: int = 0
+    generatedDuplicatesSkipped: int = 0
+    emailLeads: int = 0
+    phoneLeads: int = 0
+    emailAndPhoneLeads: int = 0
     cached: bool = False
 
 
@@ -1293,6 +1302,96 @@ def lead_identity_conflicts(lead: DiscoveredLead, canonical_key: str) -> Dict[st
     }
 
 
+def lead_has_contact(lead: DiscoveredLead) -> bool:
+    return bool(normalize_email_identity(lead.email) or compact_text(lead.phone))
+
+
+def lead_contact_bucket(lead: DiscoveredLead) -> str:
+    has_email = bool(normalize_email_identity(lead.email))
+    has_phone = bool(compact_text(lead.phone))
+    if has_email and has_phone:
+        return "email_phone"
+    if has_email:
+        return "email"
+    if has_phone:
+        return "phone"
+    return "none"
+
+
+def generated_lead_identity_conflicts(lead: DiscoveredLead, canonical_key: str) -> Dict[str, str]:
+    candidate_identities = {identity_key for _identity_type, identity_key in lead_identity_pairs(lead)}
+    if not candidate_identities:
+        return {}
+
+    with get_pipeline_db() as db:
+        rows = db.execute(
+            """
+            SELECT canonical_lead_key, lead_key, business_name, context_json
+            FROM approval_records
+            WHERE status NOT IN ('SUPERSEDED')
+            """
+        ).fetchall()
+
+    conflicts: Dict[str, str] = {}
+    for row in rows:
+        existing_key = row["canonical_lead_key"]
+        if existing_key == canonical_key:
+            conflicts[f"canonical:{canonical_key}"] = existing_key
+            continue
+
+        context = safe_json_loads(row["context_json"], {})
+        existing_lead = DiscoveredLead(
+            leadKey=row["lead_key"] or existing_key,
+            canonicalLeadKey=existing_key,
+            businessName=context.get("businessName") or row["business_name"] or "Generated lead",
+            email=context.get("email"),
+            phone=context.get("phone"),
+            website=context.get("website"),
+            domain=context.get("domain"),
+            category=context.get("category") or context.get("industry") or "General Services",
+            address=context.get("address"),
+            location=context.get("location") or "South Africa",
+            source=context.get("source") or "generated-approval",
+            sourceUrl=context.get("sourceUrl"),
+            raw=context.get("rawLead") if isinstance(context.get("rawLead"), dict) else {},
+        )
+        existing_identities = {identity_key for _identity_type, identity_key in lead_identity_pairs(existing_lead)}
+        for identity_key in candidate_identities.intersection(existing_identities):
+            conflicts[identity_key] = existing_key
+    return conflicts
+
+
+def select_mixed_contact_leads(leads: List[DiscoveredLead], limit: int) -> List[DiscoveredLead]:
+    buckets: Dict[str, List[DiscoveredLead]] = {"email_phone": [], "email": [], "phone": []}
+    for lead in leads:
+        bucket = lead_contact_bucket(lead)
+        if bucket in buckets:
+            buckets[bucket].append(lead)
+
+    selected: List[DiscoveredLead] = []
+    seen: Set[str] = set()
+
+    def take(bucket_name: str) -> None:
+        if len(selected) >= limit:
+            return
+        bucket = buckets[bucket_name]
+        while bucket:
+            lead = bucket.pop(0)
+            key = lead.canonicalLeadKey or lead.leadKey
+            if key in seen:
+                continue
+            seen.add(key)
+            selected.append(lead)
+            break
+
+    while len(selected) < limit and any(buckets.values()):
+        take("email_phone")
+        take("email")
+        take("phone")
+
+    return selected
+
+
 def upsert_lead_registry(lead: DiscoveredLead) -> None:
     canonical_key = canonical_lead_key_for_lead(lead)
     lead.canonicalLeadKey = canonical_key
@@ -1411,13 +1510,17 @@ def cached_discovery_response(
     if not row:
         return None
 
+    cached_leads = [DiscoveredLead(**lead) for lead in safe_json_loads(row["leads_json"], [])]
     leads = [
-        DiscoveredLead(**lead)
-        for lead in safe_json_loads(row["leads_json"], [])[:limit]
-    ]
-    leads = [lead for lead in leads if not lead_has_website(lead)]
+        lead
+        for lead in cached_leads
+        if not lead_has_website(lead) and lead_has_contact(lead)
+    ][:limit]
     if not leads:
         return None
+
+    email_count = sum(1 for lead in leads if normalize_email_identity(lead.email))
+    phone_count = sum(1 for lead in leads if compact_text(lead.phone))
 
     return DiscoverLeadsResponse(
         batchId=row["batch_id"],
@@ -1429,6 +1532,19 @@ def cached_discovery_response(
         warnings=safe_json_loads(row["warnings_json"], []),
         provinceStats=safe_json_loads(row["province_stats_json"], {}),
         duplicatesSkipped=row["duplicates_skipped"],
+        requestedCount=limit,
+        rawFetched=len(cached_leads),
+        eligibleReturned=len(leads),
+        websitesSkipped=sum(1 for lead in cached_leads if lead_has_website(lead)),
+        noContactSkipped=sum(1 for lead in cached_leads if not lead_has_contact(lead)),
+        generatedDuplicatesSkipped=row["duplicates_skipped"],
+        emailLeads=email_count,
+        phoneLeads=phone_count,
+        emailAndPhoneLeads=sum(
+            1
+            for lead in leads
+            if normalize_email_identity(lead.email) and compact_text(lead.phone)
+        ),
         cached=True,
     )
 
@@ -4702,7 +4818,13 @@ def deploy_github_repo_to_netlify_for_lead(
             json={"repo": repo_settings, "build_settings": repo_settings},
             timeout=45,
         )
-        site_response.raise_for_status()
+        try:
+            site_response.raise_for_status()
+        except requests.HTTPError as error:
+            raise RuntimeError(
+                f"Netlify Git-linked site update failed ({site_response.status_code}): "
+                f"{sanitize_message(site_response.text) or sanitize_message(str(error))}"
+            ) from error
         site = site_response.json()
     else:
         site_name = f"ai-site-{slugify(business_name, 32)}-{canonical_key[:8]}"
@@ -4718,7 +4840,13 @@ def deploy_github_repo_to_netlify_for_lead(
             },
             timeout=45,
         )
-        site_response.raise_for_status()
+        try:
+            site_response.raise_for_status()
+        except requests.HTTPError as error:
+            raise RuntimeError(
+                f"Netlify Git-linked site creation failed ({site_response.status_code}): "
+                f"{sanitize_message(site_response.text) or sanitize_message(str(error))}"
+            ) from error
         site = site_response.json()
         site_id = site.get("id") or site.get("name")
         site_name = site.get("name") or site_name
@@ -5920,7 +6048,7 @@ def get_site_templates():
 def discover_leads(request: DiscoverLeadsRequest):
     preset = get_preset_or_404(request.presetId)
     location = compact_text(request.location, "Durban, South Africa")
-    limit = max(1, min(request.limit or 3, 5))
+    limit = max(1, min(request.limit or 5, 200))
     primary_query = build_google_maps_query(preset, location, request.query)
 
     if not request.forceRefresh:
@@ -5940,7 +6068,11 @@ def discover_leads(request: DiscoverLeadsRequest):
 
     warnings: List[str] = []
     duplicates_skipped = 0
+    no_contact_skipped = 0
+    websites_skipped = 0
+    raw_fetched = 0
     selected_leads: List[DiscoveredLead] = []
+    eligible_leads: List[DiscoveredLead] = []
 
     province_stats: Dict[str, Any] = {
         location: {
@@ -5949,6 +6081,11 @@ def discover_leads(request: DiscoverLeadsRequest):
             "selected": 0,
             "duplicatesSkipped": 0,
             "websitesSkipped": 0,
+            "noContactSkipped": 0,
+            "eligible": 0,
+            "emailLeads": 0,
+            "phoneLeads": 0,
+            "emailAndPhoneLeads": 0,
         }
     }
 
@@ -5963,9 +6100,10 @@ def discover_leads(request: DiscoverLeadsRequest):
     )
 
     try:
-        fetch_limit = min(max(limit * 5, limit + 8), 30)
+        fetch_limit = min(max(limit * 8, limit + 30), 500)
         query_items = run_apify_google_maps(primary_query, fetch_limit, location)
-        province_stats[location]["rawItems"] = len(query_items)
+        raw_fetched = len(query_items)
+        province_stats[location]["rawItems"] = raw_fetched
 
         normalized = normalize_apify_items(
             query_items,
@@ -5975,8 +6113,6 @@ def discover_leads(request: DiscoverLeadsRequest):
         )
         province_stats[location]["normalized"] = len(normalized)
 
-        candidate_keys = [canonical_lead_key_for_lead(lead) for lead in normalized]
-        existing_keys = existing_canonical_lead_keys(candidate_keys)
         seen_batch_keys = set()
         seen_batch_identities: Set[str] = set()
 
@@ -5985,15 +6121,20 @@ def discover_leads(request: DiscoverLeadsRequest):
             lead.canonicalLeadKey = canonical_key
             lead.location = location
             identity_keys = [identity_key for _identity_type, identity_key in lead_identity_pairs(lead)]
-            identity_conflicts = lead_identity_conflicts(lead, canonical_key)
+            identity_conflicts = generated_lead_identity_conflicts(lead, canonical_key)
 
             if lead_has_website(lead):
+                websites_skipped += 1
                 province_stats[location]["websitesSkipped"] += 1
                 continue
 
+            if not lead_has_contact(lead):
+                no_contact_skipped += 1
+                province_stats[location]["noContactSkipped"] += 1
+                continue
+
             if (
-                canonical_key in existing_keys
-                or canonical_key in seen_batch_keys
+                canonical_key in seen_batch_keys
                 or identity_conflicts
                 or any(identity_key in seen_batch_identities for identity_key in identity_keys)
             ):
@@ -6003,10 +6144,9 @@ def discover_leads(request: DiscoverLeadsRequest):
 
             seen_batch_keys.add(canonical_key)
             seen_batch_identities.update(identity_keys)
-            selected_leads.append(lead)
+            eligible_leads.append(lead)
 
-            if len(selected_leads) >= limit:
-                break
+        selected_leads = select_mixed_contact_leads(eligible_leads, limit)
 
     except Exception as error:
         warnings.append(f"Apify failed, demo fallback leads were used: {sanitize_message(error)}")
@@ -6039,6 +6179,8 @@ def discover_leads(request: DiscoverLeadsRequest):
                 raw={"fallback": True},
             )
             selected_leads.append(lead)
+        raw_fetched = len(selected_leads)
+        eligible_leads = selected_leads[:]
 
     for lead in selected_leads:
         try:
@@ -6047,9 +6189,23 @@ def discover_leads(request: DiscoverLeadsRequest):
             warnings.append(f"Could not save lead {lead.businessName}: {sanitize_message(error)}")
 
     province_stats[location]["selected"] = len(selected_leads)
+    province_stats[location]["eligible"] = len(eligible_leads)
+    province_stats[location]["emailLeads"] = sum(1 for lead in selected_leads if normalize_email_identity(lead.email))
+    province_stats[location]["phoneLeads"] = sum(1 for lead in selected_leads if compact_text(lead.phone))
+    province_stats[location]["emailAndPhoneLeads"] = sum(
+        1
+        for lead in selected_leads
+        if normalize_email_identity(lead.email) and compact_text(lead.phone)
+    )
 
     if not selected_leads:
-        warnings.append("No leads were returned. Try a smaller city search such as Durban, South Africa.")
+        warnings.append("No contactable no-website leads were returned. Try a broader phrase or nearby city.")
+    elif len(selected_leads) < limit:
+        warnings.append(
+            f"Requested {limit} leads but only found {len(selected_leads)} contactable no-website leads. "
+            f"Skipped {websites_skipped} with websites, {no_contact_skipped} without email/phone, "
+            f"and {duplicates_skipped} already generated or duplicate leads."
+        )
 
     batch_id = str(uuid4())
 
@@ -6063,6 +6219,15 @@ def discover_leads(request: DiscoverLeadsRequest):
         warnings=warnings,
         provinceStats=province_stats,
         duplicatesSkipped=duplicates_skipped,
+        requestedCount=limit,
+        rawFetched=raw_fetched,
+        eligibleReturned=len(selected_leads),
+        websitesSkipped=websites_skipped,
+        noContactSkipped=no_contact_skipped,
+        generatedDuplicatesSkipped=duplicates_skipped,
+        emailLeads=province_stats[location]["emailLeads"],
+        phoneLeads=province_stats[location]["phoneLeads"],
+        emailAndPhoneLeads=province_stats[location]["emailAndPhoneLeads"],
         cached=False,
     )
 
@@ -6650,6 +6815,10 @@ def list_operation_groups(page: int = 1, pageSize: int = 10, status: str = "all"
             for ticket in approval.get("zendeskTickets") or []
             if ticket.get("payload", {}).get("deployRequested")
         )
+        province_stats = safe_json_loads(batch["province_stats_json"], {}) if batch else {}
+        raw_fetched = sum((stats or {}).get("rawItems", 0) for stats in province_stats.values()) if isinstance(province_stats, dict) else run["lead_count"]
+        eligible_count = sum((stats or {}).get("eligible", 0) for stats in province_stats.values()) if isinstance(province_stats, dict) else run["lead_count"]
+        github_exported = sum(1 for approval in approvals if (approval.get("githubExport") or {}).get("commitSha"))
         groups.append(
             {
                 "groupId": run["pipeline_id"],
@@ -6665,10 +6834,24 @@ def list_operation_groups(page: int = 1, pageSize: int = 10, status: str = "all"
                 "emailLeads": email_count,
                 "phoneLeads": phone_count,
                 "generated": len(approvals),
+                "rawFetched": raw_fetched or run["lead_count"],
+                "eligible": eligible_count or run["lead_count"],
+                "githubExported": github_exported,
+                "zendeskTickets": ticket_count,
                 "zendeskPending": max(0, len(approvals) - ticket_count),
                 "deployApproved": deploy_requested,
                 "live": live_count,
                 "failed": failed_count,
+                "chartSteps": [
+                    {"label": "Fetched", "value": raw_fetched or run["lead_count"]},
+                    {"label": "Eligible", "value": eligible_count or run["lead_count"]},
+                    {"label": "Generated", "value": len(approvals)},
+                    {"label": "GitHub", "value": github_exported},
+                    {"label": "Zendesk", "value": ticket_count},
+                    {"label": "Pending", "value": max(0, len(approvals) - live_count - failed_count)},
+                    {"label": "Live", "value": live_count},
+                    {"label": "Failed", "value": failed_count},
+                ],
                 "approvals": approvals,
                 "warnings": safe_json_loads(run["warnings_json"], []),
             }
@@ -6752,6 +6935,11 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
 
     try:
         if action in {"deploy", "deploy_site", "approve_deploy", "deploy_requested"}:
+            if channel != "email":
+                raise HTTPException(
+                    status_code=409,
+                    detail="Deploy webhook can only run for email-channel Zendesk tickets. Use phone_status for phone leads.",
+                )
             if row["status"] in {"PENDING", "DEPLOY_FAILED"}:
                 deploy_response = approve_generated_site(
                     approval_id,

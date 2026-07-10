@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BrowserRouter, NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import axios from "axios";
 import { gsap } from "gsap";
@@ -128,6 +128,19 @@ function EmptyState({ title, text }) {
   );
 }
 
+function LoadingOverlay({ show, message }) {
+  if (!show) return null;
+  return (
+    <div className="loading-overlay" role="status" aria-live="polite">
+      <div className="loading-card">
+        <div className="loading-spinner" aria-hidden="true" />
+        <strong>{message || "Working..."}</strong>
+        <span>AI Site Factory is processing this step. Larger batches can take a few minutes.</span>
+      </div>
+    </div>
+  );
+}
+
 function AppShell() {
   const locationPath = useLocation();
   const contentRef = useRef(null);
@@ -136,7 +149,7 @@ function AppShell() {
   const [selectedPresetId, setSelectedPresetId] = useState("restaurants");
   const [location, setLocation] = useState("Durban, South Africa");
   const [customQuery, setCustomQuery] = useState("");
-  const [leadCount, setLeadCount] = useState(3);
+  const [leadCount, setLeadCount] = useState(5);
   const [forceRefresh, setForceRefresh] = useState(false);
   const [forceRegenerate, setForceRegenerate] = useState(false);
   const [batchId, setBatchId] = useState(null);
@@ -145,6 +158,7 @@ function AppShell() {
   const [warnings, setWarnings] = useState([]);
   const [provinceStats, setProvinceStats] = useState({});
   const [duplicatesSkipped, setDuplicatesSkipped] = useState(0);
+  const [discoveryStats, setDiscoveryStats] = useState(null);
   const [lastDiscoveryCached, setLastDiscoveryCached] = useState(false);
   const [pipelineResult, setPipelineResult] = useState(null);
   const [reportingSummary, setReportingSummary] = useState(null);
@@ -169,6 +183,7 @@ function AppShell() {
   const [manualFlow, setManualFlow] = useState(null);
   const [discovering, setDiscovering] = useState(false);
   const [running, setRunning] = useState(false);
+  const [busyPhase, setBusyPhase] = useState("");
   const [approvalBusy, setApprovalBusy] = useState(null);
   const [debugBusy, setDebugBusy] = useState(null);
   const [message, setMessage] = useState("");
@@ -333,6 +348,41 @@ function AppShell() {
     setSelectedLeadKeys((current) => (current.includes(leadKey) ? current.filter((key) => key !== leadKey) : [...current, leadKey]));
   };
 
+  const runPipeline = async (leadsOverride = null, batchOverride = null) => {
+    const leadsForRun = Array.isArray(leadsOverride) ? leadsOverride : selectedLeads;
+    if (!leadsForRun.length) {
+      setNotice("Select one or more leads.", "warning");
+      return;
+    }
+    try {
+      setRunning(true);
+      setBusyPhase("Generating landing pages, exporting GitHub repos, and creating Zendesk tickets...");
+      setPipelineResult(null);
+      setNotice("Generating pages and exporting repositories...", "info");
+      const data = await callApi(
+        "Full Pipeline API",
+        "post",
+        "/api/pipeline/run",
+        {
+          sourceBatchId: batchOverride || batchId,
+          leads: leadsForRun,
+          resumeExisting: true,
+          forceRegenerate,
+        },
+        { timeout: 600000 }
+      );
+      setPipelineResult(data);
+      setNotice(`Pipeline finished with status ${data.status}.`, data.status === "FAILED" ? "danger" : data.status.includes("PENDING") ? "warning" : "success");
+      refreshOperations(true);
+    } catch (error) {
+      const failure = formatApiError(error);
+      setNotice(failure.message || "Pipeline run failed.", "danger");
+    } finally {
+      setRunning(false);
+      setBusyPhase("");
+    }
+  };
+
   const discoverLeads = async () => {
     if (!selectedPreset?.id) {
       setNotice("Select a business type first.", "warning");
@@ -340,6 +390,7 @@ function AppShell() {
     }
     try {
       setDiscovering(true);
+      setBusyPhase("Searching for contactable no-website leads...");
       setPipelineResult(null);
       setSelectedLeadKeys([]);
       setWarnings([]);
@@ -358,51 +409,32 @@ function AppShell() {
         { timeout: 600000 }
       );
       setBatchId(data.batchId);
-      setLeads(data.leads || []);
+      const fetchedLeads = data.leads || [];
+      setLeads(fetchedLeads);
+      setSelectedLeadKeys(fetchedLeads.map((lead) => lead.leadKey));
       setWarnings(data.warnings || []);
       setProvinceStats(data.provinceStats || {});
       setDuplicatesSkipped(data.duplicatesSkipped || 0);
+      setDiscoveryStats(data);
       setLastDiscoveryCached(Boolean(data.cached));
-      setNotice(`${data.cached ? "Loaded cached" : "Fetched"} ${data.leads?.length || 0} leads.`, data.leads?.length ? "success" : "warning");
+      setNotice(
+        `${data.cached ? "Loaded cached" : "Fetched"} ${fetchedLeads.length}/${data.requestedCount || leadCount} eligible leads. ` +
+          `Raw ${data.rawFetched || 0}; skipped ${data.websitesSkipped || 0} websites, ${data.noContactSkipped || 0} no-contact, ${data.generatedDuplicatesSkipped || data.duplicatesSkipped || 0} duplicates. ` +
+          `${fetchedLeads.length ? "Starting generation now." : ""}`,
+        fetchedLeads.length ? "success" : "warning"
+      );
       refreshOperations(true);
+      if (fetchedLeads.length) {
+        setBusyPhase("Generating landing pages, exporting GitHub repos, and creating Zendesk tickets...");
+        await runPipeline(fetchedLeads, data.batchId);
+      }
     } catch (error) {
       const failure = formatApiError(error);
       setLeads([]);
       setNotice(failure.message || "Lead discovery failed.", "danger");
     } finally {
       setDiscovering(false);
-    }
-  };
-
-  const runPipeline = async () => {
-    if (!selectedLeads.length) {
-      setNotice("Select one or more leads.", "warning");
-      return;
-    }
-    try {
-      setRunning(true);
-      setPipelineResult(null);
-      setNotice("Generating pages and exporting repositories...", "info");
-      const data = await callApi(
-        "Full Pipeline API",
-        "post",
-        "/api/pipeline/run",
-        {
-          sourceBatchId: batchId,
-          leads: selectedLeads,
-          resumeExisting: true,
-          forceRegenerate,
-        },
-        { timeout: 600000 }
-      );
-      setPipelineResult(data);
-      setNotice(`Pipeline finished with status ${data.status}.`, data.status === "FAILED" ? "danger" : data.status.includes("PENDING") ? "warning" : "success");
-      refreshOperations(true);
-    } catch (error) {
-      const failure = formatApiError(error);
-      setNotice(failure.message || "Pipeline run failed.", "danger");
-    } finally {
-      setRunning(false);
+      if (!running) setBusyPhase("");
     }
   };
 
@@ -423,6 +455,7 @@ function AppShell() {
   const approveSite = async (approvalId) => {
     try {
       setApprovalBusy(approvalId);
+      setBusyPhase("Deploying approved site through GitHub → Netlify...");
       const data = await callApi("Approval Deploy API", "post", `/api/approvals/${approvalId}/approve`, { approvedBy: "Pipeline Operator", notes: "Approved from Pipeline Workspace." }, { timeout: 420000 });
       setNotice(`Approved and deployed ${data.businessName}.`, data.status === "APPROVED" ? "success" : "warning");
       refreshOperations(true);
@@ -432,12 +465,14 @@ function AppShell() {
       refreshOperations(true);
     } finally {
       setApprovalBusy(null);
+      setBusyPhase("");
     }
   };
 
   const retryExport = async (approvalId) => {
     try {
       setApprovalBusy(approvalId);
+      setBusyPhase("Retrying GitHub export for generated site...");
       const data = await callApi("GitHub Export Retry API", "post", `/api/approvals/${approvalId}/retry-export`, { requestedBy: "Pipeline Operator" }, { timeout: 240000 });
       setNotice(`GitHub export ready for ${data.businessName}.`, "success");
       refreshOperations(true);
@@ -446,12 +481,14 @@ function AppShell() {
       setNotice(failure.message || "GitHub export retry failed.", "danger");
     } finally {
       setApprovalBusy(null);
+      setBusyPhase("");
     }
   };
 
   const rejectSite = async (approvalId) => {
     try {
       setApprovalBusy(approvalId);
+      setBusyPhase("Rejecting generated approval...");
       const data = await callApi("Approval Reject API", "post", `/api/approvals/${approvalId}/reject`, { rejectedBy: "Pipeline Operator", reason: "Rejected from Pipeline Workspace." });
       setNotice(`Rejected ${data.businessName}.`, "warning");
       refreshOperations(true);
@@ -460,12 +497,14 @@ function AppShell() {
       setNotice(failure.message || "Reject failed.", "danger");
     } finally {
       setApprovalBusy(null);
+      setBusyPhase("");
     }
   };
 
   const regenerateSite = async (approvalId) => {
     try {
       setApprovalBusy(approvalId);
+      setBusyPhase("Regenerating landing page and GitHub artifact...");
       const data = await callApi("Approval Regenerate API", "post", `/api/approvals/${approvalId}/regenerate`, { requestedBy: "Pipeline Operator" }, { timeout: 600000 });
       setNotice(`Regenerated ${data.businessName}.`, data.status === "EXPORT_FAILED" ? "danger" : "success");
       refreshOperations(true);
@@ -474,6 +513,7 @@ function AppShell() {
       setNotice(failure.message || "Regenerate failed.", "danger");
     } finally {
       setApprovalBusy(null);
+      setBusyPhase("");
     }
   };
 
@@ -558,6 +598,7 @@ function AppShell() {
     warnings,
     provinceStats,
     duplicatesSkipped,
+    discoveryStats,
     lastDiscoveryCached,
     batchId,
     pipelineResult,
@@ -591,6 +632,7 @@ function AppShell() {
     running,
     approvalBusy,
     debugBusy,
+    busyPhase,
     discoverLeads,
     runPipeline,
     previewApproval,
@@ -607,6 +649,7 @@ function AppShell() {
 
   return (
     <div className="app-shell">
+      <LoadingOverlay show={Boolean(busyPhase || discovering || running || approvalBusy)} message={busyPhase || "Working on your batch..."} />
       <aside className="sidebar">
         <div className="brand-block">
           <strong>AI Site Factory</strong>
@@ -671,6 +714,7 @@ function PipelineWorkspacePage(props) {
     runPipeline,
     warnings,
     duplicatesSkipped,
+    discoveryStats,
     lastDiscoveryCached,
     provinceStats,
     pipelineResult,
@@ -716,8 +760,8 @@ function PipelineWorkspacePage(props) {
       </section>
 
       <Section
-        title="Operations Queue"
-        help="Pipeline runs are grouped for high-volume work. Expand a group to inspect its generated businesses, channel tickets, and statuses."
+        title="Operations Flow Chart"
+        help="Each batch is shown as a pipeline diagram. Expand a group to inspect generated businesses, channel tickets, and statuses."
         action={<button className="btn btn-outline-secondary" type="button" onClick={() => refreshOperations(false)}>Refresh</button>}
       >
         <OperationFilters filters={operationFilters} setFilters={setOperationFilters} />
@@ -739,8 +783,8 @@ function PipelineWorkspacePage(props) {
 
       <Section
         title="Create New Batch"
-        help="Choose a business type and city. The search uses the selected location only and reuses cached results unless force refresh is on."
-        action={<button className="btn btn-primary" type="button" onClick={discoverLeads} disabled={discovering}>{discovering ? "Searching..." : "Search Leads"}</button>}
+        help="Type the lead intent you want, choose a location, and the app will fetch eligible no-website leads then auto-generate pages, GitHub artifacts, and Zendesk tickets."
+        action={<button className="btn btn-primary" type="button" onClick={discoverLeads} disabled={discovering || running}>{discovering || running ? "Working..." : "Search + Auto Generate"}</button>}
       >
         <div className="preset-grid">
           {presets.map((preset) => (
@@ -753,13 +797,19 @@ function PipelineWorkspacePage(props) {
         </div>
         <div className="control-grid mt-3">
           <label>Location<input className="form-control" value={location} onChange={(event) => setLocation(event.target.value)} /></label>
-          <label>Search phrase<input className="form-control" value={customQuery} onChange={(event) => setCustomQuery(event.target.value)} placeholder="Optional, e.g. emergency plumber" /></label>
-          <label>Lead count<select className="form-select" value={leadCount} onChange={(event) => setLeadCount(Number(event.target.value))}>{[1, 2, 3, 4, 5].map((count) => <option key={count} value={count}>{count}</option>)}</select></label>
+          <label>Lead intent<input className="form-control" value={customQuery} onChange={(event) => setCustomQuery(event.target.value)} placeholder="e.g. emergency plumbers, dentists with no website" /></label>
+          <label>Lead count<input className="form-control" type="number" min="1" max="200" value={leadCount} onChange={(event) => setLeadCount(Math.max(1, Math.min(200, Number(event.target.value) || 1)))} /></label>
           <label className="checkline"><input type="checkbox" checked={forceRefresh} onChange={(event) => setForceRefresh(event.target.checked)} />Force discovery refresh</label>
         </div>
         <div className="status-strip">
           <span className={`badge ${lastDiscoveryCached ? "text-bg-info" : "text-bg-success"}`}>{lastDiscoveryCached ? "CACHE" : "LIVE"}</span>
-          <span>{duplicatesSkipped} duplicates skipped</span>
+          <span>{discoveryStats?.eligibleReturned || leads.length || 0}/{discoveryStats?.requestedCount || leadCount} eligible</span>
+          <span>{discoveryStats?.rawFetched || 0} raw fetched</span>
+          <span>{discoveryStats?.websitesSkipped || 0} websites skipped</span>
+          <span>{discoveryStats?.noContactSkipped || 0} no-contact skipped</span>
+          <span>{discoveryStats?.generatedDuplicatesSkipped || duplicatesSkipped} generated duplicates skipped</span>
+          <span>{discoveryStats?.emailLeads || 0} email</span>
+          <span>{discoveryStats?.phoneLeads || 0} phone</span>
           {Object.entries(provinceStats).map(([key, value]) => <span key={key}>{key}: {value.selected || 0}</span>)}
         </div>
         {warnings.map((warning) => <div className="alert alert-warning" key={warning}>{warning}</div>)}
@@ -777,7 +827,7 @@ function PipelineWorkspacePage(props) {
       >
         <div className="selection-summary">
           <div><strong>{selectedLeads.length}</strong><span>selected</span></div>
-          <p>Selected leads move into generation. No deployment can happen until you approve a generated page.</p>
+          <p>Search now auto-generates all eligible leads. Manual selection remains available for fallback reruns.</p>
         </div>
         <LeadTable leads={leads} selectedLeadKeys={selectedLeadKeys} toggleLead={toggleLead} />
       </Section>
@@ -785,7 +835,7 @@ function PipelineWorkspacePage(props) {
       <Section
         title="Generate Landing Pages"
         help="Groq compacts the public lead details, then Gemini creates a freeform landing page with enforced Bootstrap, extra styling libraries, and a color widget."
-        action={<button className="btn btn-primary" type="button" onClick={runPipeline} disabled={running || !selectedLeads.length}>{running ? "Running..." : "Run Pipeline"}</button>}
+        action={<button className="btn btn-primary" type="button" onClick={() => runPipeline()} disabled={running || discovering || !selectedLeads.length}>{running ? "Running..." : "Manual Run Pipeline"}</button>}
       >
         <div className="control-grid">
           <label className="checkline"><input type="checkbox" checked={forceRegenerate} onChange={(event) => setForceRegenerate(event.target.checked)} />Force regenerate</label>
@@ -897,6 +947,7 @@ function OperationGroupList({ groups, meta, expandedGroups, setExpandedGroups, s
               ["Failed", group.failed],
             ].map(([label, value]) => <div key={label}><strong>{value || 0}</strong><span>{label}</span></div>)}
           </div>
+          <OperationFlowChart group={group} />
           {expandedGroups[group.groupId] && (
             <div className="operation-nested">
               {(group.approvals || []).length ? (
@@ -925,6 +976,39 @@ function OperationGroupList({ groups, meta, expandedGroups, setExpandedGroups, s
         <span>Page {meta.page} of {meta.totalPages} | {meta.total} groups</span>
         <button className="btn btn-outline-secondary btn-sm" type="button" disabled={meta.page >= meta.totalPages} onClick={() => goToPage(meta.page + 1)}>Next</button>
       </div>
+    </div>
+  );
+}
+
+function OperationFlowChart({ group }) {
+  const steps = group.chartSteps?.length
+    ? group.chartSteps
+    : [
+        { label: "Fetched", value: group.rawFetched || group.leadCount || 0 },
+        { label: "Eligible", value: group.eligible || group.leadCount || 0 },
+        { label: "Generated", value: group.generated || 0 },
+        { label: "GitHub", value: group.githubExported || 0 },
+        { label: "Zendesk", value: group.zendeskTickets || 0 },
+        { label: "Pending", value: Math.max(0, (group.generated || 0) - (group.live || 0) - (group.failed || 0)) },
+        { label: "Live", value: group.live || 0 },
+        { label: "Failed", value: group.failed || 0 },
+      ];
+  const maxValue = Math.max(1, ...steps.map((step) => Number(step.value) || 0));
+  return (
+    <div className="operation-flow" aria-label={`Pipeline flow for ${group.pipelineId}`}>
+      {steps.map((step, index) => {
+        const value = Number(step.value) || 0;
+        return (
+          <Fragment key={step.label}>
+            <div className={`flow-node ${step.label.toLowerCase() === "failed" && value ? "flow-failed" : ""}`}>
+              <strong>{value}</strong>
+              <span>{step.label}</span>
+              <div className="flow-bar"><i style={{ width: `${Math.max(8, Math.round((value / maxValue) * 100))}%` }} /></div>
+            </div>
+            {index < steps.length - 1 && <span className="flow-arrow" aria-hidden="true">→</span>}
+          </Fragment>
+        );
+      })}
     </div>
   );
 }
@@ -1022,8 +1106,11 @@ function PipelineResultCard({ result }) {
 
 function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRetry, onReject, onRegenerate }) {
   const hasSuccessfulGithubExport = Boolean(approval.githubExport?.repoUrl && approval.githubExport?.commitSha);
+  const hasEmailContact = Boolean(approval.context?.email);
+  const hasPhoneContact = Boolean(approval.context?.phone);
+  const isPhoneOnly = hasPhoneContact && !hasEmailContact;
   const needsGithubExport = ["PENDING", "DEPLOY_FAILED", "EXPORT_FAILED"].includes(approval.status) && !hasSuccessfulGithubExport;
-  const canApprove = ["PENDING", "DEPLOY_FAILED"].includes(approval.status) && hasSuccessfulGithubExport;
+  const canApprove = ["PENDING", "DEPLOY_FAILED"].includes(approval.status) && hasSuccessfulGithubExport && !isPhoneOnly;
   return (
     <article className="approval-item">
       <div className="item-head">
@@ -1031,7 +1118,7 @@ function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRet
         <span className={`badge ${statusBadgeClass(approval.status)}`}>{approval.status}</span>
       </div>
       <dl>
-        <div><dt>Contact</dt><dd>{approval.context?.email ? "Email lead" : approval.context?.phone ? "Phone lead" : "No contact yet"}</dd></div>
+        <div><dt>Contact</dt><dd>{hasEmailContact ? (hasPhoneContact ? "Email + phone lead" : "Email lead") : hasPhoneContact ? "Phone lead" : "No contact yet"}</dd></div>
         <div><dt>Created</dt><dd>{displayDate(approval.createdAt)}</dd></div>
         <div><dt>GitHub artifact</dt><dd>{approval.githubExport?.repoUrl ? <a href={approval.githubExport.repoUrl} target="_blank" rel="noreferrer">{approval.githubExport.repository || approval.githubExport.repoUrl}</a> : "Export required before deploy"}</dd></div>
         <div><dt>Commit</dt><dd>{approval.githubExport?.commitSha || "No commit yet"}</dd></div>
@@ -1039,10 +1126,11 @@ function ApprovalItem({ approval, previewHtml, busy, onPreview, onApprove, onRet
       </dl>
       {approval.status === "DEPLOY_FAILED" && <p className="text-danger mb-2">Deployment failed. Update the Netlify token if needed, then retry deployment.</p>}
       {needsGithubExport && <p className="text-warning mb-2">GitHub export is required before Netlify can deploy this site. Retry export first.</p>}
+      {isPhoneOnly && <p className="text-info mb-2">Phone-only lead: deployment approval is handled from email-capable leads. Use Zendesk phone status for dialer follow-up.</p>}
       <div className="button-row">
         <button className="btn btn-outline-secondary btn-sm" type="button" onClick={onPreview} disabled={busy || !approval.previewAvailable}>{previewHtml ? "Hide Preview" : "Preview"}</button>
         {needsGithubExport && <button className="btn btn-outline-primary btn-sm" type="button" onClick={onRetry} disabled={busy}>Retry Export</button>}
-        <button className="btn btn-success btn-sm" type="button" onClick={onApprove} disabled={busy || !canApprove}>{busy ? "Working..." : approval.status === "DEPLOY_FAILED" ? "Retry Deploy" : "Approve"}</button>
+        {!isPhoneOnly && <button className="btn btn-success btn-sm" type="button" onClick={onApprove} disabled={busy || !canApprove}>{busy ? "Working..." : approval.status === "DEPLOY_FAILED" ? "Retry Deploy" : "Approve"}</button>}
         <button className="btn btn-outline-primary btn-sm" type="button" onClick={onRegenerate} disabled={busy}>Regenerate</button>
         <button className="btn btn-outline-danger btn-sm" type="button" onClick={onReject} disabled={busy || !["PENDING", "EXPORT_FAILED", "DEPLOY_FAILED"].includes(approval.status)}>Reject</button>
       </div>
@@ -1189,7 +1277,7 @@ function AdminPage({ debugStatus, backendLogs, uiLogs, apiProbe, debugBusy, runA
       </Section>
       <Section title="Workspace Settings" help="These controls adjust the current pipeline workflow while keeping existing API contracts stable.">
         <div className="control-grid">
-          <label>Max leads per search<select className="form-select" value={leadCount} onChange={(event) => setLeadCount(Number(event.target.value))}>{[1, 2, 3, 4, 5].map((count) => <option key={count} value={count}>{count}</option>)}</select></label>
+          <label>Max leads per search<input className="form-control" type="number" min="1" max="200" value={leadCount} onChange={(event) => setLeadCount(Math.max(1, Math.min(200, Number(event.target.value) || 1)))} /></label>
           <label className="checkline"><input type="checkbox" checked={forceRegenerate} onChange={(event) => setForceRegenerate(event.target.checked)} />Force regenerate</label>
           <label className="checkline"><input type="checkbox" checked={forceRefresh} onChange={(event) => setForceRefresh(event.target.checked)} />Force discovery refresh</label>
           <div className="stat-box"><strong>Off</strong><span>Gemini images</span></div>

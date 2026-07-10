@@ -47,6 +47,55 @@ a:hover {
   grid-template-columns: 268px minmax(0, 1fr);
 }
 
+.loading-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: grid;
+  place-items: center;
+  padding: 1rem;
+  background: rgba(7, 27, 51, 0.28);
+  backdrop-filter: blur(6px);
+}
+
+.loading-card {
+  width: min(440px, 100%);
+  display: grid;
+  justify-items: center;
+  gap: 0.75rem;
+  padding: 1.5rem;
+  border: 1px solid rgba(29, 155, 240, 0.22);
+  border-radius: 18px;
+  background: #ffffff;
+  color: var(--navy);
+  text-align: center;
+  box-shadow: 0 24px 70px rgba(7, 27, 51, 0.22);
+}
+
+.loading-card strong {
+  font-size: 1rem;
+}
+
+.loading-card span {
+  color: var(--muted);
+  font-size: 0.88rem;
+}
+
+.loading-spinner {
+  width: 42px;
+  height: 42px;
+  border: 4px solid #dbeafe;
+  border-top-color: var(--teal);
+  border-radius: 999px;
+  animation: spin 0.9s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .sidebar {
   position: sticky;
   top: 0;
@@ -672,6 +721,71 @@ dd {
 .operation-stats span {
   color: var(--muted);
   font-size: 0.78rem;
+}
+
+.operation-flow {
+  display: grid;
+  grid-template-columns: repeat(15, auto);
+  align-items: stretch;
+  gap: 0.45rem;
+  overflow-x: auto;
+  padding: 0.85rem;
+  border: 1px solid #cfe8ff;
+  border-radius: 12px;
+  background: linear-gradient(135deg, #f8fbff, #eefaff);
+}
+
+.flow-node {
+  min-width: 104px;
+  display: grid;
+  gap: 0.25rem;
+  padding: 0.75rem;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 8px 20px rgba(7, 27, 51, 0.05);
+}
+
+.flow-node strong {
+  color: var(--navy);
+  font-size: 1.2rem;
+  line-height: 1;
+}
+
+.flow-node span {
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+}
+
+.flow-failed {
+  border-color: #fecaca;
+  background: #fff5f5;
+}
+
+.flow-bar {
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #e2e8f0;
+}
+
+.flow-bar i {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--teal), var(--cyan));
+}
+
+.flow-failed .flow-bar i {
+  background: var(--red);
+}
+
+.flow-arrow {
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-weight: 900;
 }
 
 .operation-nested {
