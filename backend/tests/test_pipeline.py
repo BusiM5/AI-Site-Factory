@@ -999,6 +999,21 @@ def test_zendesk_webhook_phone_status_updates_ticket_without_deploy(monkeypatch)
     assert "CALL_BACK" in captured["payload"]["ticket"]["comment"]["body"]
 
 
+def test_zendesk_webhook_rejects_phone_status_for_email_ticket(monkeypatch):
+    approval_id = create_pending_approval_for_webhook()
+    main.save_zendesk_ticket_link(approval_id, "canonical-webhook", "pipeline-webhook", "email", "intake", 654, "https://zendesk.test/654", "new", ["ai_site_email_lead"], {})
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "secret")
+
+    response = client.post(
+        "/api/zendesk/webhook",
+        json={"action": "phone_status", "approvalId": approval_id, "channel": "email", "zendeskTicketId": 654, "value": "CALL_BACK"},
+        headers={"x-ai-site-factory-secret": "secret"},
+    )
+
+    assert response.status_code == 409
+    assert "phone-channel" in response.json()["detail"]
+
+
 def test_zendesk_webhook_email_adds_public_reply(monkeypatch):
     approval_id = create_pending_approval_for_webhook()
     main.save_zendesk_ticket_link(approval_id, "canonical-webhook", "pipeline-webhook", "email", "intake", 654, "https://zendesk.test/654", "new", ["ai_site_email_lead"], {})
@@ -1024,6 +1039,21 @@ def test_zendesk_webhook_email_adds_public_reply(monkeypatch):
     assert response.status_code == 200
     assert captured["payload"]["ticket"]["comment"]["public"] is True
     assert "Public email body" in captured["payload"]["ticket"]["comment"]["body"]
+
+
+def test_zendesk_webhook_rejects_email_send_for_phone_ticket(monkeypatch):
+    approval_id = create_pending_approval_for_webhook()
+    main.save_zendesk_ticket_link(approval_id, "canonical-webhook", "pipeline-webhook", "phone", "intake", 321, "https://zendesk.test/321", "new", ["ai_site_phone_lead"], {})
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "secret")
+
+    response = client.post(
+        "/api/zendesk/webhook",
+        json={"action": "send_email", "approvalId": approval_id, "channel": "phone", "zendeskTicketId": 321},
+        headers={"x-ai-site-factory-secret": "secret"},
+    )
+
+    assert response.status_code == 409
+    assert "email-channel" in response.json()["detail"]
 
 
 def test_zendesk_webhook_deploy_triggers_existing_approval_path(monkeypatch):

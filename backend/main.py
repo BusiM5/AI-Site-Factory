@@ -6778,6 +6778,8 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
                     payload_update,
                 )
         elif action in {"send_email", "email_send", "send_approved_email", "email_send_requested"}:
+            if channel != "email":
+                raise HTTPException(status_code=409, detail="Email send webhook can only run for email-channel Zendesk tickets.")
             if not ticket_id:
                 raise HTTPException(status_code=409, detail="No Zendesk ticket was found for email send.")
             deployment = deployment_from_history(get_deployment_history_row(row["deployment_history_id"]))
@@ -6810,6 +6812,8 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
                 )
             result["email"] = {"ticketId": ticket_id, "status": ticket.get("status") or "open"}
         elif action in {"phone_status", "update_phone_status", "call_status", "phone_call_status"}:
+            if channel != "phone":
+                raise HTTPException(status_code=409, detail="Phone status webhook can only run for phone-channel Zendesk tickets.")
             status_value = compact_text(request.value, request.notes or "UPDATED")
             if ticket_id:
                 custom_fields = zendesk_custom_fields({"phoneCallStatus": status_value, "leadStatus": "PHONE_UPDATED"})
