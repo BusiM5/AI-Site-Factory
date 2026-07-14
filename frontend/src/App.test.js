@@ -1,6 +1,6 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import axios from "axios";
-import App from "./App";
+import App from "./App.jsx";
 
 jest.mock("axios");
 jest.mock("gsap", () => ({
@@ -20,6 +20,7 @@ const presetsPayload = {
   presets: [
     { id: "restaurants", label: "Restaurants", industry: "Restaurant", description: "Local restaurants." },
     { id: "plumbers", label: "Plumbers", industry: "Plumbing", description: "Local plumbers." },
+    { id: "electricians", label: "Electricians", industry: "Electrical", description: "Electrical services." },
   ],
 };
 
@@ -249,6 +250,7 @@ beforeEach(() => {
             businessName: "Alpha Plumbing",
             email: "alpha@example.com",
             phone: "+27 31 000 0000",
+            address: "1 Test Street",
             category: "Plumbing",
             location: "KwaZulu-Natal, South Africa",
             sourceUrl: "https://maps.example.com/1",
@@ -397,7 +399,8 @@ test("previews and approves a GitHub-based Netlify deployment", async () => {
   expect(within(queue).queryByText("Netlify URL")).not.toBeInTheDocument();
   expect(within(queue).queryByText("Deployment mode")).not.toBeInTheDocument();
   fireEvent.click(within(queue).getAllByText("Preview")[0]);
-  expect(await screen.findByTitle("Preview Alpha Plumbing")).toBeInTheDocument();
+  const preview = await within(queue).findByTitle("Preview Alpha Plumbing");
+  expect(preview).toBeInTheDocument();
 
   fireEvent.click(within(queue).getAllByText("Approve")[0]);
   expect(await screen.findByText(/Approved and deployed Alpha Plumbing/i)).toBeInTheDocument();
@@ -406,7 +409,7 @@ test("previews and approves a GitHub-based Netlify deployment", async () => {
   expect(await screen.findByText("https://alpha.netlify.app")).toBeInTheDocument();
   expect(screen.getByText("build-1")).toBeInTheDocument();
   expect(screen.getByText("owner/ai-site-alpha-plumbing")).toBeInTheDocument();
-  expect(screen.getAllByText("GitHub \u2192 Netlify").length).toBeGreaterThan(0);
+  expect(screen.getAllByText("GitHub to Netlify").length).toBeGreaterThan(0);
 });
 
 test("supports retry export, regenerate, and reject actions from approval queue", async () => {

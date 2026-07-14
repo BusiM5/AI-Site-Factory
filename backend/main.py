@@ -336,6 +336,76 @@ LEAD_PRESETS = [
         "query": "gyms fitness studios",
         "description": "Gyms, personal trainers, wellness studios, and fitness centers.",
     },
+    {
+        "id": "electricians",
+        "label": "Electricians",
+        "industry": "Electrical",
+        "query": "electricians electrical services",
+        "description": "Electrical repairs, wiring, inspections, and maintenance providers.",
+    },
+    {
+        "id": "roofers",
+        "label": "Roofers",
+        "industry": "Roofing",
+        "query": "roofers roofing contractors",
+        "description": "Roof repairs, waterproofing, installations, and maintenance teams.",
+    },
+    {
+        "id": "hvac",
+        "label": "HVAC",
+        "industry": "HVAC",
+        "query": "hvac air conditioning heating",
+        "description": "Air conditioning, heating, refrigeration, and ventilation specialists.",
+    },
+    {
+        "id": "auto-repair",
+        "label": "Auto Repair",
+        "industry": "Automotive",
+        "query": "auto repair mechanics",
+        "description": "Mechanics, vehicle repair workshops, panel beaters, and service centers.",
+    },
+    {
+        "id": "locksmiths",
+        "label": "Locksmiths",
+        "industry": "Locksmith",
+        "query": "locksmiths",
+        "description": "Lock repairs, key cutting, security locks, and emergency access services.",
+    },
+    {
+        "id": "pest-control",
+        "label": "Pest Control",
+        "industry": "Pest Control",
+        "query": "pest control",
+        "description": "Residential, commercial, and specialist pest control providers.",
+    },
+    {
+        "id": "cleaning-services",
+        "label": "Cleaning Services",
+        "industry": "Cleaning",
+        "query": "cleaning services",
+        "description": "Home, office, carpet, industrial, and specialist cleaning teams.",
+    },
+    {
+        "id": "landscapers",
+        "label": "Landscapers",
+        "industry": "Landscaping",
+        "query": "landscapers garden services",
+        "description": "Garden maintenance, landscaping, irrigation, and outdoor care businesses.",
+    },
+    {
+        "id": "painters",
+        "label": "Painters",
+        "industry": "Painting",
+        "query": "painters painting contractors",
+        "description": "Interior, exterior, residential, and commercial painting contractors.",
+    },
+    {
+        "id": "accountants",
+        "label": "Accountants",
+        "industry": "Accounting",
+        "query": "accountants bookkeeping tax",
+        "description": "Accounting, bookkeeping, payroll, and tax practices.",
+    },
 ]
 
 
@@ -835,7 +905,8 @@ def extract_phone_from_text(text: str) -> Optional[str]:
 def extract_email_from_item(item: Dict[str, Any]) -> Optional[str]:
     direct = first_present(item, ["email", "contactEmail", "mail"])
     if direct:
-        return direct.lower()
+        found = extract_emails_from_text(direct)
+        return found[0] if found else direct.lower()
 
     emails = item.get("emails") or item.get("emailAddresses")
     if isinstance(emails, list):
@@ -850,6 +921,18 @@ def extract_email_from_item(item: Dict[str, Any]) -> Optional[str]:
 
     found = extract_emails_from_text(json.dumps(item, default=str))
     return found[0] if found else None
+
+
+def lead_disqualification_reason(lead: DiscoveredLead) -> Optional[str]:
+    website = normalize_url(lead.website)
+    domain = compact_text(lead.domain) or domain_from_url(website)
+
+    if website or domain:
+        return "hasWebsite"
+
+    return None
+def is_qualified_discovery_lead(lead: DiscoveredLead) -> bool:
+    return lead_disqualification_reason(lead) is None
 
 
 SOUTH_AFRICA_TERMS = [
@@ -6049,6 +6132,7 @@ def discover_leads(request: DiscoverLeadsRequest):
     preset = get_preset_or_404(request.presetId)
     location = compact_text(request.location, "Durban, South Africa")
     limit = max(1, min(request.limit or 5, 200))
+    apify_limit = min(max(limit * 5, 5), 500)
     primary_query = build_google_maps_query(preset, location, request.query)
 
     if not request.forceRefresh:
@@ -6078,10 +6162,12 @@ def discover_leads(request: DiscoverLeadsRequest):
         location: {
             "rawItems": 0,
             "normalized": 0,
+            "qualified": 0,
             "selected": 0,
             "duplicatesSkipped": 0,
             "websitesSkipped": 0,
             "noContactSkipped": 0,
+            "unqualifiedSkipped": 0,
             "eligible": 0,
             "emailLeads": 0,
             "phoneLeads": 0,
@@ -6097,10 +6183,11 @@ def discover_leads(request: DiscoverLeadsRequest):
         location=location,
         query=primary_query,
         limit=limit,
+        rawFetchLimit=apify_limit,
     )
 
     try:
-        fetch_limit = min(max(limit * 8, limit + 30), 500)
+        fetch_limit = apify_limit
         query_items = run_apify_google_maps(primary_query, fetch_limit, location)
         raw_fetched = len(query_items)
         province_stats[location]["rawItems"] = raw_fetched
@@ -6113,10 +6200,12 @@ def discover_leads(request: DiscoverLeadsRequest):
         )
         province_stats[location]["normalized"] = len(normalized)
 
+        qualified = normalized
+        province_stats[location]["qualified"] = len(qualified)
         seen_batch_keys = set()
         seen_batch_identities: Set[str] = set()
 
-        for lead in normalized:
+        for lead in qualified:
             canonical_key = canonical_lead_key_for_lead(lead)
             lead.canonicalLeadKey = canonical_key
             lead.location = location
@@ -7309,19 +7398,36 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
                 ),
             )
         else:
-            deployment = run_approval_step(
-                "netlify_git_deploy",
-                "netlify",
-                lambda: deploy_github_repo_to_netlify_for_lead(
-                    canonical_key=row["canonical_lead_key"],
-                    business_name=row["business_name"],
-                    pipeline_id=row["pipeline_id"],
-                    approval_id=approval_id,
-                    approved_by=approved_by,
-                    github_export=github_export,
-                    regenerate_existing_site=request.regenerateExistingSite,
-                ),
-            )
+            try:
+                deployment = run_approval_step(
+                    "netlify_git_deploy",
+                    "netlify",
+                    lambda: deploy_github_repo_to_netlify_for_lead(
+                        canonical_key=row["canonical_lead_key"],
+                        business_name=row["business_name"],
+                        pipeline_id=row["pipeline_id"],
+                        approval_id=approval_id,
+                        approved_by=approved_by,
+                        github_export=github_export,
+                        regenerate_existing_site=request.regenerateExistingSite,
+                    ),
+                )
+            except Exception as git_error:
+                errors.append(structured_pipeline_error("netlify_git_deploy", git_error, provider="netlify", retryable=True))
+                deployment = run_approval_step(
+                    "netlify_direct_fallback_deploy",
+                    "netlify",
+                    lambda: deploy_direct_netlify_fallback_for_lead(
+                        canonical_key=row["canonical_lead_key"],
+                        business_name=row["business_name"],
+                        site_html=site_html,
+                        pipeline_id=row["pipeline_id"],
+                        approval_id=approval_id,
+                        approved_by=approved_by,
+                        github_export=github_export,
+                        git_error=git_error,
+                    ),
+                )
         effective_publish_mode = deployment.get("publishMode", publish_mode)
         deployment_history = deployment_history_row_to_dict(get_deployment_history_row(deployment.get("deploymentHistoryId")))
     except Exception as error:

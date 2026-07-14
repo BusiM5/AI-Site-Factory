@@ -1,11 +1,13 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+﻿import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BrowserRouter, NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
 import axios from "axios";
 import { gsap } from "gsap";
+import { LayoutDashboard, ListChecks, Rocket, Settings } from "lucide-react";
 import "./App.css";
 
-const API_BASE = (process.env.REACT_APP_API_BASE || "http://127.0.0.1:8000").replace(/\/$/, "");
+const API_BASE = (import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000").replace(/\/$/, "");
 const MAX_UI_LOGS = 80;
+const LEAD_COUNT_OPTIONS = [1, 2, 3, 4, 5, 10, 15, 20];
 
 const FALLBACK_PRESETS = [
   { id: "restaurants", label: "Restaurants", industry: "Restaurant", description: "Local restaurants and cafes." },
@@ -13,13 +15,74 @@ const FALLBACK_PRESETS = [
   { id: "dentists", label: "Dentists", industry: "Dental", description: "Dental practices and oral care providers." },
   { id: "beauty-salons", label: "Beauty Salons", industry: "Beauty", description: "Beauty salons, spas, and care studios." },
   { id: "gyms-fitness", label: "Gyms/Fitness", industry: "Fitness", description: "Gyms, trainers, and wellness studios." },
+  { id: "electricians", label: "Electricians", industry: "Electrical", description: "Electrical repairs, wiring, and maintenance services." },
+  { id: "roofers", label: "Roofers", industry: "Roofing", description: "Roof repairs, waterproofing, and installation teams." },
+  { id: "hvac", label: "HVAC", industry: "HVAC", description: "Air conditioning, heating, and ventilation specialists." },
+  { id: "auto-repair", label: "Auto Repair", industry: "Automotive", description: "Mechanics, panel beaters, and vehicle repair workshops." },
+  { id: "locksmiths", label: "Locksmiths", industry: "Locksmith", description: "Lock repairs, key cutting, and emergency access services." },
+  { id: "pest-control", label: "Pest Control", industry: "Pest Control", description: "Residential and commercial pest control providers." },
+  { id: "cleaning-services", label: "Cleaning Services", industry: "Cleaning", description: "Home, office, carpet, and specialist cleaning teams." },
+  { id: "landscapers", label: "Landscapers", industry: "Landscaping", description: "Garden maintenance, landscaping, and outdoor care businesses." },
+  { id: "painters", label: "Painters", industry: "Painting", description: "Interior, exterior, and commercial painting contractors." },
+  { id: "accountants", label: "Accountants", industry: "Accounting", description: "Bookkeeping, tax, payroll, and accounting practices." },
 ];
 
 const NAV_ITEMS = [
-  { path: "/pipeline", label: "Operations Hub", icon: "▦" },
-  { path: "/deployments", label: "Deployments", icon: "↗" },
-  { path: "/pipeline-runs", label: "Runs", icon: "⌁" },
-  { path: "/admin", label: "Settings", icon: "⚙" },
+  { path: "/pipeline", label: "Operations Hub", icon: LayoutDashboard },
+  { path: "/deployments", label: "Deployments", icon: Rocket },
+  { path: "/pipeline-runs", label: "Runs", icon: ListChecks },
+  { path: "/admin", label: "Settings", icon: Settings },
+];
+
+const OPERATION_STAGES = [
+  {
+    key: "fetched",
+    label: "Fetched",
+    help: "Raw leads returned by discovery.",
+    value: (group) => operationStepValue(group, "Fetched", group.rawFetched || group.leadCount || 0),
+  },
+  {
+    key: "eligible",
+    label: "Eligible",
+    help: "No-website leads with contact data.",
+    value: (group) => operationStepValue(group, "Eligible", group.eligible || group.leadCount || 0),
+  },
+  {
+    key: "generated",
+    label: "Generated",
+    help: "Landing pages created.",
+    value: (group) => operationStepValue(group, "Generated", group.generated || 0),
+  },
+  {
+    key: "github",
+    label: "GitHub",
+    help: "Site files exported to repos.",
+    value: (group) => operationStepValue(group, "GitHub", group.githubExported || 0),
+  },
+  {
+    key: "zendesk",
+    label: "Zendesk",
+    help: "Outreach tickets created.",
+    value: (group) => operationStepValue(group, "Zendesk", group.zendeskTickets || group.zendeskPending || 0),
+  },
+  {
+    key: "pending",
+    label: "Pending",
+    help: "Waiting for approval or follow-up.",
+    value: (group) => operationStepValue(group, "Pending", Math.max(0, (group.generated || 0) - (group.live || 0) - (group.failed || 0))),
+  },
+  {
+    key: "live",
+    label: "Live",
+    help: "Approved sites online.",
+    value: (group) => operationStepValue(group, "Live", group.live || 0),
+  },
+  {
+    key: "failed",
+    label: "Failed",
+    help: "Needs retry or review.",
+    value: (group) => operationStepValue(group, "Failed", group.failed || 0),
+  },
 ];
 
 function statusBadgeClass(status = "") {
@@ -60,7 +123,7 @@ function deploymentModeLabel(item = {}) {
   if (mode === "direct-netlify-fallback") return "Direct Netlify fallback";
   if (String(item.status || item.state || "").toUpperCase().includes("FAILED")) return "Failed";
   if (String(mode).toLowerCase().includes("fallback")) return "Direct Netlify fallback";
-  return "GitHub \u2192 Netlify";
+  return "GitHub to Netlify";
 }
 
 function deploymentModeBadgeClass(item = {}) {
@@ -93,15 +156,26 @@ function TechnicalDetails({ data }) {
   );
 }
 
-function ErrorSummary({ errors }) {
-  const messages = normalizeErrors(errors);
+function CompactMessageSummary({ items, tone = "danger", singular = "issue", plural = "issues" }) {
+  const messages = normalizeErrors(items);
   if (!messages.length) return null;
   return (
-    <div className="error-summary">
-      {messages.map((message, index) => <p key={`${message}-${index}`}>{message}</p>)}
-      <TechnicalDetails data={errors} />
+    <div className={`message-summary ${tone}`}>
+      <p>
+        <strong>{messages.length} {messages.length === 1 ? singular : plural}</strong>
+        <span>Full details are collapsed below.</span>
+      </p>
+      <TechnicalDetails data={items} />
     </div>
   );
+}
+
+function ErrorSummary({ errors }) {
+  return <CompactMessageSummary items={errors} tone="danger" singular="issue" plural="issues" />;
+}
+
+function WarningSummary({ warnings, singular = "warning", plural = "warnings" }) {
+  return <CompactMessageSummary items={warnings} tone="warning" singular={singular} plural={plural} />;
 }
 
 function Section({ title, help, action, children }) {
@@ -455,7 +529,7 @@ function AppShell() {
   const approveSite = async (approvalId) => {
     try {
       setApprovalBusy(approvalId);
-      setBusyPhase("Deploying approved site through GitHub → Netlify...");
+      setBusyPhase("Deploying approved site through GitHub to Netlify...");
       const data = await callApi("Approval Deploy API", "post", `/api/approvals/${approvalId}/approve`, { approvedBy: "Pipeline Operator", notes: "Approved from Pipeline Workspace." }, { timeout: 420000 });
       setNotice(`Approved and deployed ${data.businessName}.`, data.status === "APPROVED" ? "success" : "warning");
       refreshOperations(true);
@@ -656,12 +730,15 @@ function AppShell() {
           <span>GitHub to Netlify</span>
         </div>
         <nav>
-          {NAV_ITEMS.map((item) => (
-            <NavLink key={item.path} to={item.path} className={({ isActive }) => (isActive ? "active" : "")}>
-              <span className="nav-icon" aria-hidden="true">{item.icon}</span>
-              {item.label}
-            </NavLink>
-          ))}
+          {NAV_ITEMS.map((item) => {
+            const Icon = item.icon;
+            return (
+              <NavLink key={item.path} to={item.path} className={({ isActive }) => (isActive ? "active" : "")}>
+                <span className="nav-icon" aria-hidden="true"><Icon size={18} strokeWidth={2.4} /></span>
+                {item.label}
+              </NavLink>
+            );
+          })}
         </nav>
       </aside>
       <main className="content-shell" ref={contentRef}>
@@ -918,59 +995,13 @@ function OperationFilters({ filters, setFilters }) {
   );
 }
 
-function OperationGroupList({ groups, meta, expandedGroups, setExpandedGroups, setOperationFilters, approvalPreviews, approvalBusy, previewApproval, approveSite, retryExport, rejectSite, regenerateSite }) {
+function OperationGroupList({ groups, meta, setOperationFilters }) {
   if (!groups.length) return <EmptyState title="No operation groups" text="Run a batch to see grouped leads and Zendesk work here." />;
-  const toggle = (groupId) => setExpandedGroups((current) => ({ ...current, [groupId]: !current[groupId] }));
   const goToPage = (page) => setOperationFilters((current) => ({ ...current, page }));
+  const stageSummary = summarizeOperationStages(groups);
   return (
     <div className="operation-stack">
-      {groups.map((group) => (
-        <article className="operation-group" key={group.groupId}>
-          <button className="operation-group-head" type="button" onClick={() => toggle(group.groupId)}>
-            <span className={`badge ${statusBadgeClass(group.status)}`}>{group.status}</span>
-            <div>
-              <h3>{group.query || "Pipeline batch"} · {group.location || "No location"}</h3>
-              <p>{displayDate(group.createdAt)} · {group.pipelineId}</p>
-            </div>
-            <span>{expandedGroups[group.groupId] ? "Hide" : "Open"}</span>
-          </button>
-          <div className="operation-stats">
-            {[
-              ["Leads", group.leadCount],
-              ["Duplicates", group.duplicatesSkipped],
-              ["Email", group.emailLeads],
-              ["Phone", group.phoneLeads],
-              ["Generated", group.generated],
-              ["Zendesk pending", group.zendeskPending],
-              ["Deploy approved", group.deployApproved],
-              ["Live", group.live],
-              ["Failed", group.failed],
-            ].map(([label, value]) => <div key={label}><strong>{value || 0}</strong><span>{label}</span></div>)}
-          </div>
-          <OperationFlowChart group={group} />
-          {expandedGroups[group.groupId] && (
-            <div className="operation-nested">
-              {(group.approvals || []).length ? (
-                group.approvals.map((approval) => (
-                  <ApprovalItem
-                    key={approval.approvalId}
-                    approval={approval}
-                    previewHtml={approvalPreviews[approval.approvalId]}
-                    busy={approvalBusy === approval.approvalId}
-                    onPreview={() => previewApproval(approval.approvalId)}
-                    onApprove={() => approveSite(approval.approvalId)}
-                    onRetry={() => retryExport(approval.approvalId)}
-                    onReject={() => rejectSite(approval.approvalId)}
-                    onRegenerate={() => regenerateSite(approval.approvalId)}
-                  />
-                ))
-              ) : (
-                <EmptyState title="No matching approvals in this group" />
-              )}
-            </div>
-          )}
-        </article>
-      ))}
+      <OperationFlowOverview groups={groups} stages={stageSummary} />
       <div className="pagination-row">
         <button className="btn btn-outline-secondary btn-sm" type="button" disabled={meta.page <= 1} onClick={() => goToPage(meta.page - 1)}>Previous</button>
         <span>Page {meta.page} of {meta.totalPages} | {meta.total} groups</span>
@@ -980,35 +1011,45 @@ function OperationGroupList({ groups, meta, expandedGroups, setExpandedGroups, s
   );
 }
 
-function OperationFlowChart({ group }) {
-  const steps = group.chartSteps?.length
-    ? group.chartSteps
-    : [
-        { label: "Fetched", value: group.rawFetched || group.leadCount || 0 },
-        { label: "Eligible", value: group.eligible || group.leadCount || 0 },
-        { label: "Generated", value: group.generated || 0 },
-        { label: "GitHub", value: group.githubExported || 0 },
-        { label: "Zendesk", value: group.zendeskTickets || 0 },
-        { label: "Pending", value: Math.max(0, (group.generated || 0) - (group.live || 0) - (group.failed || 0)) },
-        { label: "Live", value: group.live || 0 },
-        { label: "Failed", value: group.failed || 0 },
-      ];
-  const maxValue = Math.max(1, ...steps.map((step) => Number(step.value) || 0));
+function operationStepValue(group, label, fallback = 0) {
+  const match = group.chartSteps?.find((step) => String(step.label || "").toLowerCase() === label.toLowerCase());
+  return Number(match?.value ?? fallback) || 0;
+}
+
+function summarizeOperationStages(groups) {
+  return OPERATION_STAGES.map((stage) => ({
+    ...stage,
+    total: groups.reduce((total, group) => total + stage.value(group), 0),
+  }));
+}
+
+function OperationFlowOverview({ groups, stages }) {
+  const maxValue = Math.max(1, ...stages.map((stage) => Number(stage.total) || 0));
   return (
-    <div className="operation-flow" aria-label={`Pipeline flow for ${group.pipelineId}`}>
-      {steps.map((step, index) => {
-        const value = Number(step.value) || 0;
-        return (
-          <Fragment key={step.label}>
-            <div className={`flow-node ${step.label.toLowerCase() === "failed" && value ? "flow-failed" : ""}`}>
-              <strong>{value}</strong>
-              <span>{step.label}</span>
+    <div className="operation-flow-board">
+      <div className="operation-flow-board-head">
+        <div>
+          <h3>Pipeline Stages</h3>
+          <p>Work moves left to right, from discovery through live deployment.</p>
+        </div>
+        <span>{groups.length} active {groups.length === 1 ? "batch" : "batches"}</span>
+      </div>
+      <div className="stage-flow" aria-label="Overall operations pipeline diagram">
+        {stages.map((stage, index) => {
+          const value = Number(stage.total) || 0;
+          return (
+            <div className={`stage-node ${stage.key === "failed" && value ? "stage-failed" : ""} ${index === stages.length - 1 ? "is-last" : ""}`} key={stage.key}>
+              <div className="stage-node-top">
+                <span>{index + 1}</span>
+                <strong>{value}</strong>
+              </div>
+              <h4>{stage.label}</h4>
+              <p>{stage.help}</p>
               <div className="flow-bar"><i style={{ width: `${Math.max(8, Math.round((value / maxValue) * 100))}%` }} /></div>
             </div>
-            {index < steps.length - 1 && <span className="flow-arrow" aria-hidden="true">→</span>}
-          </Fragment>
-        );
-      })}
+          );
+        })}
+      </div>
     </div>
   );
 }
@@ -1099,7 +1140,7 @@ function PipelineResultCard({ result }) {
         {result.githubExport?.commitSha && <div><dt>Commit</dt><dd>{result.githubExport.commitSha}</dd></div>}
       </dl>
       {result.stepHistory?.length > 0 && <StepList steps={result.stepHistory} />}
-      {result.errors?.length > 0 && <div className="alert alert-danger">{result.errors.join(" ")}</div>}
+      <ErrorSummary errors={result.errors} />
     </article>
   );
 }
@@ -1198,7 +1239,7 @@ function DeploymentList({ deployments, detailed = false }) {
             {detailed && <div><dt>Approved</dt><dd>{displayDate(deployment.deployed_at || deployment.deployedAt)}</dd></div>}
           </dl>
           <ErrorSummary errors={deployment.raw?.errors} />
-          {deployment.raw?.fallbackReason && <div className="alert alert-warning">Git-linked deploy failed, so this site used direct Netlify fallback: {deployment.raw.fallbackReason}</div>}
+          {deployment.raw?.fallbackReason && <WarningSummary warnings={[`Git-linked deploy failed, so this site used direct Netlify fallback: ${deployment.raw.fallbackReason}`]} />}
           <TechnicalDetails data={deployment.raw} />
         </article>
       ))}

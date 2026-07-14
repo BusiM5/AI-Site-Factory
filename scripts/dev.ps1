@@ -293,6 +293,14 @@ function Install-BackendDependencies {
     Write-Step "Installing backend dependencies"
     New-VirtualEnvironment
 
+    if (-not $InstallOnly -and (Test-Path $VenvPython)) {
+        & $VenvPython -c "import fastapi, uvicorn" *> $null
+        if ($LASTEXITCODE -eq 0) {
+            Write-Info "Using existing backend dependencies."
+            return
+        }
+    }
+
     & $VenvPython -m pip install --upgrade pip
     & $VenvPython -m pip install -r (Join-Path $BackendDir "requirements.txt")
 
@@ -306,13 +314,23 @@ function Install-FrontendDependencies {
     Write-Step "Installing frontend dependencies"
     Assert-Command "npm"
 
+    $frontendRunnerCommand = Join-Path $FrontendDir "node_modules\.bin\vite.cmd"
+    if ($env:OS -ne "Windows_NT") {
+        $frontendRunnerCommand = Join-Path $FrontendDir "node_modules/.bin/vite"
+    }
+
+    if (-not $InstallOnly -and (Test-Path -LiteralPath $frontendRunnerCommand)) {
+        Write-Info "Using existing frontend dependencies."
+        return
+    }
+
     Push-Location $FrontendDir
     try {
         if (Test-Path "package-lock.json") {
-            $installArgs = @("ci")
+            $installArgs = @("ci", "--no-audit", "--no-fund")
         }
         else {
-            $installArgs = @("install")
+            $installArgs = @("install", "--no-audit", "--no-fund")
         }
 
         try {
@@ -334,13 +352,8 @@ function Install-FrontendDependencies {
             }
         }
 
-        $reactScriptsCommand = Join-Path $FrontendDir "node_modules\.bin\react-scripts.cmd"
-        if ($env:OS -ne "Windows_NT") {
-            $reactScriptsCommand = Join-Path $FrontendDir "node_modules/.bin/react-scripts"
-        }
-
-        if (-not (Test-Path -LiteralPath $reactScriptsCommand)) {
-            Write-Warning "react-scripts was not installed; retrying frontend dependency install."
+        if (-not (Test-Path -LiteralPath $frontendRunnerCommand)) {
+            Write-Warning "vite was not installed; retrying frontend dependency install."
             Remove-FrontendPathWithRetry -Path (Join-Path $FrontendDir "node_modules") -Description "frontend node_modules"
             Invoke-Npm $installArgs
         }
@@ -522,7 +535,7 @@ try {
 
     Write-Step "Starting frontend"
     Write-Info "Frontend will use http://127.0.0.1:$BackendPort as its API base by default."
-    $frontendStartCommand = "set PORT=$FrontendPort&& set REACT_APP_API_BASE=http://127.0.0.1:$BackendPort&& npm.cmd start"
+    $frontendStartCommand = "set PORT=$FrontendPort&& set VITE_API_BASE=http://127.0.0.1:$BackendPort&& npm.cmd start -- --port $FrontendPort --strictPort"
     $script:FrontendProcess = Start-ManagedProcess `
         -Name "frontend" `
         -FileName "cmd.exe" `

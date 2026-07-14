@@ -116,18 +116,21 @@ class FakeResponse:
             raise RuntimeError(f"HTTP {self.status_code}")
 
 
-def apify_item(index, category="Restaurant", province="Gauteng"):
-    return {
+def apify_item(index, category="Restaurant", province="Gauteng", website=None, email=None, phone=None, address=None):
+    item = {
         "title": f"Lead Business {index}",
         "website": None,
         "phone": f"+27 11 000 {index:04d}",
         "categoryName": category,
-        "address": f"{index} Market Street, {province}, South Africa",
+        "address": address if address is not None else f"{index} Market Street, {province}, South Africa",
         "countryCode": "ZA",
         "rating": 4.5,
         "reviewsCount": 20 + index,
         "googleMapsUrl": f"https://maps.example.com/{index}",
     }
+    if website is not None:
+        item["website"] = website
+    return item
 
 
 def lead_payload():
@@ -309,7 +312,7 @@ def test_discover_leads_searches_requested_location_and_caches(monkeypatch):
     assert calls == [("family restaurants in Gauteng, South Africa", "Gauteng, South Africa", 10)]
 
 
-def test_discover_force_refresh_skips_previously_seen_duplicate(monkeypatch):
+def test_discover_force_refresh_can_reuse_discovered_leads(monkeypatch):
     monkeypatch.setattr(main, "run_apify_google_maps", lambda query, limit, location="South Africa": [apify_item(1, province="Gauteng")])
 
     first = client.post("/api/leads/discover", json={"presetId": "restaurants", "location": "South Africa", "limit": 1})
@@ -319,8 +322,9 @@ def test_discover_force_refresh_skips_previously_seen_duplicate(monkeypatch):
     assert len(first.json()["leads"]) == 1
     assert second.status_code == 200
     assert second.json()["cached"] is False
-    assert second.json()["leads"] == []
-    assert second.json()["duplicatesSkipped"] == 1
+    assert len(second.json()["leads"]) == 1
+    assert second.json()["leads"][0]["businessName"] == "Lead Business 1"
+    assert second.json()["duplicatesSkipped"] == 0
 
 
 def test_discover_filters_out_website_present_leads(monkeypatch):
@@ -483,33 +487,44 @@ def test_approval_deploys_from_github_and_clears_successful_html(monkeypatch):
     assert step_names.index("github_export") < step_names.index("netlify_git_deploy")
 
 
-def test_failed_github_netlify_deployment_keeps_generated_html(monkeypatch):
+def test_failed_github_netlify_deployment_uses_direct_fallback(monkeypatch):
     stub_generation(monkeypatch)
 
     def failed_deploy(*args, **kwargs):
         raise RuntimeError("netlify build failed")
 
+    def fallback_deploy(**kwargs):
+        return {
+            "deployAction": "DIRECT_FALLBACK_CREATED",
+            "siteCreated": True,
+            "siteReused": False,
+            "siteId": f"site-{kwargs['canonical_key']}",
+            "siteName": "ai-site-alpha-fallback",
+            "buildId": None,
+            "deployId": f"deploy-{kwargs['canonical_key']}",
+            "state": "ready",
+            "url": "https://alpha-fallback.netlify.app",
+            "deploymentHistoryId": None,
+            "publishMode": "direct-netlify-fallback",
+            "deploymentMode": "Direct Netlify fallback",
+            "githubExport": kwargs["github_export"],
+        }
+
     monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", failed_deploy)
+    monkeypatch.setattr(main, "deploy_direct_netlify_fallback_for_lead", fallback_deploy)
+    monkeypatch.setattr(main, "generate_outreach_with_groq", lambda context, site_url: {"subject": "Preview", "body": f"See {site_url}"})
+    monkeypatch.setattr(main, "create_zendesk_outreach_ticket", lambda *args, **kwargs: {"syncStatus": "TICKET_CREATED", "ticketId": 123})
     pipeline = client.post("/api/pipeline/run", json={"templateId": "default-service", "leads": [lead_payload()]}).json()
     approval_id = pipeline["results"][0]["pendingApprovalId"]
 
     response = client.post(f"/api/approvals/{approval_id}/approve", json={"approvedBy": "Ops"})
     detail = client.get(f"/api/approvals/{approval_id}?includeHtml=true").json()
 
-    assert response.status_code == 502
-    assert detail["status"] == "DEPLOY_FAILED"
-    assert detail["pendingPreviewHtml"]
-    assert detail["previewAvailable"] is True
+    assert response.status_code == 200
+    assert response.json()["status"] == "APPROVED"
+    assert response.json()["deployment"]["publishMode"] == "direct-netlify-fallback"
+    assert detail["status"] == "APPROVED"
     assert detail["errors"][0]["retryable"] is True
-
-    monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", fake_git_deploy_with_history)
-    monkeypatch.setattr(main, "generate_outreach_with_groq", lambda context, site_url: {"subject": "Preview", "body": f"See {site_url}"})
-    monkeypatch.setattr(main, "create_zendesk_outreach_ticket", lambda *args, **kwargs: {"syncStatus": "TICKET_CREATED", "ticketId": 123})
-
-    retry = client.post(f"/api/approvals/{approval_id}/approve", json={"approvedBy": "Ops"})
-
-    assert retry.status_code == 200
-    assert retry.json()["status"] == "APPROVED"
 
 
 def test_approval_requires_successful_github_export_before_deploy():
@@ -602,6 +617,15 @@ def test_zendesk_phone_lead_ticket_is_private_tagged_and_has_no_fake_email(monke
         "phone": "+27 31 000 0000",
         "source": "Google Maps",
     }
+    deployment = {"url": "https://alpha.netlify.app"}
+    outreach = {"subject": "Website preview", "body": "See https://alpha.netlify.app"}
+    result = main.create_zendesk_outreach_ticket(context, deployment, outreach, "pipeline-1")
+
+    assert result["ticketId"] == 999
+    assert result["contactType"] == "phone"
+    assert result["liveLink"] == "https://alpha.netlify.app"
+    assert "ai_site_no_website" in result["tags"]
+    assert len(captured_posts) == 2
 
 
 def test_discovery_accepts_large_limit_and_returns_contactable_mixed_leads(monkeypatch):
@@ -681,15 +705,6 @@ def test_already_generated_lead_is_skipped_in_discovery(monkeypatch):
     payload = result.json()
     assert payload["leads"] == []
     assert payload["generatedDuplicatesSkipped"] == 1
-    deployment = {"url": "https://alpha.netlify.app"}
-    outreach = main.generate_outreach_with_groq(context, deployment["url"])
-    result = main.create_zendesk_outreach_ticket(context, deployment, outreach, "pipeline-1")
-
-    assert result["ticketId"] == 999
-    assert result["contactType"] == "phone"
-    assert result["liveLink"] == "https://alpha.netlify.app"
-    assert "ai_site_no_website" in result["tags"]
-    assert len(captured_posts) == 2
 
 
 def test_sites_endpoint_filters_by_live_email_leads(monkeypatch):
