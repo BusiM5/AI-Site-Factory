@@ -31,7 +31,10 @@ import {
 } from "lucide-react";
 import "./App.css";
 
-const API_BASE = (import.meta.env.VITE_API_BASE || "http://127.0.0.1:8000").replace(/\/$/, "");
+const DEFAULT_API_BASE = import.meta.env.PROD
+  ? "https://ai-site-factory-backend-c4w6.onrender.com"
+  : "http://127.0.0.1:8000";
+const API_BASE = (import.meta.env.VITE_API_BASE || DEFAULT_API_BASE).replace(/\/$/, "");
 
 const FALLBACK_PRESETS = [
   { id: "restaurants", label: "Restaurants", industry: "Restaurant", description: "Restaurants, cafes, and takeaways." },

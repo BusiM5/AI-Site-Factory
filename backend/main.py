@@ -1132,6 +1132,41 @@ def pipeline_db_path() -> str:
     return path
 
 
+PIPELINE_SEED_TABLES = [
+    "lead_registry",
+    "lead_identity_index",
+    "discovery_batches",
+    "pipeline_runs",
+    "pipeline_steps",
+    "site_registry",
+    "github_site_repos",
+    "deployment_history",
+    "approval_records",
+    "campaigns",
+    "campaign_deployments",
+    "campaign_email_leads",
+    "campaign_call_leads",
+    "zendesk_field_settings",
+    "zendesk_provisioned_resources",
+    "zendesk_ticket_links",
+    "zendesk_webhook_events",
+]
+
+PIPELINE_SEED_ANCHOR_TABLES = [
+    "campaigns",
+    "pipeline_runs",
+    "approval_records",
+    "lead_registry",
+]
+
+
+def pipeline_seed_path() -> str:
+    return os.getenv(
+        "PIPELINE_SEED_PATH",
+        os.path.join(os.path.dirname(__file__), "data", "pipeline.seed.json"),
+    )
+
+
 def get_pipeline_db() -> sqlite3.Connection:
     connection = sqlite3.connect(pipeline_db_path())
     connection.row_factory = sqlite3.Row
@@ -1473,6 +1508,91 @@ def init_pipeline_db() -> None:
         ensure_db_column(db, "site_registry", "github_repo_url", "github_repo_url TEXT")
         ensure_db_column(db, "site_registry", "last_commit_sha", "last_commit_sha TEXT")
         ensure_db_column(db, "site_registry", "last_build_id", "last_build_id TEXT")
+
+
+def restore_pipeline_seed_if_empty() -> Dict[str, Any]:
+    """Restore the committed baseline only when the deployment database has no app data."""
+    seed_path = pipeline_seed_path()
+    if not os.path.exists(seed_path):
+        return {"restored": False, "reason": "seed_not_found", "path": seed_path}
+
+    with get_pipeline_db() as db:
+        existing_counts = {
+            table: db.execute(f'SELECT COUNT(*) AS count FROM "{table}"').fetchone()["count"]
+            for table in PIPELINE_SEED_ANCHOR_TABLES
+        }
+        if any(existing_counts.values()):
+            return {
+                "restored": False,
+                "reason": "database_not_empty",
+                "existingCounts": existing_counts,
+            }
+
+        try:
+            with open(seed_path, "r", encoding="utf-8") as seed_file:
+                payload = json.load(seed_file)
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Pipeline seed could not be read: {exc}") from exc
+
+        if payload.get("schemaVersion") != 1 or not isinstance(payload.get("tables"), dict):
+            raise RuntimeError("Pipeline seed has an unsupported schema.")
+
+        restored_counts: Dict[str, int] = {}
+        db.execute("PRAGMA foreign_keys = OFF")
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            for table in PIPELINE_SEED_TABLES:
+                rows = payload["tables"].get(table, [])
+                if not isinstance(rows, list):
+                    raise RuntimeError(f"Pipeline seed table '{table}' is invalid.")
+                table_columns = {
+                    column["name"]
+                    for column in db.execute(f'PRAGMA table_info("{table}")').fetchall()
+                }
+                inserted = 0
+                for row in rows:
+                    if not isinstance(row, dict):
+                        raise RuntimeError(f"Pipeline seed row in '{table}' is invalid.")
+                    columns = [column for column in row if column in table_columns]
+                    if not columns:
+                        continue
+                    quoted_columns = ", ".join(f'"{column}"' for column in columns)
+                    placeholders = ", ".join("?" for _ in columns)
+                    before = db.total_changes
+                    db.execute(
+                        f'INSERT OR IGNORE INTO "{table}" ({quoted_columns}) VALUES ({placeholders})',
+                        tuple(row[column] for column in columns),
+                    )
+                    inserted += db.total_changes - before
+                restored_counts[table] = inserted
+
+            foreign_key_issues = db.execute("PRAGMA foreign_key_check").fetchall()
+            if foreign_key_issues:
+                first_issue = dict(foreign_key_issues[0])
+                raise RuntimeError(f"Pipeline seed violates a foreign key: {first_issue}")
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.execute("PRAGMA foreign_keys = ON")
+
+    total = sum(restored_counts.values())
+    result = {
+        "restored": total > 0,
+        "reason": "seed_restored" if total > 0 else "seed_empty",
+        "restoredCounts": restored_counts,
+        "total": total,
+    }
+    if total:
+        log_event(
+            "info",
+            "pipeline.seed_restored",
+            "Previous application data restored into an empty deployment database.",
+            total=total,
+            restoredCounts=restored_counts,
+        )
+    return result
 
 def canonical_lead_key_from_values(
     raw: Dict[str, Any],
@@ -2988,6 +3108,7 @@ def backfill_legacy_campaign_data() -> Dict[str, int]:
 
 
 init_pipeline_db()
+restore_pipeline_seed_if_empty()
 backfill_legacy_campaign_data()
 
 
@@ -8288,6 +8409,13 @@ def list_campaigns(limit: int = 50):
 def backfill_campaigns():
     stats = backfill_legacy_campaign_data()
     return {"backfill": stats, **list_campaigns(200)}
+
+
+@app.post("/api/campaigns/restore-seed")
+def restore_campaign_seed():
+    """Manually retry the safe empty-database restore without overwriting live records."""
+    result = restore_pipeline_seed_if_empty()
+    return {"seed": result, **list_campaigns(200)}
 
 
 @app.get("/api/campaigns/{campaign_id}")

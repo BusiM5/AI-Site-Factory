@@ -103,6 +103,26 @@ def isolated_pipeline_db(tmp_path, monkeypatch):
     yield
 
 
+def test_empty_deployment_restores_previous_application_data():
+    first_restore = main.restore_pipeline_seed_if_empty()
+
+    assert first_restore["restored"] is True
+    assert first_restore["restoredCounts"]["campaigns"] == 37
+    assert first_restore["restoredCounts"]["campaign_email_leads"] == 11
+    assert first_restore["restoredCounts"]["campaign_call_leads"] == 17
+    assert first_restore["restoredCounts"]["campaign_deployments"] == 17
+
+    response = client.get("/api/campaigns?limit=200")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["totals"]["campaigns"] == 37
+    assert payload["totals"]["leads"] == 28
+
+    second_restore = main.restore_pipeline_seed_if_empty()
+    assert second_restore["restored"] is False
+    assert second_restore["reason"] == "database_not_empty"
+
+
 class FakeResponse:
     def __init__(self, status_code=200, payload=None):
         self.status_code = status_code
