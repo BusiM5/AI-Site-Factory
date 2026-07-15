@@ -61,6 +61,12 @@ On backend startup, `backfill_legacy_campaign_data()` imports pre-campaign disco
 
 ## Environment
 Configure provider credentials in `backend/.env`. The example env file is intentionally not included because this project uses real provider tokens locally; keep secrets out of source control and rotate any credential that was shared outside a secret manager.
+
+## Vercel frontend deployment
+
+The frontend is a Vite application and its production output is `dist`, not Create React App's legacy `build` directory. The repository includes both `frontend/vercel.json` (when the Vercel Root Directory is `frontend`) and a root `vercel.json` (when the project uses the repository root). Both configurations set the correct build/output paths and rewrite client-side routes to `index.html`.
+
+For the existing Vercel project, keep the Root Directory set to `frontend` and redeploy. The checked-in configuration overrides the old `build` Output Directory setting.
 ## CRM Tracking
 - Zendesk API
 
