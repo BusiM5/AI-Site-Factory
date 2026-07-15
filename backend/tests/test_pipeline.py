@@ -99,6 +99,7 @@ def isolated_pipeline_db(tmp_path, monkeypatch):
     main.DISCOVERY_DB.clear()
     main.PIPELINE_DB.clear()
     main.LOG_BUFFER.clear()
+    main.RUNTIME_INTEGRATION_OVERRIDES.clear()
     yield
 
 
@@ -1010,6 +1011,163 @@ def test_zendesk_field_settings_roundtrip():
     assert "unknown" not in payload["fields"]
 
 
+def zendesk_setup_fake(monkeypatch):
+    state = {
+        "ticket_fields": [
+            {"id": 1, "type": "subject", "title": "Subject"},
+            {"id": 2, "type": "description", "title": "Description"},
+            {"id": 3, "type": "status", "title": "Status"},
+            {"id": 4, "type": "priority", "title": "Priority"},
+            {"id": 5, "type": "tickettype", "title": "Type"},
+            {"id": 6, "type": "group", "title": "Group"},
+            {"id": 7, "type": "assignee", "title": "Assignee"},
+        ],
+        "ticket_forms": [],
+        "views": [],
+        "brands": [{"id": 88, "name": "Default brand", "subdomain": "supporthub", "default": True}],
+        "webhooks": [],
+        "triggers": [],
+    }
+    calls = []
+    counters = {"ticket_field": 1000, "ticket_form": 2000, "view": 3000, "webhook": 4000, "trigger": 5000}
+
+    def collection_for_url(url):
+        if "/ticket_fields" in url:
+            return "ticket_fields", "ticket_field"
+        if "/ticket_forms" in url:
+            return "ticket_forms", "ticket_form"
+        if "/views" in url:
+            return "views", "view"
+        if "/brands" in url:
+            return "brands", "brand"
+        if "/webhooks" in url:
+            return "webhooks", "webhook"
+        if "/triggers" in url:
+            return "triggers", "trigger"
+        raise AssertionError(url)
+
+    def fake_get(url, params=None, auth=None, headers=None, timeout=None):
+        collection, _ = collection_for_url(url)
+        return FakeResponse(200, {collection: state[collection], "next_page": None})
+
+    def fake_post(url, json=None, auth=None, headers=None, timeout=None):
+        collection, root = collection_for_url(url)
+        calls.append(("post", collection))
+        counters[root] += 1
+        item = {"id": counters[root], **json[root]}
+        state[collection].append(item)
+        return FakeResponse(201, {root: item})
+
+    def fake_put(url, json=None, auth=None, headers=None, timeout=None):
+        collection, root = collection_for_url(url)
+        calls.append(("put", collection))
+        resource_id = url.rstrip("/").split("/")[-1].removesuffix(".json")
+        existing = next(item for item in state[collection] if str(item["id"]) == resource_id)
+        existing.update(json[root])
+        return FakeResponse(200, {root: existing})
+
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    monkeypatch.setattr(main.requests, "put", fake_put)
+    return state, calls
+
+
+def test_zendesk_setup_inspection_reports_matches_missing_resources_and_brands(monkeypatch):
+    state, _ = zendesk_setup_fake(monkeypatch)
+    definition = main.ZENDESK_FIELD_BLUEPRINT[0]
+    state["ticket_fields"].append(
+        {
+            "id": 999,
+            "title": definition["title"],
+            "type": definition["type"],
+            "agent_description": f"[AI Site Factory key={definition['key']}] managed",
+        }
+    )
+
+    response = client.post("/api/settings/zendesk-setup/inspect", json={})
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["inspected"] is True
+    assert payload["fields"][0]["status"] == "ready"
+    assert payload["fields"][0]["resourceId"] == 999
+    assert sum(field["status"] == "missing" for field in payload["fields"]) == len(main.ZENDESK_FIELD_BLUEPRINT) - 1
+    assert payload["forms"][0]["status"] == "missing"
+    assert payload["brands"] == [{"id": "88", "name": "Default brand", "subdomain": "supporthub", "default": True}]
+
+
+def test_zendesk_setup_adopts_compatible_string_fields_but_rejects_unsafe_types(monkeypatch):
+    state, _ = zendesk_setup_fake(monkeypatch)
+    status_definition = next(item for item in main.ZENDESK_FIELD_BLUEPRINT if item["key"] == "leadStatus")
+    deploy_definition = next(item for item in main.ZENDESK_FIELD_BLUEPRINT if item["key"] == "deployRequested")
+    state["ticket_fields"].extend(
+        [
+            {"id": 991, "title": status_definition["title"], "type": "text"},
+            {"id": 992, "title": deploy_definition["title"], "type": "text"},
+        ]
+    )
+
+    payload = client.post("/api/settings/zendesk-setup/inspect", json={}).json()
+    status_field = next(item for item in payload["fields"] if item["key"] == "leadStatus")
+    deploy_field = next(item for item in payload["fields"] if item["key"] == "deployRequested")
+
+    assert status_field["status"] == "ready"
+    assert status_field["adaptedType"] is True
+    assert deploy_field["status"] == "conflict"
+
+
+def test_zendesk_setup_provisions_fields_before_forms_and_reruns_idempotently(monkeypatch):
+    state, calls = zendesk_setup_fake(monkeypatch)
+    request = {
+        "confirm": True,
+        "brandId": "88",
+        "createViews": True,
+        "createAutomation": False,
+        "emailFormName": "ASF Email Leads",
+        "callFormName": "ASF Call Leads",
+    }
+
+    first = client.post("/api/settings/zendesk-setup/provision", json=request)
+    second = client.post("/api/settings/zendesk-setup/provision", json=request)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert len(state["ticket_fields"]) == 7 + len(main.ZENDESK_FIELD_BLUEPRINT)
+    assert len(state["ticket_forms"]) == 2
+    assert len(state["views"]) == 3
+    first_form_call = next(index for index, call in enumerate(calls) if call == ("post", "ticket_forms"))
+    assert all(call == ("post", "ticket_fields") for call in calls[:first_form_call])
+    assert first_form_call == len(main.ZENDESK_FIELD_BLUEPRINT)
+    assert all(form["restricted_brand_ids"] == [88] for form in state["ticket_forms"])
+    assert all(form["in_all_brands"] is False for form in state["ticket_forms"])
+    assert all(form["ticket_field_ids"] for form in state["ticket_forms"])
+    assert second.json()["fields"][0]["status"] == "ready"
+    assert main.get_zendesk_field_settings()["approvalId"]
+
+
+def test_managed_zendesk_fields_encode_dropdown_values_and_route_channel_forms():
+    main.save_zendesk_field_settings({"contactChannel": "1001", "leadStatus": "1002", "phoneCallStatus": "1003"})
+    main.save_zendesk_provisioned_resource("field:contactChannel", "ticket_field", "1001", "Channel", {"type": "tagger"})
+    main.save_zendesk_provisioned_resource("field:leadStatus", "ticket_field", "1002", "Status", {"type": "tagger"})
+    main.save_zendesk_provisioned_resource("field:phoneCallStatus", "ticket_field", "1003", "Call status", {"type": "tagger"})
+    main.save_zendesk_provisioned_resource("form:email", "ticket_form", "2001", "Email", {"channel": "email"})
+    main.save_zendesk_provisioned_resource("form:phone", "ticket_form", "2002", "Phone", {"channel": "phone"})
+    main.save_zendesk_provisioned_resource("configuration", "configuration", "supporthub", "Setup", {"brandId": "88"})
+
+    fields = main.zendesk_custom_fields({"contactChannel": "phone", "leadStatus": "DEPLOYED", "phoneCallStatus": "No answer"})
+
+    assert fields == [
+        {"id": 1001, "value": "asf_cf_channel_phone"},
+        {"id": 1002, "value": "asf_cf_status_deployed"},
+        {"id": 1003, "value": "asf_cf_call_no_answer"},
+    ]
+    assert main.zendesk_ticket_routing_fields("email") == {"ticket_form_id": 2001, "brand_id": 88}
+    assert main.zendesk_ticket_routing_fields("phone") == {"ticket_form_id": 2002, "brand_id": 88}
+
+
 def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
     monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
     monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
@@ -1247,3 +1405,166 @@ def test_debug_logs_redact_sensitive_details():
     assert details["email"] != "owner@example.com"
     assert details["apiToken"] != "super-secret-token"
     assert details["authorization"] != "Bearer raw-token-value"
+
+
+def test_campaign_intake_splits_email_and_call_records_without_generation(monkeypatch):
+    item = apify_item(301, province="KwaZulu-Natal")
+    item["email"] = "campaign@example.com"
+    model_calls = []
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda *args, **kwargs: [item])
+    monkeypatch.setattr(main, "compact_lead_with_groq", lambda *args: model_calls.append("groq"))
+    monkeypatch.setattr(main, "generate_final_html_with_gemini", lambda *args: model_calls.append("gemini"))
+    monkeypatch.setattr(main, "export_site_to_github", lambda *args, **kwargs: model_calls.append("github"))
+
+    response = client.post(
+        "/api/campaigns/intake",
+        json={
+            "campaignName": "Durban Services - July",
+            "presetId": "plumbers",
+            "industry": "Plumbing",
+            "location": "Durban, South Africa",
+            "limit": 1,
+            "channels": ["email", "phone"],
+            "syncZendesk": False,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["metrics"]["emailLeads"] == 1
+    assert payload["metrics"]["callLeads"] == 1
+    assert payload["metrics"]["aiGenerations"] == 0
+    assert payload["metrics"]["reposCreated"] == 0
+    assert payload["emailLeads"][0]["status"] == "AWAITING_DEPLOYMENT"
+    assert payload["callLeads"][0]["status"] == "AWAITING_DEPLOYMENT"
+    assert model_calls == []
+
+
+def test_campaign_deploy_webhook_generates_once_then_deploys(monkeypatch):
+    item = apify_item(302, province="KwaZulu-Natal")
+    item["email"] = "deploy@example.com"
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda *args, **kwargs: [item])
+    model_calls, export_calls = stub_generation(monkeypatch)
+    monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", fake_git_deploy_with_history)
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "campaign-webhook-secret")
+
+    campaign = client.post(
+        "/api/campaigns/intake",
+        json={
+            "campaignName": "Deferred Deploy",
+            "presetId": "plumbers",
+            "location": "Durban, South Africa",
+            "limit": 1,
+            "channels": ["email"],
+            "syncZendesk": False,
+        },
+    ).json()
+    approval_id = campaign["emailLeads"][0]["approvalId"]
+
+    deployed = client.post(
+        "/api/zendesk/webhook",
+        headers={"x-ai-site-factory-secret": "campaign-webhook-secret"},
+        json={
+            "action": "deploy_site",
+            "approvalId": approval_id,
+            "channel": "email",
+            "actor": "Zendesk test agent",
+        },
+    )
+
+    assert deployed.status_code == 200
+    detail = client.get(f"/api/campaigns/{campaign['campaignId']}").json()
+    assert detail["metrics"]["aiGenerations"] == 1
+    assert detail["metrics"]["reposCreated"] == 1
+    assert detail["metrics"]["deployed"] == 1
+    assert detail["deployments"][0]["liveUrl"] == "https://alpha.netlify.app"
+    assert model_calls == ["groq_compact", "gemini_final"]
+    assert len(export_calls) == 1
+
+
+def test_zendesk_connection_endpoint_validates_and_masks_token(monkeypatch):
+    monkeypatch.setattr(
+        main.requests,
+        "get",
+        lambda *args, **kwargs: FakeResponse(200, {"user": {"id": 42, "email": "agent@example.com"}}),
+    )
+
+    response = client.put(
+        "/api/settings/zendesk-connection",
+        json={
+            "subdomain": "supporthub.zendesk.com",
+            "username": "agent@example.com",
+            "apiToken": "zendesk-secret-token",
+            "validateConnection": True,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["connected"] is True
+    assert payload["subdomain"] == "supporthub"
+    assert payload["username"] == "agent@example.com"
+    assert payload["maskedToken"] != "zendesk-secret-token"
+    assert "apiToken" not in payload
+
+
+def test_legacy_pipeline_backfill_populates_campaign_dashboard_idempotently():
+    lead = main.DiscoveredLead(**lead_payload())
+    lead.phone = "+27 31 555 0101"
+    canonical_key = main.canonical_lead_key_for_lead(lead)
+    lead.canonicalLeadKey = canonical_key
+    main.upsert_lead_registry(lead)
+    main.record_discovery_batch(
+        batch_id="legacy-batch-1",
+        preset_id="plumbers",
+        query="plumbers in Durban, South Africa",
+        location="Durban, South Africa",
+        lead_count=1,
+        duplicates_skipped=0,
+        leads=[lead],
+        province_stats={},
+        warnings=[],
+    )
+    main.save_pipeline_run(
+        pipeline_id="legacy-pipeline-1",
+        status="PENDING_APPROVAL",
+        template_id=main.FREEFORM_TEMPLATE_ID,
+        source_batch_id="legacy-batch-1",
+        lead_count=1,
+        completed_count=0,
+        pending_count=1,
+        failed_count=0,
+        warnings=[],
+    )
+    main.create_approval_record(
+        pipeline_id="legacy-pipeline-1",
+        canonical_key=canonical_key,
+        lead_key=lead.leadKey,
+        business_name=lead.businessName,
+        site_html="<!doctype html><html><body>Legacy site</body></html>",
+        context=main.build_public_lead_context(lead, {}, canonical_key),
+        site_content={"legacy": True},
+        template=dict(main.FREEFORM_SITE_SPEC),
+        status="PENDING",
+    )
+
+    first = main.backfill_legacy_campaign_data()
+    second = main.backfill_legacy_campaign_data()
+    dashboard = main.list_campaigns(20)
+
+    assert first == {
+        "campaignsCreated": 1,
+        "emailLeadsCreated": 1,
+        "callLeadsCreated": 1,
+        "deploymentsCreated": 1,
+    }
+    assert second == {
+        "campaignsCreated": 0,
+        "emailLeadsCreated": 0,
+        "callLeadsCreated": 0,
+        "deploymentsCreated": 0,
+    }
+    assert dashboard["totals"]["campaigns"] == 1
+    assert dashboard["totals"]["leads"] == 2
+    assert dashboard["totals"]["pending"] == 1
+    assert dashboard["totals"]["aiGenerations"] == 1

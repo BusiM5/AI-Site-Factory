@@ -15,19 +15,23 @@ Important: Render free services do not provide durable local disks. The SQLite f
 
 AI Site Factory does not store generated customer sites in the main app repository.
 
-- SQLite stores pipeline runs, duplicate indexes, pending approval HTML, Zendesk ticket links, webhook audits, GitHub export metadata, and Netlify deployment history.
+- SQLite stores campaigns, separate email/call lead queues, deferred deployment requests, pipeline runs, duplicate indexes, pending approval HTML, Zendesk ticket links, webhook audits, GitHub export metadata, and Netlify deployment history.
 - GitHub stores the generated customer artifact: `index.html` plus `README.md` in a separate repo per business.
 - Netlify stores the live site, build ID, deploy ID, and public URL.
 - Zendesk stores the operator workflow and outreach thread.
 
-The default deployment path is strict GitHub to Netlify:
+The campaign deployment path is strict GitHub to Netlify and defers model usage:
 
-1. Generate HTML.
-2. Store pending HTML in SQLite for preview.
-3. Export `index.html` and `README.md` to a generated GitHub repo.
-4. Store the GitHub repo, commit SHA, content SHAs, approval ID, canonical lead key, and checksum.
-5. After approval from the app or Zendesk, create/update a Netlify Git-linked site and trigger a build from GitHub.
-6. Store the Netlify build/deploy IDs and live URL.
+1. Discover and store a named campaign.
+2. Create separate email and call intake records and tagged Zendesk tickets. Do not generate HTML yet.
+3. Receive a `deploy_site` webhook from the agent's deploy checkbox.
+4. Generate HTML and store the pending artifact in SQLite.
+5. Export `index.html` and `README.md` to the lead-owned GitHub repo.
+6. Store the GitHub repo, commit SHA, content SHAs, approval ID, canonical lead key, and checksum.
+7. Create/update a Netlify Git-linked site and trigger a build from GitHub.
+8. Store the build/deploy IDs and live URL, then add the link and outreach template to the same Zendesk ticket.
+
+If another email/call ticket for the same canonical lead requests deployment, the existing artifact or ready deployment is reused.
 
 Direct Netlify zip deployment is only an explicit emergency fallback.
 
@@ -146,6 +150,18 @@ build
 
 ## Zendesk webhook
 
+The recommended path is the app's **Zendesk setup** screen:
+
+1. Connect with an administrator subdomain, email, and API token.
+2. Inspect the instance. This step is read-only and discovers existing fields, forms, views, webhooks, triggers, and brands.
+3. Review the 20 preconfigured fields and the separate email/call form membership. Compatible existing string fields are reused; unsafe type conflicts must be resolved first.
+4. Keep **All brands** selected unless the forms should be restricted to one brand.
+5. Optionally select managed views and webhook automation, confirm the disclaimer, and provision.
+
+Provisioning creates fields before forms, then views, then automation. It never deletes Zendesk resources and is safe to rerun. Automation creates one active authenticated webhook and three inactive triggers (email deploy, call deploy, and approved email send) so an administrator can test them before enabling them. Ticket forms require a Zendesk plan that supports multiple forms.
+
+For a manual setup, use the contract below.
+
 Update the AI Site Factory webhook:
 
 ```text
@@ -172,6 +188,20 @@ The deploy trigger should send:
   "notes": "Deployment approved from Zendesk ticket {{ticket.id}}"
 }
 ```
+
+The deploy trigger is valid for both `email` and `phone` channel tickets. Configure a second email-only trigger after deployment:
+
+```json
+{
+  "action": "send_email",
+  "approvalId": "{{ticket.ticket_field_APPROVAL_ID_FIELD_ID}}",
+  "zendeskTicketId": "{{ticket.id}}",
+  "channel": "email",
+  "actor": "Zendesk"
+}
+```
+
+Stable form/view tags include `asf_form_email_lead`, `asf_form_call_lead`, `asf_channel_email`, `asf_channel_phone`, `asf_deploy_pending`, `asf_can_deploy`, `asf_email_send_pending`, `asf_call_pending`, and `asf_deployed`.
 
 ## Demo warm-up checklist
 
