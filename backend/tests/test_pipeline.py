@@ -145,6 +145,40 @@ def test_empty_deployment_bootstraps_only_zendesk_config(monkeypatch):
     assert replay["reason"] == "zendesk_config_not_empty"
 
 
+def test_startup_zendesk_bootstrap_defaults_on_without_pipeline_restore(monkeypatch):
+    calls = []
+    expected = {"restored": True, "reason": "zendesk_config_restored"}
+    monkeypatch.delenv("ENABLE_ZENDESK_CONFIG_BOOTSTRAP", raising=False)
+    monkeypatch.setenv("ENABLE_PIPELINE_SEED_RESTORE", "true")
+    monkeypatch.setattr(
+        main,
+        "restore_zendesk_config_seed_if_empty",
+        lambda: calls.append("zendesk") or expected,
+    )
+    monkeypatch.setattr(
+        main,
+        "restore_pipeline_seed_if_empty",
+        lambda: (_ for _ in ()).throw(AssertionError("startup must not restore historical pipeline data")),
+    )
+
+    assert main.bootstrap_zendesk_config_on_startup() == expected
+    assert calls == ["zendesk"]
+
+
+def test_startup_zendesk_bootstrap_can_be_explicitly_disabled(monkeypatch):
+    monkeypatch.setenv("ENABLE_ZENDESK_CONFIG_BOOTSTRAP", "false")
+    monkeypatch.setattr(
+        main,
+        "restore_zendesk_config_seed_if_empty",
+        lambda: (_ for _ in ()).throw(AssertionError("disabled bootstrap must not read the seed")),
+    )
+
+    assert main.bootstrap_zendesk_config_on_startup() == {
+        "restored": False,
+        "reason": "zendesk_config_bootstrap_disabled",
+    }
+
+
 class FakeResponse:
     def __init__(self, status_code=200, payload=None):
         self.status_code = status_code
@@ -1195,6 +1229,41 @@ def test_zendesk_setup_adopts_compatible_string_fields_but_rejects_unsafe_types(
     assert deploy_field["status"] == "conflict"
 
 
+def test_zendesk_field_inspection_does_not_trust_stale_saved_id_for_unrelated_field(monkeypatch):
+    state, _ = zendesk_setup_fake(monkeypatch)
+    definition = next(item for item in main.ZENDESK_FIELD_BLUEPRINT if item["key"] == "phoneCallStatus")
+    stale_id = 28777280257052
+    managed_id = 28779999999999
+    state["ticket_fields"].extend(
+        [
+            {
+                "id": stale_id,
+                "title": "Legacy call disposition",
+                "type": "tagger",
+                "agent_description": "Legacy options: no_answer, call_back, interested",
+            },
+            {
+                "id": managed_id,
+                "title": definition["title"],
+                "type": "tagger",
+                "agent_description": "[AI Site Factory key=phoneCallStatus] Managed call workflow.",
+                "custom_field_options": definition["custom_field_options"],
+            },
+        ]
+    )
+    main.save_zendesk_field_settings({"phoneCallStatus": str(stale_id)})
+    main.save_zendesk_provisioned_resource(
+        "field:phoneCallStatus", "ticket_field", str(stale_id), "Legacy call disposition", {"type": "tagger"}
+    )
+
+    payload = client.post("/api/settings/zendesk-setup/inspect", json={}).json()
+    inspected = next(item for item in payload["fields"] if item["key"] == "phoneCallStatus")
+
+    assert inspected["resourceId"] == managed_id
+    assert inspected["matchSource"] == "marker"
+    assert inspected["status"] == "ready"
+
+
 def test_zendesk_setup_provisions_fields_before_forms_and_reruns_idempotently(monkeypatch):
     state, calls = zendesk_setup_fake(monkeypatch)
     request = {
@@ -1267,6 +1336,65 @@ def configure_managed_zendesk_contract():
         "configuration", "configuration", "supporthub", "Setup", {"brandId": "88"}
     )
     return field_ids
+
+
+def managed_orphan_zendesk_ticket(
+    field_ids,
+    *,
+    ticket_id=5806,
+    brand_id=88,
+    channel="email",
+    campaign_id="campaign-orphan",
+    campaign_name="Recovered Durban campaign",
+    canonical_key="canonical-orphan",
+    pipeline_id=None,
+    approval_id="8852628b-orphan-approval",
+    business_name="Recovered Plumbing",
+    contact_email=None,
+    contact_phone=None,
+):
+    pipeline_id = pipeline_id or campaign_id
+    contact_email = contact_email or ("recovered@example.com" if channel == "email" else None)
+    contact_phone = contact_phone or ("+27 31 555 0101" if channel == "phone" else None)
+    values = {
+        "campaignId": campaign_id,
+        "campaignName": campaign_name,
+        "canonicalLeadKey": canonical_key,
+        "pipelineId": pipeline_id,
+        "approvalId": approval_id,
+        "batchId": "batch-orphan",
+        "businessName": business_name,
+        "contactName": "Recovered Owner",
+        "contactEmail": contact_email,
+        "contactPhone": contact_phone,
+        "industry": "Plumbing",
+        "location": "Durban",
+        "address": "1 Recovery Road",
+        "contactChannel": channel,
+        "leadStatus": "AWAITING_DEPLOYMENT",
+        "deployRequested": True,
+        "emailSendRequested": False,
+        "phoneCallStatus": "NEW" if channel == "phone" else None,
+        "sourceUrl": "https://maps.example.com/recovered",
+    }
+    form_id = 5001 if channel == "email" else 5002
+    form_tag = "asf_form_email_lead" if channel == "email" else "asf_form_call_lead"
+    return {
+        "id": ticket_id,
+        "external_id": f"asf:{campaign_id}:{canonical_key}:{channel}:intake",
+        "brand_id": brand_id,
+        "ticket_form_id": form_id,
+        "status": "open",
+        "tags": [
+            "ai_site_factory", "asf_managed", "asf_intake", f"asf_channel_{channel}",
+            form_tag, "asf_deploy_requested", "asf_source_apify_google_maps",
+        ],
+        "custom_fields": main.zendesk_custom_fields(values),
+        "_field_ids": field_ids,
+        "_approval_id": approval_id,
+        "_canonical_key": canonical_key,
+        "_campaign_id": campaign_id,
+    }
 
 
 def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
@@ -1481,6 +1609,182 @@ def test_live_zendesk_contract_rejects_form_on_wrong_brand(monkeypatch):
     assert "not available on the selected brand" in " ".join(error.value.detail["problems"])
 
 
+def test_webhook_recovers_missing_deferred_approval_from_exact_managed_ticket(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    field_ids = configure_managed_zendesk_contract()
+    ticket = managed_orphan_zendesk_ticket(field_ids)
+    monkeypatch.setattr(
+        main,
+        "zendesk_api_request",
+        lambda method, path, **kwargs: {"ticket": ticket} if path == "/tickets/5806.json" else (_ for _ in ()).throw(AssertionError(path)),
+    )
+
+    request = main.ZendeskWebhookRequest(
+        action="deploy_site",
+        approvalId=ticket["_approval_id"],
+        canonicalLeadKey=ticket["_canonical_key"],
+        zendeskTicketId=5806,
+        channel="email",
+    )
+    recovered = main.resolve_webhook_approval(request)
+    replay = main.resolve_webhook_approval(request)
+
+    assert recovered["id"] == ticket["_approval_id"]
+    assert replay["id"] == ticket["_approval_id"]
+    context = main.safe_json_loads(recovered["context_json"], {})
+    assert context["intakeDeferred"] is True
+    assert context["recoveredFromZendeskTicketId"] == 5806
+    with main.get_pipeline_db() as db:
+        assert db.execute("SELECT COUNT(*) AS count FROM campaigns").fetchone()["count"] == 1
+        assert db.execute("SELECT COUNT(*) AS count FROM approval_records").fetchone()["count"] == 1
+        lead = db.execute("SELECT * FROM campaign_email_leads").fetchone()
+        assert lead["ticket_id"] == 5806
+        assert lead["approval_id"] == ticket["_approval_id"]
+    link = main.get_zendesk_ticket_link(ticket["_approval_id"], "email", "intake", 5806)
+    assert link["externalId"] == ticket["external_id"]
+    assert link["payload"]["recoveredFromManagedTicket"] is True
+
+
+def test_orphan_recovery_keeps_same_campaign_and_pipeline_counts_for_multiple_tickets(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    field_ids = configure_managed_zendesk_contract()
+    first = managed_orphan_zendesk_ticket(field_ids)
+    second = managed_orphan_zendesk_ticket(
+        field_ids,
+        ticket_id=5807,
+        canonical_key="canonical-orphan-two",
+        approval_id="8852628b-orphan-approval-two",
+        business_name="Recovered Electrical",
+        contact_email="electrical@example.com",
+    )
+    tickets = {first["id"]: first, second["id"]: second}
+    monkeypatch.setattr(
+        main,
+        "zendesk_api_request",
+        lambda method, path, **kwargs: {"ticket": tickets[int(path.split("/")[2].split(".")[0])]},
+    )
+
+    for ticket in (first, second):
+        recovered = main.recover_managed_zendesk_webhook_approval(
+            main.ZendeskWebhookRequest(
+                action="deploy_site",
+                approvalId=ticket["_approval_id"],
+                canonicalLeadKey=ticket["_canonical_key"],
+                zendeskTicketId=ticket["id"],
+                channel="email",
+            )
+        )
+        assert recovered["id"] == ticket["_approval_id"]
+
+    with main.get_pipeline_db() as db:
+        campaign = db.execute("SELECT * FROM campaigns WHERE id = ?", (first["_campaign_id"],)).fetchone()
+        pipeline = db.execute("SELECT * FROM pipeline_runs WHERE pipeline_id = ?", (first["_campaign_id"],)).fetchone()
+        assert campaign["discovered_count"] == 2
+        assert campaign["requested_count"] == 2
+        assert pipeline["lead_count"] == 2
+        assert db.execute("SELECT COUNT(*) AS count FROM approval_records").fetchone()["count"] == 2
+        assert db.execute("SELECT COUNT(*) AS count FROM campaign_email_leads").fetchone()["count"] == 2
+        assert db.execute("SELECT COUNT(*) AS count FROM zendesk_ticket_links").fetchone()["count"] == 2
+
+
+def test_orphan_recovery_rolls_back_every_insert_when_ticket_link_identity_conflicts(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    field_ids = configure_managed_zendesk_contract()
+    ticket = managed_orphan_zendesk_ticket(field_ids)
+    main.save_zendesk_ticket_link(
+        approval_id="existing-approval",
+        canonical_key="existing-canonical",
+        pipeline_id="existing-pipeline",
+        channel="email",
+        stage="intake",
+        ticket_id=9999,
+        ticket_url="https://supporthub.zendesk.com/agent/tickets/9999",
+        status="open",
+        tags=["existing"],
+        payload={"existing": True},
+        external_id=ticket["external_id"],
+    )
+    monkeypatch.setattr(main, "zendesk_api_request", lambda *args, **kwargs: {"ticket": ticket})
+
+    with pytest.raises(main.HTTPException) as error:
+        main.recover_managed_zendesk_webhook_approval(
+            main.ZendeskWebhookRequest(
+                action="deploy_site",
+                approvalId=ticket["_approval_id"],
+                canonicalLeadKey=ticket["_canonical_key"],
+                zendeskTicketId=ticket["id"],
+                channel="email",
+            )
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "ZENDESK_ORPHAN_RECOVERY_CONFLICT"
+    assert error.value.detail["entity"] == "ticket_link"
+    with main.get_pipeline_db() as db:
+        for table in (
+            "lead_registry",
+            "campaigns",
+            "pipeline_runs",
+            "approval_records",
+            "campaign_deployments",
+            "campaign_email_leads",
+        ):
+            assert db.execute(f'SELECT COUNT(*) AS count FROM "{table}"').fetchone()["count"] == 0
+        links = db.execute("SELECT * FROM zendesk_ticket_links").fetchall()
+        assert len(links) == 1
+        assert links[0]["approval_id"] == "existing-approval"
+
+
+def test_webhook_refuses_orphan_recovery_on_wrong_brand(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    field_ids = configure_managed_zendesk_contract()
+    ticket = managed_orphan_zendesk_ticket(field_ids, brand_id=999)
+    monkeypatch.setattr(main, "zendesk_api_request", lambda *args, **kwargs: {"ticket": ticket})
+
+    with pytest.raises(main.HTTPException) as error:
+        main.resolve_webhook_approval(
+            main.ZendeskWebhookRequest(
+                action="deploy_site",
+                approvalId=ticket["_approval_id"],
+                canonicalLeadKey=ticket["_canonical_key"],
+                zendeskTicketId=5806,
+                channel="email",
+            )
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "ZENDESK_ORPHAN_TICKET_CONTRACT_INVALID"
+    with main.get_pipeline_db() as db:
+        assert db.execute("SELECT COUNT(*) AS count FROM approval_records").fetchone()["count"] == 0
+
+
+def test_webhook_rejects_mismatched_approval_and_ticket_link():
+    first = create_pending_approval_for_webhook()
+    second = create_pending_approval_for_webhook()
+    main.save_zendesk_ticket_link(
+        second, "canonical-webhook", "pipeline-webhook", "email", "intake", 777,
+        "https://zendesk.test/777", "new", ["asf_managed"], {},
+    )
+
+    with pytest.raises(main.HTTPException) as error:
+        main.resolve_webhook_approval(
+            main.ZendeskWebhookRequest(
+                action="deploy_site", approvalId=first, zendeskTicketId=777, channel="email"
+            )
+        )
+
+    assert error.value.status_code == 409
+    assert "identities do not match" in error.value.detail
+
+
 def test_zendesk_webhook_rejects_invalid_secret(monkeypatch):
     monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "expected-secret")
 
@@ -1545,6 +1849,14 @@ def test_zendesk_webhook_email_adds_public_reply(monkeypatch):
     monkeypatch.setattr(main, "generate_outreach_with_groq", lambda context, site_url: {"subject": "Preview", "body": "Public email body"})
     captured = {}
 
+    def fake_tag_update(ticket_id, *, add=None, remove=None):
+        captured["tagTicketId"] = ticket_id
+        captured["addedTags"] = list(add or [])
+        captured["removedTags"] = list(remove or [])
+        return ["admin_owned", "asf_deploy_email_fired", *(add or [])]
+
+    monkeypatch.setattr(main, "update_zendesk_ticket_tags", fake_tag_update)
+
     def fake_put(url, json=None, auth=None, timeout=None):
         captured["payload"] = json
         return FakeResponse(200, {"ticket": {"id": 654, "status": "open"}})
@@ -1560,6 +1872,12 @@ def test_zendesk_webhook_email_adds_public_reply(monkeypatch):
     assert response.status_code == 200
     assert captured["payload"]["ticket"]["comment"]["public"] is True
     assert "Public email body" in captured["payload"]["ticket"]["comment"]["body"]
+    assert "tags" not in captured["payload"]["ticket"]
+    assert captured["tagTicketId"] == 654
+    assert "asf_email_sent" in captured["addedTags"]
+    link = main.get_zendesk_ticket_link(approval_id, "email", "intake", 654)
+    assert "admin_owned" in link["tags"]
+    assert "asf_deploy_email_fired" in link["tags"]
 
 
 def test_zendesk_webhook_rejects_email_send_for_phone_ticket(monkeypatch):
@@ -1575,6 +1893,43 @@ def test_zendesk_webhook_rejects_email_send_for_phone_ticket(monkeypatch):
 
     assert response.status_code == 409
     assert "email-channel" in response.json()["detail"]
+
+
+def test_zendesk_tag_mutation_preserves_remote_fired_and_admin_tags(monkeypatch):
+    calls = []
+
+    def fake_api(method, path, *, payload=None, params=None):
+        calls.append((method, path, payload))
+        if method == "delete":
+            return {"tags": ["admin_owned", "asf_deploy_phone_fired"]}
+        if method == "put":
+            return {
+                "tags": ["admin_owned", "asf_deploy_phone_fired", *(payload or {}).get("tags", [])]
+            }
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(main, "zendesk_api_request", fake_api)
+
+    tags = main.update_zendesk_ticket_tags(
+        5808,
+        remove=["asf_deploy_requested", "asf_stage_generating"],
+        add=["asf_deployed", "asf_stage_live"],
+    )
+
+    assert calls == [
+        (
+            "delete",
+            "/tickets/5808/tags.json",
+            {"tags": ["asf_deploy_requested", "asf_stage_generating"]},
+        ),
+        (
+            "put",
+            "/tickets/5808/tags.json",
+            {"tags": ["asf_deployed", "asf_stage_live"]},
+        ),
+    ]
+    assert "admin_owned" in tags
+    assert "asf_deploy_phone_fired" in tags
 
 
 def test_zendesk_webhook_deploy_triggers_existing_approval_path(monkeypatch):
@@ -1594,6 +1949,239 @@ def test_zendesk_webhook_deploy_triggers_existing_approval_path(monkeypatch):
     assert response.status_code == 200
     assert response.json()["result"]["deployment"]["status"] == "APPROVED"
     assert response.json()["result"]["deployment"]["publishMode"] == "github-netlify"
+
+
+def test_webhook_carries_invoking_ticket_into_approval(monkeypatch):
+    approval_id = create_pending_approval_for_webhook()
+    main.save_zendesk_ticket_link(
+        approval_id, "canonical-webhook", "pipeline-webhook", "email", "intake", 777,
+        "https://zendesk.test/777", "new", ["asf_managed", "asf_channel_email"], {},
+    )
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "secret")
+    monkeypatch.setattr(main, "reuse_existing_live_deployment", lambda *args, **kwargs: None)
+    captured = {}
+
+    def fake_approve(resolved_approval_id, action_request):
+        captured["approvalId"] = resolved_approval_id
+        captured["ticketId"] = action_request.zendeskTicketId
+        main.save_zendesk_ticket_link(
+            resolved_approval_id,
+            "canonical-webhook",
+            "pipeline-webhook",
+            "email",
+            "intake",
+            777,
+            "https://zendesk.test/777",
+            "open",
+            ["asf_managed", "asf_deployed", "asf_deploy_email_fired", "admin_owned"],
+            {
+                "deployRequested": True,
+                "deployedAt": "2026-07-16T08:00:00+00:00",
+                "liveUrl": "https://alpha.netlify.app",
+            },
+        )
+        return main.ApprovalActionResponse(
+            approvalId=resolved_approval_id,
+            status="APPROVED",
+            canonicalLeadKey="canonical-webhook",
+            businessName="Webhook Plumbing",
+            deployment={"url": "https://alpha.netlify.app", "state": "ready"},
+        )
+
+    monkeypatch.setattr(main, "approve_generated_site", fake_approve)
+
+    response = client.post(
+        "/api/zendesk/webhook",
+        json={"action": "deploy_site", "approvalId": approval_id, "channel": "email", "zendeskTicketId": 777},
+        headers={"x-ai-site-factory-secret": "secret"},
+    )
+
+    assert response.status_code == 200
+    assert captured == {"approvalId": approval_id, "ticketId": 777}
+    link = main.get_zendesk_ticket_link(approval_id, "email", "intake", 777)
+    assert link["payload"]["liveUrl"] == "https://alpha.netlify.app"
+    assert link["payload"]["deployedAt"] == "2026-07-16T08:00:00+00:00"
+    assert link["payload"]["deployWebhookAt"]
+    assert "asf_deployed" in link["tags"]
+    assert "asf_deploy_email_fired" in link["tags"]
+    assert "admin_owned" in link["tags"]
+
+
+def test_deployment_update_writes_and_verifies_live_url_on_exact_route(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    field_ids = configure_managed_zendesk_contract()
+    approval_id = main.create_approval_record(
+        pipeline_id="campaign-live-url",
+        canonical_key="canonical-live-url",
+        lead_key="lead-live-url",
+        business_name="Live URL Plumbing",
+        site_html=None,
+        context={
+            "campaignId": "campaign-live-url",
+            "campaignName": "Live URL Campaign",
+            "canonicalLeadKey": "canonical-live-url",
+            "businessName": "Live URL Plumbing",
+            "industry": "Plumbing",
+            "location": "Durban",
+            "email": "live@example.com",
+            "contactChannel": "email",
+            "intakeDeferred": True,
+        },
+        site_content={"deferredGeneration": True},
+        template=dict(main.FREEFORM_SITE_SPEC),
+        status="PENDING",
+    )
+    main.save_zendesk_ticket_link(
+        approval_id,
+        "canonical-live-url",
+        "campaign-live-url",
+        "email",
+        "intake",
+        5806,
+        "https://zendesk.test/5806",
+        "open",
+        ["asf_managed", "asf_deploy_email_fired", "admin_owned"],
+        {},
+    )
+    row = main.get_approval_or_404(approval_id)
+    captured = {}
+
+    def fake_update(ticket_id, body, public, extra_ticket_fields=None):
+        captured["ticketId"] = ticket_id
+        captured["body"] = body
+        captured["fields"] = extra_ticket_fields
+        return {"id": ticket_id, "status": "open", **extra_ticket_fields}
+
+    monkeypatch.setattr(main, "update_zendesk_ticket_comment", fake_update)
+    monkeypatch.setattr(
+        main,
+        "update_zendesk_ticket_tags",
+        lambda ticket_id, *, add=None, remove=None: [
+            "asf_managed", "asf_deploy_email_fired", "admin_owned", *(add or [])
+        ],
+    )
+
+    result = main.update_existing_intake_ticket(
+        row,
+        {"url": "https://alpha.netlify.app", "githubRepoUrl": "https://github.com/acme/site"},
+        {"subject": "Preview", "body": "Preview body"},
+        ticket_id_override=5806,
+    )
+
+    assert result["liveLink"] == "https://alpha.netlify.app"
+    assert captured["ticketId"] == 5806
+    assert captured["fields"]["brand_id"] == 88
+    assert captured["fields"]["ticket_form_id"] == 5001
+    assert "tags" not in captured["fields"]
+    values = {str(item["id"]): item["value"] for item in captured["fields"]["custom_fields"]}
+    assert values[field_ids["liveUrl"]] == "https://alpha.netlify.app"
+    link = main.get_zendesk_ticket_link(approval_id, "email", "intake", 5806)
+    assert "asf_deploy_email_fired" in link["tags"]
+    assert "admin_owned" in link["tags"]
+
+
+def test_deployment_update_refuses_unlinked_ticket_override(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    configure_managed_zendesk_contract()
+    approval_id = create_pending_approval_for_webhook()
+    row = main.get_approval_or_404(approval_id)
+    monkeypatch.setattr(
+        main,
+        "update_zendesk_ticket_tags",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unlinked ticket was mutated")),
+    )
+    monkeypatch.setattr(
+        main,
+        "update_zendesk_ticket_comment",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unlinked ticket was mutated")),
+    )
+
+    with pytest.raises(main.HTTPException) as error:
+        main.update_existing_intake_ticket(
+            row,
+            {"url": "https://alpha.netlify.app"},
+            {"subject": "Preview", "body": "Preview body"},
+            ticket_id_override=9999,
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "ZENDESK_TICKET_LINK_MISMATCH"
+    assert error.value.detail["ticketId"] == 9999
+
+
+def test_deployment_update_fails_when_zendesk_drops_live_url(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    configure_managed_zendesk_contract()
+    approval_id = main.create_approval_record(
+        pipeline_id="campaign-live-url-fail",
+        canonical_key="canonical-live-url-fail",
+        lead_key="lead-live-url-fail",
+        business_name="Dropped URL Plumbing",
+        site_html=None,
+        context={
+            "campaignId": "campaign-live-url-fail",
+            "campaignName": "Dropped URL Campaign",
+            "canonicalLeadKey": "canonical-live-url-fail",
+            "businessName": "Dropped URL Plumbing",
+            "email": "drop@example.com",
+            "contactChannel": "email",
+            "intakeDeferred": True,
+        },
+        site_content={"deferredGeneration": True},
+        template=dict(main.FREEFORM_SITE_SPEC),
+        status="PENDING",
+    )
+    main.save_zendesk_ticket_link(
+        approval_id,
+        "canonical-live-url-fail",
+        "campaign-live-url-fail",
+        "email",
+        "intake",
+        5806,
+        "https://zendesk.test/5806",
+        "open",
+        ["asf_managed", "asf_deploy_email_fired", "admin_owned"],
+        {},
+    )
+    row = main.get_approval_or_404(approval_id)
+    monkeypatch.setattr(
+        main,
+        "update_zendesk_ticket_tags",
+        lambda ticket_id, *, add=None, remove=None: [
+            "asf_managed", "asf_deploy_email_fired", "admin_owned", *(add or [])
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "update_zendesk_ticket_comment",
+        lambda ticket_id, body, public, extra_ticket_fields=None: {
+            "id": ticket_id, "status": "open", "brand_id": 88, "ticket_form_id": 5001, "custom_fields": []
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "zendesk_api_request",
+        lambda *args, **kwargs: {
+            "ticket": {"id": 5806, "brand_id": 88, "ticket_form_id": 5001, "custom_fields": []}
+        },
+    )
+
+    with pytest.raises(main.HTTPException) as error:
+        main.update_existing_intake_ticket(
+            row,
+            {"url": "https://alpha.netlify.app"},
+            {"subject": "Preview", "body": "Preview body"},
+            ticket_id_override=5806,
+        )
+
+    assert error.value.status_code == 502
+    assert error.value.detail["code"] == "ZENDESK_LIVE_URL_UPDATE_REJECTED"
 
 
 def test_model_safe_value_chunks_large_text():
@@ -2007,6 +2595,15 @@ def test_campaign_deploy_webhook_generates_once_then_deploys(monkeypatch):
     monkeypatch.setattr(main, "zendesk_connection_snapshot", lambda: {"connected": True, "workspaceReady": True})
     monkeypatch.setattr(main, "create_zendesk_intake_tickets", lambda **kwargs: [{"ticketId": 7401}])
     monkeypatch.setattr(main, "update_zendesk_deployment_lifecycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        main,
+        "update_existing_intake_ticket",
+        lambda row, deployment, outreach, ticket_id_override=None: {
+            "ticketId": ticket_id_override or 7401,
+            "syncStatus": "TICKET_UPDATED",
+            "liveLink": deployment.get("url"),
+        },
+    )
 
     campaign = client.post(
         "/api/campaigns/intake",
@@ -2040,6 +2637,243 @@ def test_campaign_deploy_webhook_generates_once_then_deploys(monkeypatch):
     assert detail["deployments"][0]["liveUrl"] == "https://alpha.netlify.app"
     assert model_calls == ["groq_compact", "gemini_final"]
     assert len(export_calls) == 1
+
+
+def create_deferred_webhook_approval(approval_id: str = "approval-concurrent-deploy") -> str:
+    return main.create_approval_record(
+        pipeline_id="pipeline-concurrent-deploy",
+        canonical_key="canonical-concurrent-deploy",
+        lead_key="lead-concurrent-deploy",
+        business_name="Concurrent Plumbing",
+        site_html=None,
+        context={
+            "businessName": "Concurrent Plumbing",
+            "canonicalLeadKey": "canonical-concurrent-deploy",
+            "contactChannel": "phone",
+            "phone": "+27 31 555 0199",
+            "intakeDeferred": True,
+        },
+        site_content={"deferredGeneration": True},
+        template={},
+        status="AWAITING_DEPLOYMENT",
+        approval_id=approval_id,
+    )
+
+
+def test_deploy_webhook_claim_is_atomic_for_concurrent_deliveries():
+    approval_id = create_deferred_webhook_approval()
+    barrier = threading.Barrier(2)
+
+    def claim():
+        barrier.wait(timeout=5)
+        return main.acquire_deploy_webhook_claim(approval_id)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        claims = list(pool.map(lambda _: claim(), range(2)))
+
+    assert sorted(item["disposition"] for item in claims) == ["ACQUIRED", "IN_PROGRESS"]
+    owner = next(item for item in claims if item["disposition"] == "ACQUIRED")
+    assert main.complete_deploy_webhook_claim(
+        approval_id,
+        owner["token"],
+        {"approvalId": approval_id, "deployment": {"url": "https://atomic.example"}},
+    ) is True
+
+    replay = main.acquire_deploy_webhook_claim(approval_id)
+    assert replay["disposition"] == "ALREADY_PROCESSED"
+    assert replay["result"]["deployment"]["url"] == "https://atomic.example"
+    with main.get_pipeline_db() as db:
+        row = db.execute(
+            "SELECT * FROM deploy_webhook_claims WHERE approval_id = ?", (approval_id,)
+        ).fetchone()
+    assert row["state"] == "COMPLETED"
+    assert row["attempt_count"] == 1
+
+
+def test_expired_deploy_webhook_lease_can_be_reclaimed():
+    approval_id = create_deferred_webhook_approval("approval-expired-lease")
+    first = main.acquire_deploy_webhook_claim(approval_id)
+    assert first["disposition"] == "ACQUIRED"
+    with main.get_pipeline_db() as db:
+        db.execute(
+            "UPDATE deploy_webhook_claims SET lease_expires_at = ? WHERE approval_id = ?",
+            (0, approval_id),
+        )
+
+    replacement = main.acquire_deploy_webhook_claim(approval_id)
+    assert replacement["disposition"] == "ACQUIRED"
+    assert replacement["token"] != first["token"]
+    assert replacement["attemptCount"] == 2
+    assert main.complete_deploy_webhook_claim(
+        approval_id,
+        first["token"],
+        {"approvalId": approval_id, "owner": "expired"},
+    ) is False
+    assert main.complete_deploy_webhook_claim(
+        approval_id,
+        replacement["token"],
+        {"approvalId": approval_id, "owner": "replacement"},
+    ) is True
+
+
+def test_concurrent_deploy_webhooks_run_generation_and_deployment_once(monkeypatch):
+    approval_id = create_deferred_webhook_approval("approval-concurrent-endpoint")
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "concurrent-secret")
+    monkeypatch.setattr(main, "safe_update_zendesk_deployment_lifecycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "update_campaign_workflow", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "reuse_existing_live_deployment", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "record_pipeline_step", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "record_zendesk_webhook_event", lambda *args, **kwargs: None)
+
+    generation_started = threading.Event()
+    release_generation = threading.Event()
+    generation_calls = []
+    deployment_calls = []
+
+    def prepare(approval_id_value):
+        generation_calls.append(approval_id_value)
+        generation_started.set()
+        assert release_generation.wait(timeout=5)
+        with main.get_pipeline_db() as db:
+            db.execute(
+                """
+                UPDATE approval_records
+                SET status = 'PENDING', html = '<!doctype html><html></html>',
+                    github_export_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    '{"repository":"owner/repo","commitSha":"abc123"}',
+                    main.now_iso(),
+                    approval_id_value,
+                ),
+            )
+        return main.get_approval_or_404(approval_id_value)
+
+    def deploy(approval_id_value, request):
+        deployment_calls.append(approval_id_value)
+        return main.ApprovalActionResponse(
+            approvalId=approval_id_value,
+            status="APPROVED",
+            canonicalLeadKey="canonical-concurrent-deploy",
+            businessName="Concurrent Plumbing",
+            deployment={"url": "https://concurrent.example", "state": "ready"},
+        )
+
+    monkeypatch.setattr(main, "prepare_deferred_approval", prepare)
+    monkeypatch.setattr(main, "approve_generated_site", deploy)
+
+    def deliver():
+        request = main.ZendeskWebhookRequest(
+            action="deploy_site",
+            approvalId=approval_id,
+            canonicalLeadKey="canonical-concurrent-deploy",
+            channel="phone",
+        )
+        http_request = main.Request(
+            {
+                "type": "http",
+                "method": "POST",
+                "path": "/api/zendesk/webhook",
+                "headers": [(b"x-ai-site-factory-secret", b"concurrent-secret")],
+            }
+        )
+        return main.zendesk_webhook(request, http_request)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(deliver)
+        assert generation_started.wait(timeout=5)
+        second = pool.submit(deliver)
+        second_result = second.result(timeout=5)
+        release_generation.set()
+        first_result = first.result(timeout=5)
+
+    assert {first_result["status"], second_result["status"]} == {"COMPLETED", "IN_PROGRESS"}
+    assert generation_calls == [approval_id]
+    assert deployment_calls == [approval_id]
+
+    replay = deliver()
+    assert replay["status"] == "ALREADY_PROCESSED"
+    assert replay["result"]["deployment"]["deployment"]["url"] == "https://concurrent.example"
+    assert generation_calls == [approval_id]
+    assert deployment_calls == [approval_id]
+
+
+def test_failed_deploy_webhook_claim_releases_for_retry(monkeypatch):
+    approval_id = create_deferred_webhook_approval("approval-retry-deploy")
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "retry-secret")
+    monkeypatch.setattr(main, "safe_update_zendesk_deployment_lifecycle", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "update_campaign_workflow", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "reuse_existing_live_deployment", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "record_pipeline_step", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "record_zendesk_webhook_event", lambda *args, **kwargs: None)
+    prepare_calls = []
+    deployment_calls = []
+
+    def prepare(approval_id_value):
+        prepare_calls.append(approval_id_value)
+        if len(prepare_calls) == 1:
+            raise main.HTTPException(status_code=502, detail="temporary generation failure")
+        with main.get_pipeline_db() as db:
+            db.execute(
+                """
+                UPDATE approval_records
+                SET status = 'PENDING', html = '<!doctype html><html></html>',
+                    github_export_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                ('{"repository":"owner/repo","commitSha":"retry123"}', main.now_iso(), approval_id_value),
+            )
+        return main.get_approval_or_404(approval_id_value)
+
+    def deploy(approval_id_value, request):
+        deployment_calls.append(approval_id_value)
+        return main.ApprovalActionResponse(
+            approvalId=approval_id_value,
+            status="APPROVED",
+            canonicalLeadKey="canonical-concurrent-deploy",
+            businessName="Concurrent Plumbing",
+            deployment={"url": "https://retry.example", "state": "ready"},
+        )
+
+    monkeypatch.setattr(main, "prepare_deferred_approval", prepare)
+    monkeypatch.setattr(main, "approve_generated_site", deploy)
+
+    request = main.ZendeskWebhookRequest(
+        action="deploy_site",
+        approvalId=approval_id,
+        canonicalLeadKey="canonical-concurrent-deploy",
+        channel="phone",
+    )
+    http_request = main.Request(
+        {
+            "type": "http",
+            "method": "POST",
+            "path": "/api/zendesk/webhook",
+            "headers": [(b"x-ai-site-factory-secret", b"retry-secret")],
+        }
+    )
+
+    with pytest.raises(main.HTTPException, match="temporary generation failure"):
+        main.zendesk_webhook(request, http_request)
+    with main.get_pipeline_db() as db:
+        failed = db.execute(
+            "SELECT * FROM deploy_webhook_claims WHERE approval_id = ?", (approval_id,)
+        ).fetchone()
+    assert failed["state"] == "FAILED"
+    assert failed["claim_token"] is None
+    assert failed["lease_expires_at"] is None
+
+    retried = main.zendesk_webhook(request, http_request)
+    assert retried["status"] == "COMPLETED"
+    assert prepare_calls == [approval_id, approval_id]
+    assert deployment_calls == [approval_id]
+    with main.get_pipeline_db() as db:
+        completed = db.execute(
+            "SELECT * FROM deploy_webhook_claims WHERE approval_id = ?", (approval_id,)
+        ).fetchone()
+    assert completed["state"] == "COMPLETED"
+    assert completed["attempt_count"] == 2
 
 
 def test_zendesk_connection_endpoint_validates_and_masks_token(monkeypatch):

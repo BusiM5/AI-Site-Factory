@@ -1,6 +1,7 @@
 [CmdletBinding()]
 param(
     [switch]$InstallOnly,
+    [switch]$UseLocalApi,
     [int]$BackendPort = 8000,
     [int]$FrontendPort = 3000
 )
@@ -18,6 +19,7 @@ $ConfiguredBackendPort = $BackendPort
 $ConfiguredFrontendPort = $FrontendPort
 $BackendUrl = $null
 $FrontendUrl = $null
+$FrontendApiBase = $null
 
 $script:BackendProcess = $null
 $script:FrontendProcess = $null
@@ -28,6 +30,43 @@ $script:PortCleanupEnabled = $false
 function Set-ServerUrls {
     $script:BackendUrl = "http://127.0.0.1:$BackendPort/"
     $script:FrontendUrl = "http://127.0.0.1:$FrontendPort/"
+}
+
+function Get-DotEnvValue {
+    param(
+        [string]$Path,
+        [string]$Key
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return $null
+    }
+
+    $line = Get-Content -LiteralPath $Path |
+        Where-Object { $_ -match "^$([regex]::Escape($Key))=" } |
+        Select-Object -Last 1
+    if (-not $line) {
+        return $null
+    }
+
+    return (($line -split "=", 2)[1]).Trim().Trim('"').Trim("'")
+}
+
+function Resolve-FrontendApiBase {
+    if ($UseLocalApi) {
+        return $BackendUrl.TrimEnd('/')
+    }
+
+    $backendEnvPath = Join-Path $BackendDir ".env"
+    foreach ($key in @("PUBLIC_BACKEND_URL", "RENDER_BACKEND_URL")) {
+        $candidate = Get-DotEnvValue -Path $backendEnvPath -Key $key
+        if ($candidate -and $candidate -match '^https://') {
+            return $candidate.TrimEnd('/')
+        }
+    }
+
+    Write-Warning "No public backend URL is configured; the frontend will use the local API. Zendesk webhooks require a public backend that shares this database."
+    return $BackendUrl.TrimEnd('/')
 }
 
 Set-ServerUrls
@@ -193,6 +232,7 @@ function Save-DevelopmentPorts {
         frontendPort = $FrontendPort
         backendUrl = $BackendUrl
         frontendUrl = $FrontendUrl
+        frontendApiBase = $FrontendApiBase
         updatedAt = (Get-Date).ToString("o")
     }
 
@@ -515,6 +555,7 @@ try {
     $BackendPort = Resolve-UsablePort -Port $BackendPort -Name "backend"
     $FrontendPort = Resolve-UsablePort -Port $FrontendPort -Name "frontend"
     Set-ServerUrls
+    $FrontendApiBase = Resolve-FrontendApiBase
     Save-DevelopmentPorts
 
     $script:CancelHandler = [System.ConsoleCancelEventHandler] {
@@ -534,8 +575,11 @@ try {
     Wait-ForBackend
 
     Write-Step "Starting frontend"
-    Write-Info "Frontend will use http://127.0.0.1:$BackendPort as its API base by default."
-    $frontendStartCommand = "set PORT=$FrontendPort&& set VITE_API_BASE=http://127.0.0.1:$BackendPort&& npm.cmd start -- --port $FrontendPort --strictPort"
+    Write-Info "Frontend API base: $FrontendApiBase"
+    if (-not $UseLocalApi -and $FrontendApiBase -ne $BackendUrl.TrimEnd('/')) {
+        Write-Info "Using the public backend so Zendesk callbacks and campaign state share one database. Pass -UseLocalApi only for isolated development without production Zendesk writes."
+    }
+    $frontendStartCommand = "set PORT=$FrontendPort&& set VITE_API_BASE=$FrontendApiBase&& npm.cmd start -- --port $FrontendPort --strictPort"
     $script:FrontendProcess = Start-ManagedProcess `
         -Name "frontend" `
         -FileName "cmd.exe" `

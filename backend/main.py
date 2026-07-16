@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from uuid import NAMESPACE_URL, uuid4, uuid5
 import base64
 from collections import deque
@@ -827,6 +827,7 @@ class ApprovalActionRequest(BaseModel):
     reason: Optional[str] = None
     regenerateExistingSite: bool = False
     publishMode: str = "github-netlify"
+    zendeskTicketId: Optional[int] = None
 
 
 class ApprovalActionResponse(BaseModel):
@@ -1529,6 +1530,23 @@ def init_pipeline_db() -> None:
                 errors_json TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS deploy_webhook_claims (
+                approval_id TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                claim_token TEXT,
+                lease_expires_at REAL,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                claimed_at TEXT,
+                completed_at TEXT,
+                last_error TEXT,
+                result_json TEXT,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(approval_id) REFERENCES approval_records(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_deploy_webhook_claim_state_lease
+            ON deploy_webhook_claims(state, lease_expires_at);
+
             CREATE TABLE IF NOT EXISTS zendesk_field_settings (
                 field_key TEXT PRIMARY KEY,
                 field_id TEXT,
@@ -1798,6 +1816,14 @@ def restore_zendesk_config_seed_if_empty() -> Dict[str, Any]:
             restoredCounts=restored_counts,
         )
     return result
+
+
+def bootstrap_zendesk_config_on_startup() -> Dict[str, Any]:
+    """Restore only Zendesk blueprint metadata; enabled by default for ephemeral hosts."""
+    if not env_enabled("ENABLE_ZENDESK_CONFIG_BOOTSTRAP", default=True):
+        return {"restored": False, "reason": "zendesk_config_bootstrap_disabled"}
+    return restore_zendesk_config_seed_if_empty()
+
 
 def canonical_lead_key_from_values(
     raw: Dict[str, Any],
@@ -3461,10 +3487,7 @@ def backfill_legacy_campaign_data() -> Dict[str, int]:
 
 
 init_pipeline_db()
-if env_enabled("ENABLE_ZENDESK_CONFIG_BOOTSTRAP"):
-    restore_zendesk_config_seed_if_empty()
-elif env_enabled("ENABLE_PIPELINE_SEED_RESTORE"):
-    restore_pipeline_seed_if_empty()
+bootstrap_zendesk_config_on_startup()
 if env_enabled("ENABLE_LEGACY_CAMPAIGN_BACKFILL"):
     backfill_legacy_campaign_data()
 
@@ -8561,7 +8584,10 @@ def zendesk_match_resource(
     if normalized_saved:
         match = next((item for item in items if compact_text(item.get("id")) == normalized_saved), None)
         if match:
-            return match, "saved_id"
+            saved_name_matches = compact_text(match.get(name_key)).casefold() == compact_text(name).casefold()
+            saved_marker_matches = bool(marker and marker in compact_text(match.get(marker_key)))
+            if marker is None or saved_name_matches or saved_marker_matches:
+                return match, "saved_id"
     if marker:
         match = next((item for item in items if marker in compact_text(item.get(marker_key))), None)
         if match:
@@ -10465,6 +10491,35 @@ def update_zendesk_ticket_comment(ticket_id: int, body: str, public: bool, extra
     return response.json().get("ticket", {})
 
 
+def update_zendesk_ticket_tags(
+    ticket_id: int,
+    *,
+    add: Optional[Iterable[str]] = None,
+    remove: Optional[Iterable[str]] = None,
+) -> List[str]:
+    """Mutate managed tags without replacing tags owned by Zendesk administrators or triggers."""
+    add_tags = list(dict.fromkeys(compact_text(tag) for tag in (add or []) if compact_text(tag)))
+    remove_tags = list(dict.fromkeys(compact_text(tag) for tag in (remove or []) if compact_text(tag)))
+    response: Dict[str, Any] = {}
+    if remove_tags:
+        response = zendesk_api_request(
+            "delete",
+            f"/tickets/{int(ticket_id)}/tags.json",
+            payload={"tags": remove_tags},
+        )
+    if add_tags:
+        response = zendesk_api_request(
+            "put",
+            f"/tickets/{int(ticket_id)}/tags.json",
+            payload={"tags": add_tags},
+        )
+    tags = response.get("tags") if isinstance(response, dict) else None
+    if not isinstance(tags, list):
+        ticket = zendesk_api_request("get", f"/tickets/{int(ticket_id)}.json").get("ticket") or {}
+        tags = ticket.get("tags") or []
+    return list(dict.fromkeys(compact_text(tag) for tag in tags if compact_text(tag)))
+
+
 def update_campaign_workflow(
     approval_id: str,
     status: str,
@@ -10571,13 +10626,16 @@ def update_zendesk_deployment_lifecycle(
         "DEPLOY_FAILED": ["asf_deploy_failed", "asf_stage_failed"],
         "FAILED": ["asf_deploy_failed", "asf_stage_failed"],
     }.get(normalized, ["asf_deploy_requested"])
-    tags = [tag for tag in (link or {}).get("tags", []) if tag not in ZENDESK_LIFECYCLE_TAGS]
-    tags = list(dict.fromkeys(tags + stage_tags + ["asf_managed", f"asf_channel_{channel}"]))
+    tags = update_zendesk_ticket_tags(
+        int(ticket_id),
+        remove=ZENDESK_LIFECYCLE_TAGS,
+        add=stage_tags + ["asf_managed", f"asf_channel_{channel}"],
+    )
     lead_status = "FAILED" if normalized in {"FAILED", "GENERATION_FAILED", "DEPLOY_FAILED"} else "GENERATING"
     custom_fields = zendesk_custom_fields(
         {"deployRequested": True, "leadStatus": lead_status, "contactChannel": channel}
     )
-    extra_fields: Dict[str, Any] = {"status": "open", "tags": tags}
+    extra_fields: Dict[str, Any] = {"status": "open"}
     if custom_fields:
         extra_fields["custom_fields"] = custom_fields
     ticket = update_zendesk_ticket_comment(int(ticket_id), message, public=False, extra_ticket_fields=extra_fields)
@@ -10621,8 +10679,23 @@ def update_existing_intake_ticket(
 ) -> Dict[str, Any]:
     context = safe_json_loads(row["context_json"], {})
     channel = compact_text(context.get("contactChannel"), contact_type_from_context(context)).lower()
+    contract = require_zendesk_ticket_contract(channel)
     link = get_zendesk_ticket_link(row["id"], channel, "intake", ticket_id_override)
-    ticket_id = ticket_id_override or (link or {}).get("ticketId")
+    if ticket_id_override is not None and (
+        not link
+        or compact_text(link.get("ticketId")) != compact_text(ticket_id_override)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ZENDESK_TICKET_LINK_MISMATCH",
+                "message": "The invoking Zendesk ticket is not linked to this approval and channel.",
+                "approvalId": row["id"],
+                "channel": channel,
+                "ticketId": ticket_id_override,
+            },
+        )
+    ticket_id = (link or {}).get("ticketId")
     live_url = compact_text(deployment.get("url"))
     repo_url = compact_text(
         deployment.get("githubRepoUrl")
@@ -10637,9 +10710,14 @@ def update_existing_intake_ticket(
             "contactType": channel,
             "message": "Deployment completed, but this campaign lead has no Zendesk ticket.",
         }
+    if not live_url:
+        raise HTTPException(status_code=502, detail="The completed deployment did not return a live URL for Zendesk.")
 
-    tags = [tag for tag in (link or {}).get("tags", []) if tag not in ZENDESK_LIFECYCLE_TAGS]
-    tags = list(dict.fromkeys(tags + ["asf_managed", "asf_deployed", "asf_stage_live", "asf_repo_ready", f"asf_channel_{channel}"]))
+    tags = update_zendesk_ticket_tags(
+        int(ticket_id),
+        remove=ZENDESK_LIFECYCLE_TAGS,
+        add=["asf_managed", "asf_deployed", "asf_stage_live", "asf_repo_ready", f"asf_channel_{channel}"],
+    )
     custom_fields = zendesk_custom_fields(
         {
             "campaignId": context.get("campaignId"),
@@ -10653,7 +10731,11 @@ def update_existing_intake_ticket(
             "sourceUrl": context.get("sourceUrl"),
         }
     )
-    extra_fields: Dict[str, Any] = {"status": "open", "tags": tags}
+    extra_fields: Dict[str, Any] = {
+        "status": "open",
+        "brand_id": contract["brandId"],
+        "ticket_form_id": contract["formId"],
+    }
     if custom_fields:
         extra_fields["custom_fields"] = custom_fields
     body = (
@@ -10668,6 +10750,31 @@ def update_existing_intake_ticket(
         "For email leads, review the draft and tick the email-send field. For call leads, use the live link during the call."
     )
     ticket = update_zendesk_ticket_comment(int(ticket_id), body, public=False, extra_ticket_fields=extra_fields)
+    live_url_field_id = compact_text(contract["fieldIds"].get("liveUrl"))
+
+    def live_url_is_confirmed(candidate: Dict[str, Any]) -> bool:
+        values = {
+            compact_text(item.get("id")): item.get("value")
+            for item in (candidate.get("custom_fields") or [])
+        }
+        return (
+            compact_text(candidate.get("brand_id")) == compact_text(contract["brandId"])
+            and compact_text(candidate.get("ticket_form_id")) == compact_text(contract["formId"])
+            and zendesk_ticket_field_value_matches(live_url, values.get(live_url_field_id))
+        )
+
+    if not live_url_is_confirmed(ticket):
+        ticket = zendesk_api_request("get", f"/tickets/{ticket_id}.json").get("ticket") or {}
+    if not live_url_is_confirmed(ticket):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "ZENDESK_LIVE_URL_UPDATE_REJECTED",
+                "message": "Zendesk did not preserve the managed brand, form, and live URL field after deployment.",
+                "ticketId": ticket_id,
+                "liveUrlFieldId": live_url_field_id,
+            },
+        )
     payload = {
         **((link or {}).get("payload") or {}),
         "deployRequested": True,
@@ -10878,22 +10985,720 @@ def reuse_existing_live_deployment(
     return {"deployment": deployment, "outreach": outreach, "zendesk": zendesk, "reused": True}
 
 
+def get_approval_if_present(approval_id: Optional[str]) -> Optional[sqlite3.Row]:
+    normalized = compact_text(approval_id)
+    if not normalized:
+        return None
+    with get_pipeline_db() as db:
+        return db.execute("SELECT * FROM approval_records WHERE id = ?", (normalized,)).fetchone()
+
+
+def recover_managed_zendesk_webhook_approval(request: ZendeskWebhookRequest) -> sqlite3.Row:
+    """Rebuild a deferred campaign approval only from an exact managed Zendesk ticket contract."""
+    ticket_id = request.zendeskTicketId
+    requested_channel = compact_text(request.channel).lower()
+    action = compact_text(request.action).lower().replace("-", "_")
+    if not ticket_id or requested_channel not in {"email", "phone"}:
+        raise HTTPException(status_code=404, detail="Could not resolve approval for Zendesk webhook.")
+    if action not in {"deploy", "deploy_site", "approve_deploy", "deploy_requested"}:
+        raise HTTPException(
+            status_code=409,
+            detail="Only a managed deploy webhook can recover a missing deferred approval.",
+        )
+
+    contract = require_zendesk_ticket_contract(requested_channel)
+    ticket = zendesk_api_request("get", f"/tickets/{ticket_id}.json").get("ticket") or {}
+    ticket_tags = {compact_text(tag) for tag in (ticket.get("tags") or []) if compact_text(tag)}
+    required_tags = {
+        "ai_site_factory",
+        "asf_managed",
+        "asf_intake",
+        f"asf_channel_{requested_channel}",
+        "asf_form_email_lead" if requested_channel == "email" else "asf_form_call_lead",
+    }
+    if (
+        compact_text(ticket.get("id")) != compact_text(ticket_id)
+        or compact_text(ticket.get("brand_id")) != compact_text(contract["brandId"])
+        or compact_text(ticket.get("ticket_form_id")) != compact_text(contract["formId"])
+        or not required_tags.issubset(ticket_tags)
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ZENDESK_ORPHAN_TICKET_CONTRACT_INVALID",
+                "message": "The Zendesk ticket cannot recover local state because its managed route or tags do not match.",
+                "ticketId": ticket_id,
+            },
+        )
+
+    field_values = {
+        compact_text(item.get("id")): item.get("value")
+        for item in (ticket.get("custom_fields") or [])
+    }
+
+    def managed_value(key: str) -> Any:
+        return field_values.get(compact_text(contract["fieldIds"].get(key)))
+
+    campaign_id = compact_text(managed_value("campaignId"))
+    campaign_name = compact_text(managed_value("campaignName"))
+    canonical_key = compact_text(managed_value("canonicalLeadKey"))
+    pipeline_id = compact_text(managed_value("pipelineId"))
+    approval_id = compact_text(managed_value("approvalId"))
+    business_name = compact_text(managed_value("businessName"))
+    channel_value = compact_text(managed_value("contactChannel")).lower()
+    expected_channel_values = {
+        requested_channel,
+        f"asf_cf_channel_{requested_channel}",
+    }
+    required_values = {
+        "campaignId": campaign_id,
+        "campaignName": campaign_name,
+        "canonicalLeadKey": canonical_key,
+        "pipelineId": pipeline_id,
+        "approvalId": approval_id,
+        "businessName": business_name,
+    }
+    missing_values = [key for key, value in required_values.items() if not value]
+    external_id = compact_text(ticket.get("external_id"))
+    expected_external_id = f"asf:{campaign_id}:{canonical_key}:{requested_channel}:intake"
+    deploy_requested = managed_value("deployRequested")
+    identity_mismatch = (
+        external_id != expected_external_id
+        or channel_value not in expected_channel_values
+        or (compact_text(request.approvalId) and compact_text(request.approvalId) != approval_id)
+        or (compact_text(request.canonicalLeadKey) and compact_text(request.canonicalLeadKey) != canonical_key)
+        or not zendesk_ticket_field_value_matches(True, deploy_requested)
+    )
+    if missing_values or identity_mismatch:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ZENDESK_ORPHAN_TICKET_IDENTITY_INVALID",
+                "message": "The Zendesk ticket cannot recover local state because its managed identity is incomplete or inconsistent.",
+                "ticketId": ticket_id,
+                "missing": missing_values,
+            },
+        )
+
+    contact_email = normalize_email_identity(managed_value("contactEmail"))
+    contact_phone = compact_text(managed_value("contactPhone"))
+    if requested_channel == "email" and not contact_email:
+        raise HTTPException(status_code=409, detail="The managed email ticket has no recoverable contact email.")
+    if requested_channel == "phone" and not contact_phone:
+        raise HTTPException(status_code=409, detail="The managed phone ticket has no recoverable contact phone.")
+
+    industry = compact_text(managed_value("industry"), "Local service")
+    location = compact_text(managed_value("location"), "South Africa")
+    address = compact_text(managed_value("address"))
+    contact_name = compact_text(managed_value("contactName"))
+    source_url = compact_text(managed_value("sourceUrl"))
+    batch_id = compact_text(managed_value("batchId"))
+    lead_key = stable_lead_key("zendesk-recovery", campaign_id, canonical_key)
+    source = "uploaded-lead-data" if "asf_source_upload" in ticket_tags else "apify-google-maps"
+    timestamp = now_iso()
+    context = {
+        "campaignId": campaign_id,
+        "campaignName": campaign_name,
+        "batchId": batch_id or None,
+        "canonicalLeadKey": canonical_key,
+        "leadKey": lead_key,
+        "businessName": business_name,
+        "contactName": contact_name or None,
+        "email": contact_email,
+        "phone": contact_phone or None,
+        "industry": industry,
+        "category": industry,
+        "location": location,
+        "address": address or None,
+        "source": source,
+        "sourceUrl": source_url or None,
+        "contactChannel": requested_channel,
+        "intakeDeferred": True,
+        "noWebsiteLead": True,
+        "hasWebsite": False,
+        "recoveredFromZendeskTicketId": int(ticket_id),
+    }
+    fields_json = json.dumps(
+        {
+            "campaignId": campaign_id,
+            "campaignName": campaign_name,
+            "businessName": business_name,
+            "contactName": contact_name or None,
+            "email": contact_email,
+            "phone": contact_phone or None,
+            "industry": industry,
+            "location": location,
+            "address": address or None,
+            "sourceUrl": source_url or None,
+            "channel": requested_channel,
+        },
+        default=str,
+    )
+
+    subdomain = require_env("ZENDESK_SUBDOMAIN")
+    deployment_id = f"recovered-deployment-{approval_id}"
+    channel_table = "campaign_email_leads" if requested_channel == "email" else "campaign_call_leads"
+    link_payload = {
+        "recoveredFromManagedTicket": True,
+        "recoveredAt": timestamp,
+        "externalId": external_id,
+        "customFields": ticket.get("custom_fields") or [],
+    }
+
+    def recovery_conflict(entity: str, message: str) -> None:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ZENDESK_ORPHAN_RECOVERY_CONFLICT",
+                "entity": entity,
+                "message": message,
+                "ticketId": ticket_id,
+            },
+        )
+
+    with get_pipeline_db() as db:
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(
+                """
+                INSERT OR IGNORE INTO lead_registry (
+                    canonical_lead_key, lead_key, business_name, email, phone, category, address,
+                    location, source, source_url, status, raw_json, first_seen_at, last_seen_at, discovery_count
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DISCOVERED', ?, ?, ?, 1)
+                """,
+                (
+                    canonical_key, lead_key, business_name, contact_email, contact_phone or None, industry,
+                    address or None, location, source, source_url or None,
+                    json.dumps({"recoveredFromZendeskTicketId": ticket_id}), timestamp, timestamp,
+                ),
+            )
+            db.execute(
+                """
+                UPDATE lead_registry
+                SET email = CASE WHEN email IS NULL OR TRIM(email) = '' THEN ? ELSE email END,
+                    phone = CASE WHEN phone IS NULL OR TRIM(phone) = '' THEN ? ELSE phone END,
+                    last_seen_at = ?
+                WHERE canonical_lead_key = ?
+                """,
+                (contact_email, contact_phone or None, timestamp, canonical_key),
+            )
+            db.execute(
+                """
+                INSERT OR IGNORE INTO campaigns (
+                    id, name, preset_id, industry, query, location, requested_count, discovered_count,
+                    channel_filter, status, warnings_json, created_at, updated_at
+                ) VALUES (?, ?, 'zendesk-recovery', ?, 'Recovered managed Zendesk intake', ?, 1, 1, ?,
+                          'INTAKE_READY', '[]', ?, ?)
+                """,
+                (campaign_id, campaign_name, industry, location, requested_channel, timestamp, timestamp),
+            )
+            db.execute(
+                """
+                INSERT OR IGNORE INTO pipeline_runs (
+                    pipeline_id, status, template_id, source_batch_id, created_at, updated_at,
+                    lead_count, completed_count, pending_count, failed_count, warnings_json
+                ) VALUES (?, 'INTAKE_READY', ?, NULL, ?, ?, 1, 0, 1, 0, '[]')
+                """,
+                (pipeline_id, FREEFORM_TEMPLATE_ID, timestamp, timestamp),
+            )
+            db.execute(
+                """
+                INSERT OR IGNORE INTO approval_records (
+                    id, pipeline_id, canonical_lead_key, lead_key, business_name, status, html,
+                    context_json, site_content_json, template_json, created_at, updated_at,
+                    publish_mode, errors_json
+                ) VALUES (?, ?, ?, ?, ?, 'AWAITING_DEPLOYMENT', NULL, ?, ?, ?, ?, ?, 'github-netlify', '[]')
+                """,
+                (
+                    approval_id, pipeline_id, canonical_key, lead_key, business_name,
+                    json.dumps(context, default=str),
+                    json.dumps({"deferredGeneration": True, "recoveredFromZendesk": True}, default=str),
+                    json.dumps(dict(FREEFORM_SITE_SPEC), default=str), timestamp, timestamp,
+                ),
+            )
+            db.execute(
+                """
+                INSERT OR IGNORE INTO campaign_deployments (
+                    id, campaign_id, canonical_lead_key, approval_id, channel, status,
+                    requested_at, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'DEPLOY_REQUESTED', ?, ?, ?)
+                """,
+                (
+                    deployment_id, campaign_id, canonical_key, approval_id,
+                    requested_channel, timestamp, timestamp, timestamp,
+                ),
+            )
+            if requested_channel == "email":
+                db.execute(
+                    """
+                    INSERT OR IGNORE INTO campaign_email_leads (
+                        id, campaign_id, canonical_lead_key, approval_id, business_name, contact_name,
+                        email, source_url, status, deploy_requested, ticket_id, deployment_id,
+                        fields_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'DEPLOY_REQUESTED', 1, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"recovered-email-{approval_id}", campaign_id, canonical_key, approval_id,
+                        business_name, contact_name or None, contact_email, source_url or None, ticket_id,
+                        deployment_id, fields_json, timestamp, timestamp,
+                    ),
+                )
+            else:
+                db.execute(
+                    """
+                    INSERT OR IGNORE INTO campaign_call_leads (
+                        id, campaign_id, canonical_lead_key, approval_id, business_name, contact_name,
+                        phone, source_url, status, deploy_requested, ticket_id, deployment_id,
+                        fields_json, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'DEPLOY_REQUESTED', 1, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"recovered-phone-{approval_id}", campaign_id, canonical_key, approval_id,
+                        business_name, contact_name or None, contact_phone, source_url or None, ticket_id,
+                        deployment_id, fields_json, timestamp, timestamp,
+                    ),
+                )
+            db.execute(
+                """
+                INSERT OR IGNORE INTO zendesk_ticket_links (
+                    id, approval_id, canonical_lead_key, pipeline_id, external_id, ticket_id, ticket_url,
+                    channel, stage, status, tags_json, payload_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'intake', ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid4()), approval_id, canonical_key, pipeline_id, external_id, int(ticket_id),
+                    f"https://{subdomain}.zendesk.com/agent/tickets/{ticket_id}", requested_channel,
+                    ticket.get("status") or "open", json.dumps(sorted(ticket_tags), default=str),
+                    json.dumps(link_payload, default=str), timestamp, timestamp,
+                ),
+            )
+
+            approval_row = db.execute(
+                "SELECT * FROM approval_records WHERE id = ?", (approval_id,)
+            ).fetchone()
+            approval_context = safe_json_loads(approval_row["context_json"], {}) if approval_row else {}
+            if not approval_row or (
+                compact_text(approval_row["canonical_lead_key"]) != canonical_key
+                or compact_text(approval_row["pipeline_id"]) != pipeline_id
+                or normalize_identity_text(approval_row["business_name"]) != normalize_identity_text(business_name)
+                or compact_text(approval_context.get("campaignId")) != campaign_id
+                or compact_text(approval_context.get("contactChannel")).lower() != requested_channel
+            ):
+                recovery_conflict("approval", "The approval ID is already owned by different local state.")
+
+            campaign_row = db.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
+            if not campaign_row or compact_text(campaign_row["name"]) != campaign_name:
+                recovery_conflict("campaign", "The campaign ID is already owned by a different campaign.")
+
+            lead_row = db.execute(
+                "SELECT * FROM lead_registry WHERE canonical_lead_key = ?", (canonical_key,)
+            ).fetchone()
+            lead_contact_conflict = (
+                requested_channel == "email"
+                and normalize_email_identity(lead_row["email"] if lead_row else None) != contact_email
+            ) or (
+                requested_channel == "phone"
+                and normalize_phone_identity(lead_row["phone"] if lead_row else None)
+                != normalize_phone_identity(contact_phone)
+            )
+            if not lead_row or (
+                normalize_identity_text(lead_row["business_name"]) != normalize_identity_text(business_name)
+                or lead_contact_conflict
+            ):
+                recovery_conflict("lead", "The canonical lead key is already owned by a different lead.")
+
+            channel_row = db.execute(
+                f"SELECT * FROM {channel_table} WHERE campaign_id = ? AND canonical_lead_key = ?",
+                (campaign_id, canonical_key),
+            ).fetchone()
+            channel_contact_conflict = (
+                requested_channel == "email"
+                and normalize_email_identity(channel_row["email"] if channel_row else None) != contact_email
+            ) or (
+                requested_channel == "phone"
+                and normalize_phone_identity(channel_row["phone"] if channel_row else None)
+                != normalize_phone_identity(contact_phone)
+            )
+            if not channel_row or (
+                compact_text(channel_row["approval_id"]) != approval_id
+                or normalize_identity_text(channel_row["business_name"]) != normalize_identity_text(business_name)
+                or compact_text(channel_row["ticket_id"]) != compact_text(ticket_id)
+                or compact_text(channel_row["deployment_id"]) != deployment_id
+                or channel_contact_conflict
+            ):
+                recovery_conflict("channel", "The campaign lead is already owned by different intake state.")
+
+            deployment_row = db.execute(
+                "SELECT * FROM campaign_deployments WHERE approval_id = ?", (approval_id,)
+            ).fetchone()
+            if not deployment_row or (
+                compact_text(deployment_row["id"]) != deployment_id
+                or compact_text(deployment_row["campaign_id"]) != campaign_id
+                or compact_text(deployment_row["canonical_lead_key"]) != canonical_key
+                or compact_text(deployment_row["channel"]).lower() != requested_channel
+            ):
+                recovery_conflict("deployment", "The approval deployment is already owned by different state.")
+
+            link_row = db.execute(
+                """
+                SELECT * FROM zendesk_ticket_links
+                WHERE approval_id = ? AND channel = ? AND stage = 'intake'
+                """,
+                (approval_id, requested_channel),
+            ).fetchone()
+            external_owner = db.execute(
+                "SELECT * FROM zendesk_ticket_links WHERE external_id = ?", (external_id,)
+            ).fetchone()
+            if not link_row or not external_owner or link_row["id"] != external_owner["id"] or (
+                compact_text(link_row["canonical_lead_key"]) != canonical_key
+                or compact_text(link_row["pipeline_id"]) != pipeline_id
+                or compact_text(link_row["external_id"]) != external_id
+                or compact_text(link_row["ticket_id"]) != compact_text(ticket_id)
+            ):
+                recovery_conflict("ticket_link", "The Zendesk ticket identity is already owned by different local state.")
+
+            recovered_campaign_leads = db.execute(
+                """
+                SELECT COUNT(*) AS count FROM (
+                    SELECT canonical_lead_key FROM campaign_email_leads WHERE campaign_id = ?
+                    UNION
+                    SELECT canonical_lead_key FROM campaign_call_leads WHERE campaign_id = ?
+                )
+                """,
+                (campaign_id, campaign_id),
+            ).fetchone()["count"]
+            recovered_pipeline_leads = db.execute(
+                "SELECT COUNT(DISTINCT canonical_lead_key) AS count FROM approval_records WHERE pipeline_id = ?",
+                (pipeline_id,),
+            ).fetchone()["count"]
+            db.execute(
+                """
+                UPDATE campaigns
+                SET discovered_count = MAX(discovered_count, ?),
+                    requested_count = MAX(requested_count, ?),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (recovered_campaign_leads, recovered_campaign_leads, timestamp, campaign_id),
+            )
+            db.execute(
+                """
+                UPDATE pipeline_runs
+                SET lead_count = MAX(lead_count, ?), updated_at = ?
+                WHERE pipeline_id = ?
+                """,
+                (recovered_pipeline_leads, timestamp, pipeline_id),
+            )
+            campaign_row = db.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
+            pipeline_row = db.execute("SELECT * FROM pipeline_runs WHERE pipeline_id = ?", (pipeline_id,)).fetchone()
+            if not campaign_row or int(campaign_row["discovered_count"]) < int(recovered_campaign_leads):
+                recovery_conflict("campaign", "Recovered campaign lead totals could not be persisted.")
+            if not pipeline_row or int(pipeline_row["lead_count"]) < int(recovered_pipeline_leads):
+                recovery_conflict("pipeline", "Recovered pipeline lead totals could not be persisted.")
+            db.commit()
+        except HTTPException:
+            db.rollback()
+            raise
+        except sqlite3.IntegrityError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ZENDESK_ORPHAN_RECOVERY_CONFLICT",
+                    "entity": "database",
+                    "message": "The managed Zendesk ticket conflicts with existing local state.",
+                    "ticketId": ticket_id,
+                },
+            ) from exc
+        except Exception:
+            db.rollback()
+            raise
+    log_event(
+        "warning",
+        "zendesk.webhook.approval_recovered",
+        "Recovered missing deferred campaign state from a fully managed Zendesk ticket.",
+        approvalId=approval_id,
+        ticketId=ticket_id,
+        campaignId=campaign_id,
+    )
+    return get_approval_or_404(approval_id)
+
+
 def resolve_webhook_approval(request: ZendeskWebhookRequest) -> sqlite3.Row:
-    if request.approvalId:
-        return get_approval_or_404(request.approvalId)
+    requested_approval_id = compact_text(request.approvalId)
+    requested_canonical_key = compact_text(request.canonicalLeadKey)
+    ticket_links: List[sqlite3.Row] = []
     if request.zendeskTicketId:
         with get_pipeline_db() as db:
-            link = db.execute(
-                "SELECT approval_id FROM zendesk_ticket_links WHERE ticket_id = ? ORDER BY created_at DESC LIMIT 1",
+            ticket_links = db.execute(
+                "SELECT * FROM zendesk_ticket_links WHERE ticket_id = ? ORDER BY created_at DESC",
                 (request.zendeskTicketId,),
+            ).fetchall()
+        linked_approval_ids = {compact_text(link["approval_id"]) for link in ticket_links}
+        if len(linked_approval_ids) > 1:
+            raise HTTPException(status_code=409, detail="Zendesk ticket is linked to conflicting approvals.")
+        linked_approval_id = next(iter(linked_approval_ids), "")
+        if requested_approval_id and linked_approval_id and requested_approval_id != linked_approval_id:
+            raise HTTPException(status_code=409, detail="Zendesk webhook approval and ticket identities do not match.")
+
+    row = get_approval_if_present(requested_approval_id)
+    if not row and ticket_links:
+        row = get_approval_if_present(ticket_links[0]["approval_id"])
+    if request.zendeskTicketId and (not row or not ticket_links):
+        row = recover_managed_zendesk_webhook_approval(request)
+        ticket_links = []
+        with get_pipeline_db() as db:
+            ticket_links = db.execute(
+                "SELECT * FROM zendesk_ticket_links WHERE ticket_id = ? AND approval_id = ?",
+                (request.zendeskTicketId, row["id"]),
+            ).fetchall()
+
+    if not row and requested_canonical_key:
+        with get_pipeline_db() as db:
+            candidates = db.execute(
+                """
+                SELECT * FROM approval_records
+                WHERE canonical_lead_key = ?
+                  AND status IN (
+                    'AWAITING_DEPLOYMENT', 'GENERATION_FAILED', 'EXPORT_FAILED',
+                    'PENDING', 'DEPLOY_FAILED', 'APPROVED', 'DEPLOYED_ZENDESK_FAILED'
+                  )
+                ORDER BY created_at DESC
+                """,
+                (requested_canonical_key,),
+            ).fetchall()
+        if len(candidates) > 1:
+            raise HTTPException(status_code=409, detail="Canonical lead key matches multiple webhook approvals.")
+        row = candidates[0] if candidates else None
+
+    if not row:
+        raise HTTPException(status_code=404, detail="Could not resolve approval for Zendesk webhook.")
+    if requested_approval_id and requested_approval_id != compact_text(row["id"]):
+        raise HTTPException(status_code=409, detail="Zendesk webhook approval identity does not match local state.")
+    if requested_canonical_key and requested_canonical_key != compact_text(row["canonical_lead_key"]):
+        raise HTTPException(status_code=409, detail="Zendesk webhook canonical lead identity does not match local state.")
+
+    context = safe_json_loads(row["context_json"], {})
+    linked_channels = {compact_text(link["channel"]).lower() for link in ticket_links}
+    context_channel = compact_text(context.get("contactChannel")).lower()
+    expected_channel = (
+        context_channel
+        or (next(iter(linked_channels)) if len(linked_channels) == 1 else "")
+        or contact_type_from_context(context)
+    ).lower()
+    requested_channel = compact_text(request.channel, expected_channel).lower()
+    if requested_channel != expected_channel or (linked_channels and requested_channel not in linked_channels):
+        raise HTTPException(status_code=409, detail="Zendesk webhook channel does not match the managed campaign ticket.")
+    return row
+
+
+DEPLOY_WEBHOOK_ACTIONS = {"deploy", "deploy_site", "approve_deploy", "deploy_requested"}
+
+
+def deploy_webhook_lease_seconds() -> int:
+    try:
+        configured = int(os.getenv("DEPLOY_WEBHOOK_LEASE_SECONDS", "3600"))
+    except (TypeError, ValueError):
+        configured = 3600
+    return max(60, min(configured, 24 * 60 * 60))
+
+
+def public_deploy_webhook_claim(claim: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "status": claim["disposition"],
+        "attempt": claim.get("attemptCount", 0),
+        "leaseExpiresAtEpoch": claim.get("leaseExpiresAt"),
+    }
+
+
+def acquire_deploy_webhook_claim(approval_id: str) -> Dict[str, Any]:
+    """Atomically claim the expensive deploy path for one approval."""
+    token = str(uuid4())
+    now_epoch = time.time()
+    lease_expires_at = now_epoch + deploy_webhook_lease_seconds()
+    timestamp = now_iso()
+
+    with get_pipeline_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        approval = db.execute(
+            "SELECT * FROM approval_records WHERE id = ?", (approval_id,)
+        ).fetchone()
+        if not approval:
+            raise HTTPException(status_code=404, detail="Approval record not found.")
+
+        existing = db.execute(
+            "SELECT * FROM deploy_webhook_claims WHERE approval_id = ?", (approval_id,)
+        ).fetchone()
+        if existing and compact_text(existing["state"]).upper() == "COMPLETED":
+            return {
+                "disposition": "ALREADY_PROCESSED",
+                "attemptCount": existing["attempt_count"] or 0,
+                "leaseExpiresAt": None,
+                "result": safe_json_loads(existing["result_json"], {}),
+            }
+
+        if (
+            existing
+            and compact_text(existing["state"]).upper() == "IN_PROGRESS"
+            and float(existing["lease_expires_at"] or 0) > now_epoch
+        ):
+            return {
+                "disposition": "IN_PROGRESS",
+                "attemptCount": existing["attempt_count"] or 0,
+                "leaseExpiresAt": existing["lease_expires_at"],
+                "result": {},
+            }
+
+        if approval["status"] == "APPROVED" and approval["deployment_history_id"]:
+            history = db.execute(
+                "SELECT * FROM deployment_history WHERE id = ?",
+                (approval["deployment_history_id"],),
             ).fetchone()
-        if link:
-            return get_approval_or_404(link["approval_id"])
-    if request.canonicalLeadKey:
-        existing = latest_reusable_approval_for_lead(request.canonicalLeadKey)
+            completed_result = {
+                "approvalId": approval_id,
+                "action": "deploy_site",
+                "deployment": deployment_from_history(history),
+            }
+            attempt_count = existing["attempt_count"] if existing else 0
+            db.execute(
+                """
+                INSERT INTO deploy_webhook_claims (
+                    approval_id, state, claim_token, lease_expires_at, attempt_count,
+                    claimed_at, completed_at, last_error, result_json, updated_at
+                ) VALUES (?, 'COMPLETED', NULL, NULL, ?, NULL, ?, NULL, ?, ?)
+                ON CONFLICT(approval_id) DO UPDATE SET
+                    state = 'COMPLETED', claim_token = NULL, lease_expires_at = NULL,
+                    completed_at = excluded.completed_at, last_error = NULL,
+                    result_json = excluded.result_json, updated_at = excluded.updated_at
+                """,
+                (
+                    approval_id,
+                    attempt_count,
+                    timestamp,
+                    json.dumps(completed_result, default=str),
+                    timestamp,
+                ),
+            )
+            return {
+                "disposition": "ALREADY_PROCESSED",
+                "attemptCount": attempt_count,
+                "leaseExpiresAt": None,
+                "result": completed_result,
+            }
+
+        attempt_count = (existing["attempt_count"] or 0) + 1 if existing else 1
         if existing:
-            return existing
-    raise HTTPException(status_code=404, detail="Could not resolve approval for Zendesk webhook.")
+            updated = db.execute(
+                """
+                UPDATE deploy_webhook_claims
+                SET state = 'IN_PROGRESS', claim_token = ?, lease_expires_at = ?,
+                    attempt_count = ?, claimed_at = ?, completed_at = NULL,
+                    last_error = NULL, result_json = NULL, updated_at = ?
+                WHERE approval_id = ?
+                  AND (state != 'IN_PROGRESS' OR lease_expires_at IS NULL OR lease_expires_at <= ?)
+                """,
+                (
+                    token,
+                    lease_expires_at,
+                    attempt_count,
+                    timestamp,
+                    timestamp,
+                    approval_id,
+                    now_epoch,
+                ),
+            )
+            if updated.rowcount != 1:
+                current = db.execute(
+                    "SELECT * FROM deploy_webhook_claims WHERE approval_id = ?", (approval_id,)
+                ).fetchone()
+                return {
+                    "disposition": "IN_PROGRESS",
+                    "attemptCount": current["attempt_count"] or 0,
+                    "leaseExpiresAt": current["lease_expires_at"],
+                    "result": {},
+                }
+        else:
+            db.execute(
+                """
+                INSERT INTO deploy_webhook_claims (
+                    approval_id, state, claim_token, lease_expires_at, attempt_count,
+                    claimed_at, completed_at, last_error, result_json, updated_at
+                ) VALUES (?, 'IN_PROGRESS', ?, ?, 1, ?, NULL, NULL, NULL, ?)
+                """,
+                (approval_id, token, lease_expires_at, timestamp, timestamp),
+            )
+
+    return {
+        "disposition": "ACQUIRED",
+        "attemptCount": attempt_count,
+        "leaseExpiresAt": lease_expires_at,
+        "token": token,
+        "result": {},
+    }
+
+
+def renew_deploy_webhook_claim(approval_id: str, claim_token: str) -> bool:
+    timestamp = now_iso()
+    with get_pipeline_db() as db:
+        updated = db.execute(
+            """
+            UPDATE deploy_webhook_claims
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE approval_id = ? AND state = 'IN_PROGRESS' AND claim_token = ?
+            """,
+            (
+                time.time() + deploy_webhook_lease_seconds(),
+                timestamp,
+                approval_id,
+                claim_token,
+            ),
+        )
+    return updated.rowcount == 1
+
+
+def complete_deploy_webhook_claim(
+    approval_id: str,
+    claim_token: str,
+    result: Dict[str, Any],
+) -> bool:
+    timestamp = now_iso()
+    with get_pipeline_db() as db:
+        updated = db.execute(
+            """
+            UPDATE deploy_webhook_claims
+            SET state = 'COMPLETED', claim_token = NULL, lease_expires_at = NULL,
+                completed_at = ?, last_error = NULL, result_json = ?, updated_at = ?
+            WHERE approval_id = ? AND state = 'IN_PROGRESS' AND claim_token = ?
+            """,
+            (
+                timestamp,
+                json.dumps(result, default=str),
+                timestamp,
+                approval_id,
+                claim_token,
+            ),
+        )
+    return updated.rowcount == 1
+
+
+def fail_deploy_webhook_claim(approval_id: str, claim_token: str, error: Any) -> bool:
+    timestamp = now_iso()
+    with get_pipeline_db() as db:
+        updated = db.execute(
+            """
+            UPDATE deploy_webhook_claims
+            SET state = 'FAILED', claim_token = NULL, lease_expires_at = NULL,
+                completed_at = NULL, last_error = ?, updated_at = ?
+            WHERE approval_id = ? AND state = 'IN_PROGRESS' AND claim_token = ?
+            """,
+            (
+                sanitize_message(error),
+                timestamp,
+                approval_id,
+                claim_token,
+            ),
+        )
+    return updated.rowcount == 1
 
 
 @app.post("/api/zendesk/webhook")
@@ -10918,11 +11723,27 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
     ticket_id = request.zendeskTicketId or (ticket_link or {}).get("ticketId")
     result: Dict[str, Any] = {"approvalId": approval_id, "action": action}
     started = now_iso()
+    deploy_claim_token: Optional[str] = None
+    deploy_claim_attempt = 0
 
     try:
-        if action in {"deploy", "deploy_site", "approve_deploy", "deploy_requested"}:
+        if action in DEPLOY_WEBHOOK_ACTIONS:
             if channel not in {"email", "phone"}:
                 raise HTTPException(status_code=409, detail="Deploy webhook requires an email or phone campaign channel.")
+            claim = acquire_deploy_webhook_claim(approval_id)
+            deploy_claim_attempt = claim.get("attemptCount", 0)
+            if claim["disposition"] == "IN_PROGRESS":
+                result["claim"] = public_deploy_webhook_claim(claim)
+                record_zendesk_webhook_event(action, "IN_PROGRESS", payload, result)
+                return {"status": "IN_PROGRESS", "result": result}
+            if claim["disposition"] == "ALREADY_PROCESSED":
+                result.update(claim.get("result") or {})
+                result["claim"] = public_deploy_webhook_claim(claim)
+                record_zendesk_webhook_event(action, "COMPLETED", payload, result)
+                return {"status": "ALREADY_PROCESSED", "result": result}
+
+            deploy_claim_token = claim["token"]
+            result["claim"] = public_deploy_webhook_claim(claim)
             if context.get("intakeDeferred"):
                 safe_update_zendesk_deployment_lifecycle(
                     row,
@@ -10931,6 +11752,8 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
                     "AI Site Factory deployment was requested. Site generation is starting now.",
                 )
             update_campaign_workflow(approval_id, "DEPLOY_REQUESTED", requested=True)
+            if not renew_deploy_webhook_claim(approval_id, deploy_claim_token):
+                raise HTTPException(status_code=409, detail="Deployment claim was lost before processing started.")
             reused = reuse_existing_live_deployment(
                 row,
                 compact_text(request.actor, "Zendesk Webhook"),
@@ -10942,6 +11765,8 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
             else:
                 if row["status"] in {"AWAITING_DEPLOYMENT", "GENERATION_FAILED", "EXPORT_FAILED"} and not row["html"]:
                     row = prepare_deferred_approval(approval_id)
+                    if not renew_deploy_webhook_claim(approval_id, deploy_claim_token):
+                        raise HTTPException(status_code=409, detail="Deployment claim was lost after site generation.")
                 if row["status"] in {"PENDING", "DEPLOY_FAILED"}:
                     if context.get("intakeDeferred"):
                         safe_update_zendesk_deployment_lifecycle(
@@ -10958,30 +11783,61 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
                             "DEPLOYING",
                             "The GitHub artifact is ready and Netlify is deploying the site.",
                         )
+                    if not renew_deploy_webhook_claim(approval_id, deploy_claim_token):
+                        raise HTTPException(status_code=409, detail="Deployment claim was lost before Netlify deployment.")
                     deploy_response = approve_generated_site(
                         approval_id,
                         ApprovalActionRequest(
                             approvedBy=compact_text(request.actor, "Zendesk Webhook"),
                             notes=request.notes or "Deployment requested from Zendesk webhook.",
+                            zendeskTicketId=ticket_id,
                         ),
                     )
                     result["deployment"] = deploy_response.model_dump()
+                    if deploy_response.status == "DEPLOYED_ZENDESK_FAILED":
+                        raise HTTPException(
+                            status_code=502,
+                            detail={
+                                "code": "ZENDESK_LIVE_URL_UPDATE_FAILED",
+                                "message": "The site deployed, but the managed Zendesk ticket did not accept the live URL update.",
+                                "ticketId": ticket_id,
+                            },
+                        )
                 else:
                     result["deployment"] = approval_row_to_dict(row)
             if ticket_link:
-                payload_update = {**ticket_link.get("payload", {}), "deployRequested": True, "deployWebhookAt": now_iso()}
+                latest_ticket_link = (
+                    get_zendesk_ticket_link(approval_id, channel, "intake", ticket_id)
+                    or ticket_link
+                )
+                payload_update = {
+                    **latest_ticket_link.get("payload", {}),
+                    "deployRequested": True,
+                    "deployWebhookAt": now_iso(),
+                }
                 save_zendesk_ticket_link(
                     approval_id,
                     row["canonical_lead_key"],
                     row["pipeline_id"],
-                    ticket_link["channel"],
-                    ticket_link["stage"],
-                    ticket_id,
-                    ticket_link.get("ticketUrl"),
-                    "deploy_requested",
-                    ticket_link.get("tags", []),
+                    latest_ticket_link["channel"],
+                    latest_ticket_link["stage"],
+                    latest_ticket_link.get("ticketId"),
+                    latest_ticket_link.get("ticketUrl"),
+                    latest_ticket_link.get("status") or "deploy_requested",
+                    latest_ticket_link.get("tags", []),
                     payload_update,
                 )
+            completed_result = {
+                **result,
+                "claim": {
+                    "status": "COMPLETED",
+                    "attempt": deploy_claim_attempt,
+                    "leaseExpiresAtEpoch": None,
+                },
+            }
+            if not complete_deploy_webhook_claim(approval_id, deploy_claim_token, completed_result):
+                raise HTTPException(status_code=409, detail="Deployment claim could not be completed by its owner.")
+            result = completed_result
         elif action in {"send_email", "email_send", "send_approved_email", "email_send_requested"}:
             if channel != "email":
                 raise HTTPException(status_code=409, detail="Email send webhook can only run for email-channel Zendesk tickets.")
@@ -10992,7 +11848,11 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
             outreach = safe_json_loads(row["outreach_json"], None) or generate_outreach_with_groq(context, site_url)
             body = f"{outreach.get('body')}\n\n{request.notes or ''}".strip()
             custom_fields = zendesk_custom_fields({"emailSendRequested": True, "leadStatus": "EMAIL_SENT", "liveUrl": site_url})
-            extra_fields: Dict[str, Any] = {"status": "open", "tags": ["ai_site_factory", "ai_site_email_sent", "ai_site_email_lead"]}
+            tags = update_zendesk_ticket_tags(
+                int(ticket_id),
+                add=["ai_site_factory", "ai_site_email_sent", "ai_site_email_lead", "asf_email_sent"],
+            )
+            extra_fields: Dict[str, Any] = {"status": "open"}
             if custom_fields:
                 extra_fields["custom_fields"] = custom_fields
             ticket = update_zendesk_ticket_comment(int(ticket_id), body, public=True, extra_ticket_fields=extra_fields)
@@ -11012,7 +11872,7 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
                     ticket_id,
                     ticket_link.get("ticketUrl"),
                     ticket.get("status") or "open",
-                    list(set(ticket_link.get("tags", []) + ["ai_site_email_sent", "asf_email_sent"])),
+                    tags,
                     payload_update,
                 )
             result["email"] = {"ticketId": ticket_id, "status": ticket.get("status") or "open"}
@@ -11064,7 +11924,9 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
         record_zendesk_webhook_event(action, "COMPLETED", payload, result)
         return {"status": "COMPLETED", "result": result}
     except HTTPException as error:
-        if action in {"deploy", "deploy_site", "approve_deploy", "deploy_requested"} and ticket_id and context.get("intakeDeferred"):
+        if deploy_claim_token:
+            fail_deploy_webhook_claim(approval_id, deploy_claim_token, error.detail)
+        if action in DEPLOY_WEBHOOK_ACTIONS and ticket_id and context.get("intakeDeferred"):
             try:
                 failure_status = "GENERATION_FAILED" if "generation" in compact_text(error.detail).lower() else "DEPLOY_FAILED"
                 update_zendesk_deployment_lifecycle(
@@ -11076,7 +11938,9 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
         record_zendesk_webhook_event(action, "FAILED", payload, message=str(error.detail))
         raise
     except Exception as error:
-        if action in {"deploy", "deploy_site", "approve_deploy", "deploy_requested"} and ticket_id and context.get("intakeDeferred"):
+        if deploy_claim_token:
+            fail_deploy_webhook_claim(approval_id, deploy_claim_token, error)
+        if action in DEPLOY_WEBHOOK_ACTIONS and ticket_id and context.get("intakeDeferred"):
             try:
                 update_zendesk_deployment_lifecycle(
                     row, ticket_id, "DEPLOY_FAILED",
@@ -11413,7 +12277,9 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
             zendesk = run_approval_step(
                 "zendesk_intake_update",
                 "zendesk",
-                lambda: update_existing_intake_ticket(row, deployment, outreach or {}),
+                lambda: update_existing_intake_ticket(
+                    row, deployment, outreach or {}, request.zendeskTicketId
+                ),
             )
         else:
             outreach = run_approval_step(
