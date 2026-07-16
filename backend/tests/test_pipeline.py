@@ -1,3 +1,5 @@
+import base64
+import re
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -89,6 +91,76 @@ def test_existing_theme_widget_is_upgraded_to_control_site_variables():
     assert 'root.style.setProperty("--ai-text", text)' in upgraded
     assert 'root.style.setProperty("--ai-background", background)' in upgraded
     assert 'root.style.setProperty("--ai-highlight", highlight)' in upgraded
+    assert upgraded.count('data-ai-site-theme-version="3"') == 2
+    assert "var(--ai-highlight-deep) 0%" in upgraded
+    assert "var(--ai-highlight-soft) 100%" in upgraded
+    assert 'root.style.setProperty("--ai-on-highlight", onHighlight)' in upgraded
+    assert 'img[src^="data:image/svg+xml;base64,"]' in upgraded
+    assert "aspect-ratio: 3 / 2 !important" in upgraded
+    assert "object-fit: contain !important" in upgraded
+    assert "overflow-wrap: anywhere" in upgraded
+    assert "white-space: normal" in upgraded
+
+
+def decode_svg_data_uri(data_uri):
+    return base64.b64decode(data_uri.split(",", 1)[1]).decode("utf-8")
+
+
+def svg_role_lines(svg, role):
+    block = re.search(rf"<text data-role='{role}'[^>]*>(.*?)</text>", svg).group(1)
+    return re.findall(r"<tspan[^>]*>(.*?)</tspan>", block)
+
+
+def test_fallback_svg_wraps_all_business_copy_inside_bounded_regions():
+    subtitle = "Independent accounting and bookkeeping specialists serving greater Durban"
+    business_name = "The Founder's Architect Accounting and Advisory Practice"
+    detail = "17 Erskine Terrace, Addington Beach, Durban, 4001, South Africa"
+
+    svg = decode_svg_data_uri(
+        main.fallback_image_data_uri(business_name, "#d35d89", subtitle, detail)
+    )
+
+    assert "ai-site-fallback-image-v2" in svg
+    assert " ".join(svg_role_lines(svg, "subtitle")) == subtitle
+    assert " ".join(svg_role_lines(svg, "business-name")) == business_name
+    assert " ".join(svg_role_lines(svg, "detail")) == detail
+    assert max(map(int, re.findall(r"textLength='(\d+)'", svg))) <= 436
+    assert max(map(int, re.findall(r"<tspan x='626' y='(\d+)'", svg))) <= 618
+
+    unbroken = "A" * 180
+    lines, _, _ = main.fit_svg_text(unbroken, 436, 92, 24, 0.56)
+    assert "".join(lines) == unbroken
+
+
+def test_existing_legacy_fallback_svg_is_upgraded_without_touching_other_data_images():
+    legacy_svg = (
+        "<svg xmlns='http://www.w3.org/2000/svg' width='1200' height='800' viewBox='0 0 1200 800'>"
+        "<defs><linearGradient id='accent' x1='0' y1='0' x2='1' y2='1'>"
+        "<stop offset='0' stop-color='#d35d89'/><stop offset='1' stop-color='#1d9bf0'/>"
+        "</linearGradient></defs>"
+        "<rect x='138' y='158' width='426' height='300' rx='30'/>"
+        "<text x='626' y='197' font-family='Arial'>Accounting in Durban, South Africa</text>"
+        "<text x='626' y='408' font-family='Arial'>The Founder&#x27;s Architect</text>"
+        "<text x='626' y='472' font-family='Arial'>17 Erskine Terrace, Addington Beach, Durban</text>"
+        "</svg>"
+    )
+    unrelated_svg = "<svg xmlns='http://www.w3.org/2000/svg' width='1200' height='800'><rect/></svg>"
+    legacy_uri = "data:image/svg+xml;base64," + base64.b64encode(legacy_svg.encode()).decode()
+    unrelated_uri = "data:image/svg+xml;base64," + base64.b64encode(unrelated_svg.encode()).decode()
+    existing_html = f"<!doctype html><html><head></head><body><img src='{legacy_uri}'><img src='{unrelated_uri}'></body></html>"
+
+    upgraded = main.ensure_required_site_features(existing_html)
+    payloads = re.findall(r"data:image/svg\+xml;base64,([A-Za-z0-9+/]+={0,2})", upgraded)
+    upgraded_svg = base64.b64decode(payloads[0]).decode()
+
+    assert "ai-site-fallback-image-v2" in upgraded_svg
+    assert "The Founder's Architect" in upgraded_svg
+    assert " ".join(svg_role_lines(upgraded_svg, "detail")) == "17 Erskine Terrace, Addington Beach, Durban"
+    assert base64.b64decode(payloads[1]).decode() == unrelated_svg
+
+    upgraded_again = main.ensure_required_site_features(upgraded)
+    assert upgraded_again == upgraded
+    assert upgraded_again.count(payloads[0]) == 1
 
 
 @pytest.fixture(autouse=True)
