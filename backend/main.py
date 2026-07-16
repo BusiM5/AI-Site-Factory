@@ -1732,6 +1732,13 @@ def restore_pipeline_seed_if_empty() -> Dict[str, Any]:
     return result
 
 
+def bootstrap_pipeline_seed_on_startup() -> Dict[str, Any]:
+    """Restore historical app data at startup only for explicitly opted-in deployments."""
+    if not env_enabled("ENABLE_PIPELINE_SEED_RESTORE"):
+        return {"restored": False, "reason": "pipeline_seed_restore_disabled"}
+    return restore_pipeline_seed_if_empty()
+
+
 def restore_zendesk_config_seed_if_empty() -> Dict[str, Any]:
     """Bootstrap only the managed Zendesk blueprint, never historical app data."""
     seed_path = pipeline_seed_path()
@@ -3513,6 +3520,7 @@ def backfill_legacy_campaign_data() -> Dict[str, int]:
 
 
 init_pipeline_db()
+bootstrap_pipeline_seed_on_startup()
 bootstrap_zendesk_config_on_startup()
 if env_enabled("ENABLE_LEGACY_CAMPAIGN_BACKFILL"):
     backfill_legacy_campaign_data()

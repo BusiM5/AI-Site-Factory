@@ -16,6 +16,8 @@ services:
         value: /var/data/uploads
       - key: ENABLE_ZENDESK_CONFIG_BOOTSTRAP
         value: "true"
+      - key: ENABLE_PIPELINE_SEED_RESTORE
+        value: "true"
       - key: GITHUB_REPO_PRIVATE
         value: "false"
       - key: NETLIFY_DEPLOY_POLL_SECONDS

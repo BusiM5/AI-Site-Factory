@@ -769,7 +769,7 @@ function AppShell() {
     if (!quiet) setRefreshing(true);
     const loadWorkspaceRequests = () => Promise.allSettled([
       axios.get(`${API_BASE}/api/presets`, { timeout: 20000 }),
-      axios.get(`${API_BASE}/api/campaigns?limit=100`, { timeout: 30000 }),
+      axios.get(`${API_BASE}/api/campaigns?limit=100&includeLegacy=true`, { timeout: 30000 }),
       axios.get(`${API_BASE}/api/settings/zendesk-connection`, { timeout: 20000 }),
     ]);
     let requests = await loadWorkspaceRequests();

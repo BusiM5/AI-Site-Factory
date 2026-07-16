@@ -217,20 +217,36 @@ def test_empty_deployment_bootstraps_only_zendesk_config(monkeypatch):
     assert replay["reason"] == "zendesk_config_not_empty"
 
 
-def test_startup_zendesk_bootstrap_defaults_on_without_pipeline_restore(monkeypatch):
+def test_startup_pipeline_seed_restore_is_opt_in(monkeypatch):
+    monkeypatch.delenv("ENABLE_PIPELINE_SEED_RESTORE", raising=False)
+    monkeypatch.setattr(
+        main,
+        "restore_pipeline_seed_if_empty",
+        lambda: (_ for _ in ()).throw(AssertionError("disabled bootstrap must not read the seed")),
+    )
+
+    assert main.bootstrap_pipeline_seed_on_startup() == {
+        "restored": False,
+        "reason": "pipeline_seed_restore_disabled",
+    }
+
+
+def test_startup_pipeline_seed_restore_runs_when_enabled(monkeypatch):
+    expected = {"restored": True, "reason": "seed_restored"}
+    monkeypatch.setenv("ENABLE_PIPELINE_SEED_RESTORE", "true")
+    monkeypatch.setattr(main, "restore_pipeline_seed_if_empty", lambda: expected)
+
+    assert main.bootstrap_pipeline_seed_on_startup() == expected
+
+
+def test_startup_zendesk_bootstrap_defaults_on(monkeypatch):
     calls = []
     expected = {"restored": True, "reason": "zendesk_config_restored"}
     monkeypatch.delenv("ENABLE_ZENDESK_CONFIG_BOOTSTRAP", raising=False)
-    monkeypatch.setenv("ENABLE_PIPELINE_SEED_RESTORE", "true")
     monkeypatch.setattr(
         main,
         "restore_zendesk_config_seed_if_empty",
         lambda: calls.append("zendesk") or expected,
-    )
-    monkeypatch.setattr(
-        main,
-        "restore_pipeline_seed_if_empty",
-        lambda: (_ for _ in ()).throw(AssertionError("startup must not restore historical pipeline data")),
     )
 
     assert main.bootstrap_zendesk_config_on_startup() == expected
