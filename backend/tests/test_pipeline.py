@@ -900,23 +900,131 @@ def test_github_export_creates_unique_repo_and_commits_readme_then_index(monkeyp
     assert len(rows) == 2
 
 
+def test_netlify_github_installation_resolution_is_scoped_and_overridable(monkeypatch):
+    monkeypatch.delenv("NETLIFY_GITHUB_INSTALLATION_ID", raising=False)
+    assert main.resolve_netlify_github_installation("BusiM5/generated-site") == (99999032, "owner_default")
+    assert main.resolve_netlify_github_installation("another-owner/generated-site") == (None, "unmatched_owner")
+
+    monkeypatch.setenv("NETLIFY_GITHUB_INSTALLATION_ID", "123456")
+    assert main.resolve_netlify_github_installation("another-owner/generated-site") == (123456, "environment")
+
+
+@pytest.mark.parametrize("invalid_id", ["0", "-1", "not-a-number"])
+def test_netlify_github_installation_rejects_non_positive_or_invalid_values(monkeypatch, invalid_id):
+    monkeypatch.setenv("NETLIFY_GITHUB_INSTALLATION_ID", invalid_id)
+
+    with pytest.raises(RuntimeError, match="positive numeric"):
+        main.resolve_netlify_github_installation("BusiM5/generated-site")
+
+
+def test_netlify_auto_build_selection_requires_target_sha_and_fresh_build_id():
+    builds = [
+        {"id": "old-target", "sha": "target-sha", "done": True},
+        {"id": "new-wrong", "sha": "different-sha", "done": True},
+    ]
+    assert main.netlify_current_build_from_list(builds, "target-sha", "old-target") is None
+
+    expected = {"id": "new-target", "sha": "target-sha", "done": True}
+    assert main.netlify_current_build_from_list([expected, *builds], "target-sha", "old-target") == expected
+
+
+def test_site_registry_publish_mode_migration_backfills_latest_deployment_mode():
+    timestamp = main.now_iso()
+    with main.get_pipeline_db() as db:
+        db.execute("DROP TABLE site_registry")
+        db.execute(
+            """
+            CREATE TABLE site_registry (
+                canonical_lead_key TEXT PRIMARY KEY,
+                site_id TEXT NOT NULL,
+                site_name TEXT,
+                url TEXT,
+                admin_url TEXT,
+                github_repo_full_name TEXT,
+                github_repo_url TEXT,
+                last_commit_sha TEXT,
+                last_build_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_deploy_id TEXT,
+                last_deploy_state TEXT,
+                deployment_count INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        db.execute(
+            """
+            INSERT INTO site_registry (
+                canonical_lead_key, site_id, created_at, updated_at, last_deploy_state
+            ) VALUES ('legacy-fallback', 'legacy-site', ?, ?, 'ready')
+            """,
+            (timestamp, timestamp),
+        )
+        db.execute(
+            """
+            INSERT INTO deployment_history (
+                id, canonical_lead_key, deployed_at, publish_mode
+            ) VALUES ('legacy-history', 'legacy-fallback', ?, 'direct-netlify-fallback')
+            """,
+            (timestamp,),
+        )
+
+    main.init_pipeline_db()
+
+    with main.get_pipeline_db() as db:
+        columns = {row["name"] for row in db.execute("PRAGMA table_info(site_registry)").fetchall()}
+        registry = db.execute(
+            "SELECT * FROM site_registry WHERE canonical_lead_key = 'legacy-fallback'"
+        ).fetchone()
+    assert "publish_mode" in columns
+    assert registry["publish_mode"] == "direct-netlify-fallback"
+
+
 def test_netlify_git_deploy_uses_build_api_not_zip_upload(monkeypatch):
     monkeypatch.setenv("NETLIFY_AUTH_TOKEN", "netlify-secret")
+    monkeypatch.delenv("NETLIFY_GITHUB_INSTALLATION_ID", raising=False)
     calls = []
     github_export = fake_github_export("canonical-one", "Alpha Plumbing", "<html>one</html>", "pipeline-1", "approval-1")
+    github_export["repository"] = "BusiM5/ai-site-canonical-one"
+    github_export["repoUrl"] = "https://github.com/BusiM5/ai-site-canonical-one"
 
     def fake_post(url, headers=None, json=None, params=None, data=None, timeout=None):
         calls.append(("post", url, json, data))
         assert data is None
         if url.endswith("/api/v1/sites"):
             assert json["repo"]["repo_path"] == github_export["repository"]
-            return FakeResponse(201, {"id": "site-1", "name": "ai-site-alpha", "ssl_url": "https://alpha.netlify.app", "admin_url": "https://app.netlify.com/sites/alpha"})
+            assert json["repo"]["installation_id"] == 99999032
+            assert "repo_url" not in json["repo"]
+            assert "build_settings" not in json
+            return FakeResponse(
+                201,
+                {
+                    "id": "site-1",
+                    "name": "ai-site-alpha",
+                    "ssl_url": "https://alpha.netlify.app",
+                    "admin_url": "https://app.netlify.com/sites/alpha",
+                    "build_settings": json["repo"],
+                },
+            )
         if url.endswith("/builds"):
             return FakeResponse(201, {"id": "build-1", "deploy_id": "deploy-1", "done": True})
         raise AssertionError(url)
 
-    def fake_get(url, headers=None, timeout=None):
+    def fake_get(url, headers=None, params=None, timeout=None):
         calls.append(("get", url, None, None))
+        if url.endswith("/sites/site-1/builds"):
+            assert params == {"per_page": 10}
+            return FakeResponse(
+                200,
+                [
+                    {
+                        "id": "build-1",
+                        "deploy_id": "deploy-1",
+                        "sha": github_export["commitSha"],
+                        "done": True,
+                    }
+                ],
+            )
         if "/deploys/" in url:
             return FakeResponse(200, {"id": "deploy-1", "state": "ready", "ssl_url": "https://alpha.netlify.app"})
         raise AssertionError(url)
@@ -935,10 +1043,199 @@ def test_netlify_git_deploy_uses_build_api_not_zip_upload(monkeypatch):
 
     assert deployment["state"] == "ready"
     assert deployment["buildId"] == "build-1"
+    assert not any(call[1].endswith("/builds") and call[0] == "post" for call in calls)
     assert not any("/deploys" in call[1] and call[0] == "post" for call in calls)
     history = client.get("/api/deployments/history").json()["deployments"]
     assert history[0]["github_repo_url"] == github_export["repoUrl"]
     assert history[0]["build_id"] == "build-1"
+    installation_log = next(
+        entry for entry in main.LOG_BUFFER if entry["event"] == "provider.netlify.github_installation_selected"
+    )
+    assert installation_log["details"]["source"] == "owner_default"
+
+
+def test_netlify_git_deploy_reads_back_linkage_and_posts_build_only_when_auto_build_missing(monkeypatch):
+    monkeypatch.setenv("NETLIFY_AUTH_TOKEN", "netlify-secret")
+    monkeypatch.setenv("NETLIFY_GITHUB_INSTALLATION_ID", "123456")
+    monkeypatch.setenv("NETLIFY_AUTOBUILD_WAIT_SECONDS", "0")
+    github_export = fake_github_export("canonical-manual", "Manual Build", "<html>manual</html>")
+    posts = []
+    expected_site_name = "ai-site-manual-build-canonica"
+    expected_repo = {
+        "provider": "github",
+        "repo_path": github_export["repository"],
+        "repo_branch": "main",
+        "dir": "",
+        "cmd": "",
+        "public_repo": True,
+        "installation_id": 123456,
+    }
+
+    def fake_post(url, headers=None, json=None, params=None, data=None, timeout=None):
+        posts.append(url)
+        if url.endswith("/api/v1/sites"):
+            assert json == {
+                "name": expected_site_name,
+                "processing_settings": {"html": {"pretty_urls": True}},
+                "repo": expected_repo,
+            }
+            return FakeResponse(201, {"id": "site-manual", "name": json["name"]})
+        if url.endswith("/sites/site-manual/builds"):
+            return FakeResponse(
+                201,
+                {"id": "build-manual", "deploy_id": "deploy-manual", "sha": github_export["commitSha"], "done": True},
+            )
+        raise AssertionError(url)
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        if url.endswith("/sites/site-manual"):
+            return FakeResponse(
+                200,
+                {
+                    "id": "site-manual",
+                    "name": expected_site_name,
+                    "ssl_url": "https://manual.netlify.app",
+                    "build_settings": expected_repo,
+                },
+            )
+        if url.endswith("/sites/site-manual/builds"):
+            assert params == {"per_page": 10}
+            return FakeResponse(200, [])
+        if url.endswith("/deploys/deploy-manual"):
+            return FakeResponse(200, {"id": "deploy-manual", "state": "ready", "ssl_url": "https://manual.netlify.app"})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    monkeypatch.setattr(main.requests, "get", fake_get)
+
+    deployment = main.deploy_github_repo_to_netlify_for_lead(
+        "canonical-manual",
+        "Manual Build",
+        "pipeline-manual",
+        "approval-manual",
+        "Ops",
+        github_export,
+    )
+
+    assert deployment["state"] == "ready"
+    assert deployment["buildId"] == "build-manual"
+    assert sum(url.endswith("/builds") for url in posts) == 1
+
+
+def test_netlify_git_deploy_rejects_unverified_repository_linkage(monkeypatch):
+    monkeypatch.setenv("NETLIFY_AUTH_TOKEN", "netlify-secret")
+    monkeypatch.setenv("NETLIFY_GITHUB_INSTALLATION_ID", "123456")
+    github_export = fake_github_export("canonical-unlinked", "Unlinked", "<html>unlinked</html>")
+    wrong_link = {
+        "provider": "github",
+        "repo_path": "another-owner/wrong-repo",
+        "repo_branch": "main",
+        "installation_id": 999,
+    }
+    build_posts = []
+
+    def fake_post(url, headers=None, json=None, params=None, data=None, timeout=None):
+        if url.endswith("/api/v1/sites"):
+            return FakeResponse(201, {"id": "site-unlinked", "name": json["name"], "build_settings": wrong_link})
+        build_posts.append(url)
+        raise AssertionError(url)
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    monkeypatch.setattr(
+        main.requests,
+        "get",
+        lambda url, **kwargs: FakeResponse(200, {"id": "site-unlinked", "build_settings": wrong_link}),
+    )
+
+    with pytest.raises(RuntimeError, match="did not confirm"):
+        main.deploy_github_repo_to_netlify_for_lead(
+            "canonical-unlinked",
+            "Unlinked",
+            "pipeline-unlinked",
+            "approval-unlinked",
+            "Ops",
+            github_export,
+        )
+
+    assert build_posts == []
+    with main.get_pipeline_db() as db:
+        assert db.execute("SELECT COUNT(*) AS count FROM site_registry").fetchone()["count"] == 0
+
+
+def test_netlify_git_deploy_relinks_fallback_registry_instead_of_reusing_it(monkeypatch):
+    monkeypatch.setenv("NETLIFY_AUTH_TOKEN", "netlify-secret")
+    monkeypatch.setenv("NETLIFY_GITHUB_INSTALLATION_ID", "123456")
+    github_export = fake_github_export("canonical-fallback", "Fallback Site", "<html>fallback</html>")
+    timestamp = main.now_iso()
+    with main.get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT INTO site_registry (
+                canonical_lead_key, site_id, site_name, url, admin_url,
+                github_repo_full_name, github_repo_url, last_commit_sha, last_build_id,
+                created_at, updated_at, last_deploy_id, last_deploy_state,
+                deployment_count, publish_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "canonical-fallback", "site-fallback", "fallback-site",
+                "https://fallback.netlify.app", "https://app.netlify.com/sites/fallback-site",
+                github_export["repository"], github_export["repoUrl"], github_export["commitSha"],
+                "old-build", timestamp, timestamp, "old-deploy", "ready", 1,
+                "direct-netlify-fallback",
+            ),
+        )
+    patches = []
+
+    def fake_patch(url, headers=None, json=None, timeout=None):
+        patches.append(json)
+        assert "build_settings" not in json
+        return FakeResponse(
+            200,
+            {
+                "id": "site-fallback",
+                "name": "fallback-site",
+                "ssl_url": "https://fallback.netlify.app",
+                "admin_url": "https://app.netlify.com/sites/fallback-site",
+                "build_settings": json["repo"],
+            },
+        )
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        if url.endswith("/sites/site-fallback/builds"):
+            return FakeResponse(
+                200,
+                [{"id": "new-build", "deploy_id": "new-deploy", "sha": github_export["commitSha"], "done": True}],
+            )
+        if url.endswith("/deploys/new-deploy"):
+            return FakeResponse(200, {"id": "new-deploy", "state": "ready", "ssl_url": "https://fallback.netlify.app"})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(main.requests, "patch", fake_patch)
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    monkeypatch.setattr(
+        main.requests,
+        "post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("automatic linked build must be reused")),
+    )
+
+    deployment = main.deploy_github_repo_to_netlify_for_lead(
+        "canonical-fallback",
+        "Fallback Site",
+        "pipeline-fallback",
+        "approval-fallback",
+        "Ops",
+        github_export,
+    )
+
+    assert deployment["deployAction"] == "REDEPLOYED"
+    assert len(patches) == 1
+    with main.get_pipeline_db() as db:
+        registry = db.execute(
+            "SELECT * FROM site_registry WHERE canonical_lead_key = 'canonical-fallback'"
+        ).fetchone()
+        assert registry["publish_mode"] == "github-netlify"
+        assert registry["last_build_id"] == "new-build"
 
 
 def test_direct_netlify_deploy_migrates_stale_site_to_current_account(monkeypatch):
@@ -1025,11 +1322,12 @@ def test_direct_netlify_deploy_migrates_stale_site_to_current_account(monkeypatc
     assert create_names[1] != create_names[0]
     with main.get_pipeline_db() as db:
         registry = db.execute(
-            "SELECT site_id, url FROM site_registry WHERE canonical_lead_key = ?",
+            "SELECT site_id, url, publish_mode FROM site_registry WHERE canonical_lead_key = ?",
             ("canonical-one",),
         ).fetchone()
     assert registry["site_id"] == "new-account-site"
     assert registry["url"] == "https://new-account.netlify.app"
+    assert registry["publish_mode"] == "direct-netlify"
 
 
 def test_no_owner_fields_in_responses(monkeypatch):

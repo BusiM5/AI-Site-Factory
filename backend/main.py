@@ -97,6 +97,7 @@ REQUIRED_PROVIDER_ENV = {
 
 VALID_PUBLISH_MODES = {"github-netlify", "direct-netlify", "direct-netlify-fallback"}
 FREEFORM_TEMPLATE_ID = "gemini-freeform"
+NETLIFY_GITHUB_INSTALLATION_DEFAULTS = {"busim5": 99999032}
 
 FREEFORM_SITE_SPEC = {
     "id": FREEFORM_TEMPLATE_ID,
@@ -1457,7 +1458,8 @@ def init_pipeline_db() -> None:
                 updated_at TEXT NOT NULL,
                 last_deploy_id TEXT,
                 last_deploy_state TEXT,
-                deployment_count INTEGER NOT NULL DEFAULT 0
+                deployment_count INTEGER NOT NULL DEFAULT 0,
+                publish_mode TEXT NOT NULL DEFAULT 'github-netlify'
             );
 
             CREATE TABLE IF NOT EXISTS github_site_repos (
@@ -1609,6 +1611,29 @@ def init_pipeline_db() -> None:
         ensure_db_column(db, "site_registry", "github_repo_url", "github_repo_url TEXT")
         ensure_db_column(db, "site_registry", "last_commit_sha", "last_commit_sha TEXT")
         ensure_db_column(db, "site_registry", "last_build_id", "last_build_id TEXT")
+        ensure_db_column(db, "site_registry", "publish_mode", "publish_mode TEXT NOT NULL DEFAULT 'github-netlify'")
+        db.execute(
+            """
+            UPDATE site_registry
+            SET publish_mode = COALESCE(
+                (
+                    SELECT deployment_history.publish_mode
+                    FROM deployment_history
+                    WHERE deployment_history.canonical_lead_key = site_registry.canonical_lead_key
+                      AND deployment_history.publish_mode IS NOT NULL
+                    ORDER BY deployment_history.deployed_at DESC
+                    LIMIT 1
+                ),
+                publish_mode,
+                'github-netlify'
+            )
+            WHERE EXISTS (
+                SELECT 1 FROM deployment_history
+                WHERE deployment_history.canonical_lead_key = site_registry.canonical_lead_key
+                  AND deployment_history.publish_mode IS NOT NULL
+            )
+            """
+        )
         ensure_db_column(db, "campaigns", "idempotency_key", "idempotency_key TEXT")
         ensure_db_column(db, "zendesk_ticket_links", "external_id", "external_id TEXT")
         db.execute(
@@ -5977,6 +6002,78 @@ def zip_site_html(site_html: str) -> bytes:
     return buffer.getvalue()
 
 
+def resolve_netlify_github_installation(repo_full_name: str) -> Tuple[Optional[int], str]:
+    repo_owner = compact_text(repo_full_name.split("/", 1)[0]).lower()
+    configured = compact_text(os.getenv("NETLIFY_GITHUB_INSTALLATION_ID"))
+    if configured:
+        try:
+            installation_id = int(configured)
+        except ValueError as error:
+            raise RuntimeError(
+                "NETLIFY_GITHUB_INSTALLATION_ID must be a positive numeric GitHub App installation id."
+            ) from error
+        if installation_id <= 0:
+            raise RuntimeError(
+                "NETLIFY_GITHUB_INSTALLATION_ID must be a positive numeric GitHub App installation id."
+            )
+        return installation_id, "environment"
+
+    installation_id = NETLIFY_GITHUB_INSTALLATION_DEFAULTS.get(repo_owner)
+    if installation_id is not None:
+        return installation_id, "owner_default"
+    return None, "unmatched_owner"
+
+
+def netlify_site_repo_link_matches(
+    site: Dict[str, Any],
+    repo_full_name: str,
+    branch: str,
+    installation_id: Optional[int],
+) -> bool:
+    candidates = [site.get("repo"), site.get("build_settings")]
+    if site.get("provider") or site.get("repo_path"):
+        candidates.append(site)
+    expected_repo = compact_text(repo_full_name).lower()
+    expected_branch = compact_text(branch).lower()
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            continue
+        provider = compact_text(candidate.get("provider")).lower()
+        repo_path = compact_text(candidate.get("repo_path") or candidate.get("repo")).lower()
+        repo_branch = compact_text(candidate.get("repo_branch") or candidate.get("branch")).lower()
+        linked_installation = compact_text(candidate.get("installation_id"))
+        if provider != "github" or repo_path != expected_repo:
+            continue
+        if repo_branch and repo_branch != expected_branch:
+            continue
+        if installation_id is not None and linked_installation != str(installation_id):
+            continue
+        return True
+    return False
+
+
+def netlify_current_build_from_list(
+    builds: Any,
+    commit_sha: str,
+    previous_build_id: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(builds, list):
+        return None
+    expected_sha = compact_text(commit_sha).lower()
+    exact = next(
+        (
+            build
+            for build in builds
+            if isinstance(build, dict)
+            and compact_text(build.get("id"))
+            and compact_text(build.get("id")) != compact_text(previous_build_id)
+            and compact_text(build.get("sha")).lower() == expected_sha
+        ),
+        None,
+    )
+    return exact
+
+
 def deploy_github_repo_to_netlify_for_lead(
     canonical_key: str,
     business_name: str,
@@ -6008,6 +6105,8 @@ def deploy_github_repo_to_netlify_for_lead(
     if (
         existing_site
         and not regenerate_existing_site
+        and compact_text(existing_site["publish_mode"]) == "github-netlify"
+        and compact_text(existing_site["github_repo_full_name"]).lower() == repo_full_name.lower()
         and existing_site["last_commit_sha"] == commit_sha
         and existing_site["last_deploy_state"] in {"ready", "building", "enqueued"}
     ):
@@ -6033,21 +6132,20 @@ def deploy_github_repo_to_netlify_for_lead(
             "commitSha": commit_sha,
         }
 
-    netlify_installation_id_raw = compact_text(os.getenv("NETLIFY_GITHUB_INSTALLATION_ID"))
-    netlify_installation_id: Optional[int] = None
-    if netlify_installation_id_raw:
-        try:
-            netlify_installation_id = int(netlify_installation_id_raw)
-        except ValueError as error:
-            raise RuntimeError(
-                "NETLIFY_GITHUB_INSTALLATION_ID must be a numeric Netlify GitHub installation id."
-            ) from error
+    netlify_installation_id, installation_source = resolve_netlify_github_installation(repo_full_name)
+    log_event(
+        "info",
+        "provider.netlify.github_installation_selected",
+        "Selected GitHub App installation for Netlify repository linkage.",
+        repository=repo_full_name,
+        installationId=netlify_installation_id,
+        source=installation_source,
+    )
 
     repo_settings = {
         "provider": "github",
         "repo_path": repo_full_name,
         "repo_branch": branch,
-        "repo_url": f"https://github.com/{repo_full_name}.git",
         "dir": "",
         "cmd": "",
         "public_repo": not bool(github_export.get("private")),
@@ -6064,7 +6162,7 @@ def deploy_github_repo_to_netlify_for_lead(
         site_response = requests.patch(
             f"https://api.netlify.com/api/v1/sites/{site_id}",
             headers={**headers, "Content-Type": "application/json"},
-            json={"repo": repo_settings, "build_settings": repo_settings},
+            json={"repo": repo_settings},
             timeout=45,
         )
         try:
@@ -6085,7 +6183,6 @@ def deploy_github_repo_to_netlify_for_lead(
                 "name": site_name,
                 "processing_settings": {"html": {"pretty_urls": True}},
                 "repo": repo_settings,
-                "build_settings": repo_settings,
             },
             timeout=45,
         )
@@ -6103,16 +6200,79 @@ def deploy_github_repo_to_netlify_for_lead(
         if not site_id:
             raise RuntimeError("Netlify did not return a site id.")
 
-    log_event("info", "provider.netlify.git_build_start", "Triggering Netlify build from GitHub repository.", siteName=site_name, repository=repo_full_name, branch=branch)
-    build_response = requests.post(
-        f"https://api.netlify.com/api/v1/sites/{site_id}/builds",
-        headers={**headers, "Content-Type": "application/json"},
-        params={"branch": branch},
-        json={},
-        timeout=45,
+    site_readback: Optional[Dict[str, Any]] = None
+
+    def read_site() -> Dict[str, Any]:
+        response = requests.get(
+            f"https://api.netlify.com/api/v1/sites/{site_id}",
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    if not netlify_site_repo_link_matches(site, repo_full_name, branch, netlify_installation_id):
+        site_readback = read_site()
+        if not netlify_site_repo_link_matches(
+            site_readback, repo_full_name, branch, netlify_installation_id
+        ):
+            raise RuntimeError(
+                "Netlify did not confirm the requested GitHub repository and App installation linkage."
+            )
+
+    previous_build_id = existing_site["last_build_id"] if existing_site else None
+
+    def list_site_builds() -> List[Dict[str, Any]]:
+        response = requests.get(
+            f"https://api.netlify.com/api/v1/sites/{site_id}/builds",
+            headers=headers,
+            params={"per_page": 10},
+            timeout=30,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return payload if isinstance(payload, list) else []
+
+    build = netlify_current_build_from_list(
+        list_site_builds(), commit_sha, previous_build_id
     )
-    build_response.raise_for_status()
-    build = build_response.json()
+
+    try:
+        auto_build_wait = max(
+            0.0,
+            min(float(os.getenv("NETLIFY_AUTOBUILD_WAIT_SECONDS", "5")), 10.0),
+        )
+    except ValueError:
+        auto_build_wait = 5.0
+    auto_build_deadline = time.time() + auto_build_wait
+    while build is None and time.time() < auto_build_deadline:
+        time.sleep(min(0.5, max(0.0, auto_build_deadline - time.time())))
+        build = netlify_current_build_from_list(
+            list_site_builds(), commit_sha, previous_build_id
+        )
+
+    if build is None:
+        log_event("info", "provider.netlify.git_build_start", "Triggering Netlify build from GitHub repository.", siteName=site_name, repository=repo_full_name, branch=branch)
+        build_response = requests.post(
+            f"https://api.netlify.com/api/v1/sites/{site_id}/builds",
+            headers={**headers, "Content-Type": "application/json"},
+            params={"branch": branch},
+            json={},
+            timeout=45,
+        )
+        build_response.raise_for_status()
+        build = build_response.json()
+    else:
+        log_event(
+            "info",
+            "provider.netlify.git_auto_build_reused",
+            "Reusing the build Netlify created while linking the GitHub repository.",
+            siteName=site_name,
+            repository=repo_full_name,
+            buildId=build.get("id"),
+        )
+
+    site_details = {**site, **(site_readback or {})}
     build_id = build.get("id")
     deploy_id = build.get("deploy_id")
     build_error = build.get("error")
@@ -6120,7 +6280,6 @@ def deploy_github_repo_to_netlify_for_lead(
 
     poll_until = time.time() + int(os.getenv("NETLIFY_DEPLOY_POLL_SECONDS", "45"))
     while build_id and not build.get("done") and time.time() < poll_until:
-        time.sleep(2)
         build_poll = requests.get(
             f"https://api.netlify.com/api/v1/builds/{build_id}",
             headers=headers,
@@ -6130,6 +6289,8 @@ def deploy_github_repo_to_netlify_for_lead(
         build = build_poll.json()
         deploy_id = build.get("deploy_id") or deploy_id
         build_error = build.get("error") or build_error
+        if not build.get("done") and time.time() < poll_until:
+            time.sleep(2)
 
     if build_error:
         raise RuntimeError(f"Netlify build failed: {build_error}")
@@ -6138,7 +6299,6 @@ def deploy_github_repo_to_netlify_for_lead(
     if deploy_id:
         state = "enqueued"
         while state not in {"ready", "error"} and time.time() < poll_until:
-            time.sleep(2)
             deploy_poll = requests.get(
                 f"https://api.netlify.com/api/v1/deploys/{deploy_id}",
                 headers=headers,
@@ -6147,17 +6307,19 @@ def deploy_github_repo_to_netlify_for_lead(
             deploy_poll.raise_for_status()
             deploy = deploy_poll.json()
             state = deploy.get("state") or state
+            if state not in {"ready", "error"} and time.time() < poll_until:
+                time.sleep(2)
         if state == "error":
             raise RuntimeError(deploy.get("error_message") or "Netlify deploy failed.")
 
     site_url = (
         deploy.get("ssl_url")
-        or site.get("ssl_url")
-        or site.get("url")
+        or site_details.get("ssl_url")
+        or site_details.get("url")
         or (existing_site["url"] if existing_site else None)
         or f"https://{site_name}.netlify.app"
     )
-    admin_url = site.get("admin_url") or (existing_site["admin_url"] if existing_site else None)
+    admin_url = site_details.get("admin_url") or (existing_site["admin_url"] if existing_site else None)
     deployed_at = now_iso()
     deployment_history_id = str(uuid4())
 
@@ -6190,9 +6352,9 @@ def deploy_github_repo_to_netlify_for_lead(
             INSERT INTO site_registry (
                 canonical_lead_key, site_id, site_name, url, admin_url,
                 github_repo_full_name, github_repo_url, last_commit_sha, last_build_id,
-                created_at, updated_at, last_deploy_id, last_deploy_state, deployment_count
+                created_at, updated_at, last_deploy_id, last_deploy_state, deployment_count, publish_mode
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'github-netlify')
             ON CONFLICT(canonical_lead_key) DO UPDATE SET
                 site_id = excluded.site_id,
                 site_name = excluded.site_name,
@@ -6205,6 +6367,7 @@ def deploy_github_repo_to_netlify_for_lead(
                 updated_at = excluded.updated_at,
                 last_deploy_id = excluded.last_deploy_id,
                 last_deploy_state = excluded.last_deploy_state,
+                publish_mode = excluded.publish_mode,
                 deployment_count = site_registry.deployment_count + 1
             """,
             (
@@ -6293,6 +6456,10 @@ def deploy_direct_netlify_for_lead(
             db.execute(
                 "UPDATE deployment_history SET publish_mode = ?, raw_json = ? WHERE id = ?",
                 ("direct-netlify", json.dumps(result, default=str), deployment_history_id),
+            )
+            db.execute(
+                "UPDATE site_registry SET publish_mode = ?, updated_at = ? WHERE canonical_lead_key = ?",
+                ("direct-netlify", now_iso(), canonical_key),
             )
 
     log_event(
@@ -6517,9 +6684,9 @@ def deploy_direct_netlify_fallback_for_lead(
             INSERT INTO site_registry (
                 canonical_lead_key, site_id, site_name, url, admin_url,
                 github_repo_full_name, github_repo_url, last_commit_sha, last_build_id,
-                created_at, updated_at, last_deploy_id, last_deploy_state, deployment_count
+                created_at, updated_at, last_deploy_id, last_deploy_state, deployment_count, publish_mode
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'direct-netlify-fallback')
             ON CONFLICT(canonical_lead_key) DO UPDATE SET
                 site_id = excluded.site_id,
                 site_name = excluded.site_name,
@@ -6532,6 +6699,7 @@ def deploy_direct_netlify_fallback_for_lead(
                 updated_at = excluded.updated_at,
                 last_deploy_id = excluded.last_deploy_id,
                 last_deploy_state = excluded.last_deploy_state,
+                publish_mode = excluded.publish_mode,
                 deployment_count = site_registry.deployment_count + 1
             """,
             (
