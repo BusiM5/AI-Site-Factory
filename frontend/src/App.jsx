@@ -37,6 +37,11 @@ const DEFAULT_API_BASE = import.meta.env.PROD
   ? "https://ai-site-factory-backend-c4w6.onrender.com"
   : "http://127.0.0.1:8000";
 const API_BASE = (import.meta.env.VITE_API_BASE || DEFAULT_API_BASE).replace(/\/$/, "");
+const BACKEND_UNREACHABLE_NOTICE = {
+  code: "BACKEND_UNREACHABLE",
+  tone: "danger",
+  text: "The backend is temporarily unavailable. Retrying automatically.",
+};
 
 const FALLBACK_PRESETS = [
   { id: "restaurants", label: "Restaurants", industry: "Restaurant", description: "Restaurants, cafes, and takeaways." },
@@ -762,11 +767,20 @@ function AppShell() {
 
   const refresh = useCallback(async (quiet = false) => {
     if (!quiet) setRefreshing(true);
-    const requests = await Promise.allSettled([
+    const loadWorkspaceRequests = () => Promise.allSettled([
       axios.get(`${API_BASE}/api/presets`, { timeout: 20000 }),
       axios.get(`${API_BASE}/api/campaigns?limit=100`, { timeout: 30000 }),
       axios.get(`${API_BASE}/api/settings/zendesk-connection`, { timeout: 20000 }),
     ]);
+    let requests = await loadWorkspaceRequests();
+    if (requests.every((item) => item.status === "rejected")) {
+      try {
+        await axios.get(`${API_BASE}/`, { timeout: 45000 });
+        requests = await loadWorkspaceRequests();
+      } catch {
+        // The regular 20-second refresh loop will continue retrying automatically.
+      }
+    }
     if (requests[0].status === "fulfilled") setPresets(requests[0].value.data.presets || FALLBACK_PRESETS);
     if (requests[1].status === "fulfilled") {
       const data = requests[1].value.data; setCampaigns(data.campaigns || []); setTotals(data.totals || {});
@@ -793,7 +807,11 @@ function AppShell() {
         setHistory([]); setDetail(null);
       }
     }
-    if (requests.every((item) => item.status === "rejected")) setNotice({ tone: "danger", text: "The backend could not be reached. Check that the API is running." });
+    if (requests.every((item) => item.status === "rejected")) {
+      setNotice(BACKEND_UNREACHABLE_NOTICE);
+    } else {
+      setNotice((current) => current?.code === BACKEND_UNREACHABLE_NOTICE.code ? null : current);
+    }
     setLoading(false); setRefreshing(false);
   }, [selectedCampaignId, setSelectedCampaignId]);
 
