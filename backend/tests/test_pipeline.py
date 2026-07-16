@@ -1,4 +1,6 @@
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
@@ -92,6 +94,7 @@ def test_existing_theme_widget_is_upgraded_to_control_site_variables():
 @pytest.fixture(autouse=True)
 def isolated_pipeline_db(tmp_path, monkeypatch):
     monkeypatch.setenv("PIPELINE_DB_PATH", str(tmp_path / "pipeline.db"))
+    monkeypatch.setenv("ENABLE_LEGACY_PIPELINE_RUN", "true")
     main.init_pipeline_db()
     main.LEADS_DB.clear()
     main.CONTENT_DB.clear()
@@ -112,7 +115,7 @@ def test_empty_deployment_restores_previous_application_data():
     assert first_restore["restoredCounts"]["campaign_call_leads"] == 17
     assert first_restore["restoredCounts"]["campaign_deployments"] == 17
 
-    response = client.get("/api/campaigns?limit=200")
+    response = client.get("/api/campaigns?limit=200&includeLegacy=true")
     assert response.status_code == 200
     payload = response.json()
     assert payload["totals"]["campaigns"] == 37
@@ -121,6 +124,25 @@ def test_empty_deployment_restores_previous_application_data():
     second_restore = main.restore_pipeline_seed_if_empty()
     assert second_restore["restored"] is False
     assert second_restore["reason"] == "database_not_empty"
+
+
+def test_empty_deployment_bootstraps_only_zendesk_config(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "cxsupporthub")
+
+    restored = main.restore_zendesk_config_seed_if_empty()
+
+    assert restored["restored"] is True
+    assert restored["restoredCounts"]["zendesk_field_settings"] == 20
+    assert restored["restoredCounts"]["zendesk_provisioned_resources"] == 23
+    with main.get_pipeline_db() as db:
+        assert db.execute("SELECT COUNT(*) FROM campaigns").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM approval_records").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM zendesk_ticket_links").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM zendesk_provisioned_resources WHERE resource_key LIKE 'trigger:%'").fetchone()[0] == 0
+
+    replay = main.restore_zendesk_config_seed_if_empty()
+    assert replay["restored"] is False
+    assert replay["reason"] == "zendesk_config_not_empty"
 
 
 class FakeResponse:
@@ -162,6 +184,15 @@ def lead_payload():
         category="Plumbing",
         location="Durban",
     ).model_dump()
+
+
+def test_legacy_pipeline_is_disabled_without_explicit_opt_in(monkeypatch):
+    monkeypatch.delenv("ENABLE_LEGACY_PIPELINE_RUN", raising=False)
+
+    response = client.post("/api/pipeline/run", json={"leads": [lead_payload()]})
+
+    assert response.status_code == 410
+    assert response.json()["detail"]["code"] == "LEGACY_PIPELINE_DISABLED"
 
 
 def fake_github_export(canonical_key, business_name, site_html, pipeline_id=None, approval_id=None):
@@ -1030,6 +1061,12 @@ def test_zendesk_field_settings_roundtrip():
     assert payload["fields"]["pipelineId"] == "1002"
     assert "unknown" not in payload["fields"]
 
+    client.put("/api/settings/zendesk-fields", json={"fields": {"approvalId": "1003"}})
+    merged = client.get("/api/settings/zendesk-fields").json()["fields"]
+    assert merged["canonicalLeadKey"] == "1001"
+    assert merged["pipelineId"] == "1002"
+    assert merged["approvalId"] == "1003"
+
 
 def zendesk_setup_fake(monkeypatch):
     state = {
@@ -1119,6 +1156,25 @@ def test_zendesk_setup_inspection_reports_matches_missing_resources_and_brands(m
     assert payload["brands"] == [{"id": "88", "name": "Default brand", "subdomain": "supporthub", "default": True}]
 
 
+def test_zendesk_setup_page_loads_existing_brands_without_manual_inspection(monkeypatch):
+    zendesk_setup_fake(monkeypatch)
+
+    response = client.get("/api/settings/zendesk-setup")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["brandsLoaded"] is True
+    assert payload["brands"] == [
+        {
+            "id": "88",
+            "name": "Default brand",
+            "subdomain": "supporthub",
+            "default": True,
+            "active": True,
+        }
+    ]
+
+
 def test_zendesk_setup_adopts_compatible_string_fields_but_rejects_unsafe_types(monkeypatch):
     state, _ = zendesk_setup_fake(monkeypatch)
     status_definition = next(item for item in main.ZENDESK_FIELD_BLUEPRINT if item["key"] == "leadStatus")
@@ -1188,13 +1244,39 @@ def test_managed_zendesk_fields_encode_dropdown_values_and_route_channel_forms()
     assert main.zendesk_ticket_routing_fields("phone") == {"ticket_form_id": 2002, "brand_id": 88}
 
 
+def configure_managed_zendesk_contract():
+    field_ids = {}
+    for index, definition in enumerate(main.ZENDESK_FIELD_BLUEPRINT, start=1):
+        field_id = str(3000 + index)
+        field_ids[definition["key"]] = field_id
+        main.save_zendesk_provisioned_resource(
+            f"field:{definition['key']}",
+            "ticket_field",
+            field_id,
+            definition["title"],
+            {"type": definition["type"], "forms": definition["forms"]},
+        )
+    main.save_zendesk_field_settings(field_ids)
+    main.save_zendesk_provisioned_resource(
+        "form:email", "ticket_form", "5001", "Email", {"channel": "email", "brandId": "88"}
+    )
+    main.save_zendesk_provisioned_resource(
+        "form:phone", "ticket_form", "5002", "Phone", {"channel": "phone", "brandId": "88"}
+    )
+    main.save_zendesk_provisioned_resource(
+        "configuration", "configuration", "supporthub", "Setup", {"brandId": "88"}
+    )
+    return field_ids
+
+
 def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
     monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
     monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
     monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
-    main.save_zendesk_field_settings({"approvalId": "2001", "contactChannel": "2002"})
+    field_ids = configure_managed_zendesk_contract()
     ticket_posts = []
     ticket_headers = []
+    remote_tickets = {}
 
     def fake_post(url, json=None, auth=None, headers=None, timeout=None):
         if url.endswith("/organizations.json"):
@@ -1204,10 +1286,20 @@ def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
         if url.endswith("/tickets.json"):
             ticket_posts.append(json["ticket"])
             ticket_headers.append(headers)
-            return FakeResponse(201, {"ticket": {"id": 900 + len(ticket_posts), "status": "new"}})
+            ticket = {**json["ticket"], "id": 900 + len(ticket_posts), "status": "new"}
+            remote_tickets[ticket["id"]] = ticket
+            return FakeResponse(
+                201,
+                {"ticket": ticket},
+            )
         raise AssertionError(url)
 
     def fake_get(url, params=None, auth=None, headers=None, timeout=None):
+        if url.endswith("/tickets.json"):
+            return FakeResponse(200, {"tickets": []})
+        if "/tickets/" in url:
+            ticket_id = int(url.rsplit("/", 1)[-1].removesuffix(".json"))
+            return FakeResponse(200, {"ticket": remote_tickets[ticket_id]})
         if url.endswith("/users/search.json"):
             return FakeResponse(200, {"users": []})
         raise AssertionError(url)
@@ -1215,6 +1307,8 @@ def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
     monkeypatch.setattr(main.requests, "post", fake_post)
     monkeypatch.setattr(main.requests, "get", fake_get)
     context = {
+        "campaignId": "campaign-intake",
+        "campaignName": "Durban Plumbers - July",
         "canonicalLeadKey": "canonical-intake",
         "businessName": "Alpha Plumbing",
         "industry": "Plumbing",
@@ -1230,13 +1324,161 @@ def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
     assert len(first) == 2
     assert len(second) == 2
     assert len(ticket_posts) == 2
+    assert {(ticket["brand_id"], ticket["ticket_form_id"]) for ticket in ticket_posts} == {(88, 5001), (88, 5002)}
+    assert {ticket["external_id"] for ticket in ticket_posts} == {
+        "asf:campaign-intake:canonical-intake:email:intake",
+        "asf:campaign-intake:canonical-intake:phone:intake",
+    }
     assert {next(tag for tag in ticket["tags"] if tag in {"ai_site_email_lead", "ai_site_phone_lead"}) for ticket in ticket_posts} == {"ai_site_email_lead", "ai_site_phone_lead"}
     assert all("asf_managed" in ticket["tags"] for ticket in ticket_posts)
-    assert {headers["Idempotency-Key"] for headers in ticket_headers} == {
-        "asf-approval-intake-email",
-        "asf-approval-intake-phone",
-    }
-    assert ticket_posts[0]["custom_fields"]
+    assert len({headers["Idempotency-Key"] for headers in ticket_headers}) == 2
+    assert all(headers["Idempotency-Key"].startswith("asf-") for headers in ticket_headers)
+    for ticket in ticket_posts:
+        values = {str(item["id"]): item["value"] for item in ticket["custom_fields"]}
+        assert values[field_ids["campaignId"]] == "campaign-intake"
+        assert values[field_ids["campaignName"]] == "Durban Plumbers - July"
+        assert values[field_ids["approvalId"]] == "approval-intake"
+        assert values[field_ids["businessName"]] == "Alpha Plumbing"
+        assert values[field_ids["industry"]] == "Plumbing"
+        assert values[field_ids["location"]] == "Durban"
+
+
+def test_zendesk_intake_rejects_missing_contract_before_http(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    monkeypatch.setattr(
+        main.requests,
+        "get",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("HTTP must not run")),
+    )
+    monkeypatch.setattr(
+        main.requests,
+        "post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("HTTP must not run")),
+    )
+
+    with pytest.raises(main.HTTPException) as error:
+        main.create_zendesk_intake_tickets(
+            "approval-intake",
+            {
+                "campaignId": "campaign-intake",
+                "campaignName": "Durban Plumbers - July",
+                "canonicalLeadKey": "canonical-intake",
+                "businessName": "Alpha Plumbing",
+                "email": "alpha@example.com",
+            },
+            "pipeline-intake",
+            requested_channels=["email"],
+        )
+
+    assert error.value.status_code == 409
+    assert error.value.detail["code"] == "ZENDESK_TICKET_CONTRACT_INVALID"
+
+
+def test_zendesk_intake_adopts_and_repairs_ticket_by_external_id_without_posting(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    field_ids = configure_managed_zendesk_contract()
+    external_id = "asf:campaign-intake:canonical-intake:email:intake"
+    repairs = []
+
+    def fake_get(url, params=None, **kwargs):
+        assert url.endswith("/tickets.json")
+        assert params["external_id"] == external_id
+        return FakeResponse(
+            200,
+            {
+                "tickets": [
+                        {
+                            "id": 8123,
+                            "external_id": external_id,
+                            "brand_id": 999,
+                            "ticket_form_id": 9999,
+                            "status": "new",
+                            "tags": [],
+                            "custom_fields": [],
+                        }
+                ]
+            },
+        )
+
+    def fake_put(url, json=None, **kwargs):
+        assert url.endswith("/tickets/8123.json")
+        repairs.append(json["ticket"])
+        return FakeResponse(200, {"ticket": {**json["ticket"], "id": 8123, "status": "new"}})
+
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    monkeypatch.setattr(main.requests, "put", fake_put)
+    monkeypatch.setattr(
+        main.requests,
+        "post",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("ticket must be adopted")),
+    )
+
+    result = main.create_zendesk_intake_tickets(
+        "approval-intake",
+        {
+            "campaignId": "campaign-intake",
+            "campaignName": "Durban Plumbers - July",
+            "canonicalLeadKey": "canonical-intake",
+            "businessName": "Alpha Plumbing",
+            "industry": "Plumbing",
+            "location": "Durban",
+            "email": "alpha@example.com",
+        },
+        "pipeline-intake",
+        requested_channels=["email"],
+    )
+
+    assert result[0]["ticketId"] == 8123
+    assert result[0]["externalId"] == external_id
+    assert result[0]["payload"]["adoptedByExternalId"] is True
+    assert result[0]["payload"]["repaired"] is True
+    assert repairs[0]["brand_id"] == 88
+    assert repairs[0]["ticket_form_id"] == 5001
+    values = {str(item["id"]): item["value"] for item in repairs[0]["custom_fields"]}
+    assert values[field_ids["campaignName"]] == "Durban Plumbers - July"
+    assert values[field_ids["businessName"]] == "Alpha Plumbing"
+    assert "asf_managed" in repairs[0]["tags"]
+
+
+def test_zendesk_field_comparison_normalizes_checkbox_values():
+    assert main.zendesk_ticket_field_value_matches(False, "false") is True
+    assert main.zendesk_ticket_field_value_matches(True, "true") is True
+    assert main.zendesk_ticket_field_value_matches(False, True) is False
+    assert main.zendesk_ticket_field_value_matches("asf_cf_channel_email", "asf_cf_channel_email") is True
+
+
+def test_live_zendesk_contract_rejects_form_on_wrong_brand(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    field_ids = configure_managed_zendesk_contract()
+
+    def fake_api(method, path, **kwargs):
+        if path == "/brands/88.json":
+            return {"brand": {"id": 88, "active": True}}
+        if path == "/ticket_forms/5001.json":
+            return {
+                "ticket_form": {
+                    "id": 5001,
+                    "active": True,
+                    "in_all_brands": False,
+                    "restricted_brand_ids": [99],
+                    "ticket_field_ids": [int(value) for value in field_ids.values()],
+                }
+            }
+        raise AssertionError(path)
+
+    monkeypatch.setattr(main, "zendesk_api_request", fake_api)
+
+    with pytest.raises(main.HTTPException) as error:
+        main.require_zendesk_ticket_contract("email", verify_live=True)
+
+    assert error.value.status_code == 409
+    assert "not available on the selected brand" in " ".join(error.value.detail["problems"])
 
 
 def test_zendesk_webhook_rejects_invalid_secret(monkeypatch):
@@ -1438,27 +1680,32 @@ def test_campaign_intake_splits_email_and_call_records_without_generation(monkey
     item = apify_item(301, province="KwaZulu-Natal")
     item["email"] = "campaign@example.com"
     model_calls = []
-    monkeypatch.setattr(main, "run_apify_google_maps", lambda *args, **kwargs: [item])
+    discovery_calls = []
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda *args, **kwargs: discovery_calls.append(True) or [item])
     monkeypatch.setattr(main, "compact_lead_with_groq", lambda *args: model_calls.append("groq"))
     monkeypatch.setattr(main, "generate_final_html_with_gemini", lambda *args: model_calls.append("gemini"))
     monkeypatch.setattr(main, "export_site_to_github", lambda *args, **kwargs: model_calls.append("github"))
     monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
     monkeypatch.setattr(main, "zendesk_connection_snapshot", lambda: {"connected": True, "workspaceReady": True})
-    ticket_ids = iter([7301, 7302])
-    monkeypatch.setattr(main, "create_zendesk_intake_tickets", lambda **kwargs: [{"ticketId": next(ticket_ids)}])
-
-    response = client.post(
-        "/api/campaigns/intake",
-        json={
-            "campaignName": "Durban Services - July",
-            "presetId": "plumbers",
-            "industry": "Plumbing",
-            "location": "Durban, South Africa",
-            "limit": 1,
-            "channels": ["email", "phone"],
-            "syncZendesk": True,
-        },
+    ticket_ids = {"email": 7301, "phone": 7302}
+    monkeypatch.setattr(
+        main,
+        "create_zendesk_intake_tickets",
+        lambda **kwargs: [{"ticketId": ticket_ids[kwargs["requested_channels"][0]]}],
     )
+
+    request = {
+        "campaignName": "Durban Services - July",
+        "presetId": "plumbers",
+        "industry": "Plumbing",
+        "location": "Durban, South Africa",
+        "limit": 1,
+        "channels": ["email", "phone"],
+        "syncZendesk": True,
+    }
+    response = client.post("/api/campaigns/intake", json=request)
+    replay = client.post("/api/campaigns/intake", json=request)
 
     assert response.status_code == 200
     payload = response.json()
@@ -1468,7 +1715,94 @@ def test_campaign_intake_splits_email_and_call_records_without_generation(monkey
     assert payload["metrics"]["reposCreated"] == 0
     assert payload["emailLeads"][0]["status"] == "TICKET_READY"
     assert payload["callLeads"][0]["status"] == "TICKET_READY"
+    assert replay.status_code == 200
+    assert replay.json()["campaignId"] == payload["campaignId"]
+    assert replay.json()["idempotentReplay"] is True
+    assert len(discovery_calls) == 1
     assert model_calls == []
+
+
+def test_campaign_replay_resumes_partial_zendesk_intake_without_duplicates(monkeypatch):
+    item = apify_item(401, province="KwaZulu-Natal")
+    item["email"] = "resume@example.com"
+    discovery_calls = []
+    attempts = {"email": 0, "phone": 0}
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda *args, **kwargs: discovery_calls.append(True) or [item])
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
+
+    def intake(**kwargs):
+        channel = kwargs["requested_channels"][0]
+        attempts[channel] += 1
+        if channel == "phone" and attempts[channel] == 1:
+            raise RuntimeError("temporary Zendesk timeout")
+        return [{"ticketId": 9101 if channel == "email" else 9102}]
+
+    monkeypatch.setattr(main, "create_zendesk_intake_tickets", intake)
+    request = {
+        "campaignName": "Resumable campaign",
+        "presetId": "plumbers",
+        "industry": "Plumbing",
+        "location": "Durban, South Africa",
+        "limit": 1,
+        "channels": ["email", "phone"],
+        "syncZendesk": True,
+    }
+
+    first = client.post("/api/campaigns/intake", json=request)
+    second = client.post("/api/campaigns/intake", json=request)
+
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "INTAKE_PARTIAL"
+    assert first.json()["sync"]["pending"] == 1
+    assert second.status_code == 200, second.text
+    assert second.json()["status"] == "ACTIVE"
+    assert second.json()["idempotentReplay"] is True
+    assert second.json()["sync"]["pending"] == 0
+    assert len(discovery_calls) == 1
+    with main.get_pipeline_db() as db:
+        assert db.execute("SELECT COUNT(*) FROM campaigns").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM approval_records").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM campaign_deployments").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*) FROM campaign_email_leads").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM campaign_call_leads").fetchone()[0] == 1
+
+
+def test_campaign_final_state_uses_saved_ticket_facts_not_stale_worker_error(monkeypatch):
+    item = apify_item(402, province="KwaZulu-Natal")
+    item["email"] = "race@example.com"
+    item["phone"] = None
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda *args, **kwargs: [item])
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
+
+    def stale_worker(**kwargs):
+        with main.get_pipeline_db() as db:
+            db.execute(
+                "UPDATE campaign_email_leads SET ticket_id = 9301, status = 'TICKET_READY' WHERE approval_id = ?",
+                (kwargs["approval_id"],),
+            )
+        raise RuntimeError("stale worker timeout after another retry succeeded")
+
+    monkeypatch.setattr(main, "create_zendesk_intake_tickets", stale_worker)
+    response = client.post(
+        "/api/campaigns/intake",
+        json={
+            "campaignName": "Concurrent retry facts",
+            "presetId": "plumbers",
+            "location": "Durban, South Africa",
+            "limit": 1,
+            "channels": ["email"],
+            "syncZendesk": True,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "ACTIVE"
+    assert response.json()["sync"]["pending"] == 0
+    assert response.json()["sync"]["errors"] == []
+    with main.get_pipeline_db() as db:
+        assert db.execute("SELECT error FROM campaign_deployments").fetchone()["error"] is None
 
 
 def test_campaign_creation_is_locked_until_zendesk_workspace_is_provisioned():
@@ -1490,6 +1824,7 @@ def test_campaign_creation_is_locked_until_zendesk_workspace_is_provisioned():
 
 def test_uploaded_campaign_processes_durable_chunks_without_generating_sites(monkeypatch):
     monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
     ticket_ids = iter([8101, 8102])
     monkeypatch.setattr(main, "create_zendesk_intake_tickets", lambda **kwargs: [{"ticketId": next(ticket_ids)}])
     monkeypatch.setattr(main, "compact_lead_with_groq", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("AI must wait for deploy_site")))
@@ -1519,6 +1854,21 @@ def test_uploaded_campaign_processes_durable_chunks_without_generating_sites(mon
     assert job["fileRetained"] is True
     assert job["totalRows"] == 2
 
+    replay = client.post(
+        "/api/campaigns/import",
+        data={
+            "campaignName": "Uploaded leads",
+            "industry": "Plumbing",
+            "location": "Durban",
+            "channels": "email,phone",
+            "chunkSize": "1",
+        },
+        files={"file": ("leads.csv", csv_data, "text/csv")},
+    )
+    assert replay.status_code == 200
+    assert replay.json()["jobId"] == job["jobId"]
+    assert replay.json()["idempotentReplay"] is True
+
     first = client.post(f"/api/campaigns/imports/{job['jobId']}/process")
     assert first.status_code == 200, first.text
     assert first.json()["processedRows"] == 1
@@ -1535,6 +1885,116 @@ def test_uploaded_campaign_processes_durable_chunks_without_generating_sites(mon
     assert completed["campaign"]["metrics"]["aiGenerations"] == 0
 
 
+def test_uploaded_generic_row_ids_do_not_create_distinct_lead_identities():
+    first = main.normalize_uploaded_lead(
+        {"id": "row-1", "businessName": "Alpha Plumbing", "email": "alpha@example.com", "location": "Durban"},
+        1,
+        "Plumbing",
+        "Durban",
+    )
+    second = main.normalize_uploaded_lead(
+        {"id": "row-2", "businessName": "Alpha Plumbing", "email": "alpha@example.com", "location": "Durban"},
+        2,
+        "Plumbing",
+        "Durban",
+    )
+
+    assert first.canonicalLeadKey == second.canonicalLeadKey
+    assert first.leadKey == second.leadKey
+
+
+def test_uploaded_identity_is_skipped_across_campaigns(monkeypatch):
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
+    ticket_calls = []
+
+    def intake(**kwargs):
+        ticket_calls.append(kwargs)
+        return [{"ticketId": 8201}]
+
+    monkeypatch.setattr(main, "create_zendesk_intake_tickets", intake)
+
+    def queue(name, business):
+        csv_data = f"businessName,email,industry,location\n{business},same@example.com,Plumbing,Durban\n"
+        response = client.post(
+            "/api/campaigns/import",
+            data={
+                "campaignName": name,
+                "industry": "Plumbing",
+                "location": "Durban",
+                "channels": "email",
+                "chunkSize": "5",
+            },
+            files={"file": ("leads.csv", csv_data, "text/csv")},
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    first_job = queue("First upload", "Alpha Plumbing")
+    first_result = client.post(f"/api/campaigns/imports/{first_job['jobId']}/process")
+    second_job = queue("Second upload", "Alpha Plumbing (Pty) Ltd")
+    second_result = client.post(f"/api/campaigns/imports/{second_job['jobId']}/process")
+
+    assert first_result.status_code == 200, first_result.text
+    assert first_result.json()["succeededRows"] == 1
+    assert second_result.status_code == 200, second_result.text
+    assert second_result.json()["status"] == "COMPLETED"
+    assert second_result.json()["succeededRows"] == 0
+    assert second_result.json()["skippedRows"] == 1
+    assert second_result.json()["campaign"]["metrics"]["emailLeads"] == 0
+    assert len(ticket_calls) == 1
+    with main.get_pipeline_db() as db:
+        assert db.execute("SELECT COUNT(*) FROM campaign_email_leads").fetchone()[0] == 1
+        item = db.execute(
+            "SELECT * FROM campaign_import_items WHERE job_id = ?", (second_job["jobId"],)
+        ).fetchone()
+        assert item["status"] == "SKIPPED"
+        assert main.safe_json_loads(item["ticket_ids_json"], []) == [8201]
+
+
+def test_uploaded_identity_claim_is_atomic_across_campaigns():
+    timestamp = main.now_iso()
+    campaign_ids = ["claim-campaign-a", "claim-campaign-b"]
+    with main.get_pipeline_db() as db:
+        for campaign_id in campaign_ids:
+            db.execute(
+                """
+                INSERT INTO campaigns (
+                    id, idempotency_key, name, preset_id, industry, query, location, requested_count,
+                    discovered_count, channel_filter, status, warnings_json, created_at, updated_at
+                ) VALUES (?, ?, ?, 'uploaded-leads', 'Plumbing', 'leads.csv', 'Durban', 1, 0, 'email',
+                          'IMPORT_PROCESSING', '[]', ?, ?)
+                """,
+                (campaign_id, f"upload:{campaign_id}", campaign_id, timestamp, timestamp),
+            )
+
+    leads = [
+        main.normalize_uploaded_lead(
+            {"businessName": business, "email": "atomic@example.com", "location": "Durban"},
+            index,
+            "Plumbing",
+            "Durban",
+        )
+        for index, business in enumerate(["Atomic Plumbing", "Atomic Plumbing Pty Ltd"], start=1)
+    ]
+    barrier = threading.Barrier(2)
+
+    def claim(index):
+        barrier.wait(timeout=5)
+        return main.claim_uploaded_campaign_lead_identity(campaign_ids[index], leads[index])
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(claim, [0, 1]))
+
+    assert sum(result is None for result in results) == 1
+    assert sum(result is not None for result in results) == 1
+    with main.get_pipeline_db() as db:
+        email_claims = db.execute(
+            "SELECT COUNT(*) AS count FROM campaign_lead_identity_claims WHERE identity_key = 'email:atomic@example.com'"
+        ).fetchone()["count"]
+        assert email_claims == 1
+
+
 def test_campaign_deploy_webhook_generates_once_then_deploys(monkeypatch):
     item = apify_item(302, province="KwaZulu-Natal")
     item["email"] = "deploy@example.com"
@@ -1543,6 +2003,7 @@ def test_campaign_deploy_webhook_generates_once_then_deploys(monkeypatch):
     monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", fake_git_deploy_with_history)
     monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "campaign-webhook-secret")
     monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
     monkeypatch.setattr(main, "zendesk_connection_snapshot", lambda: {"connected": True, "workspaceReady": True})
     monkeypatch.setattr(main, "create_zendesk_intake_tickets", lambda **kwargs: [{"ticketId": 7401}])
     monkeypatch.setattr(main, "update_zendesk_deployment_lifecycle", lambda *args, **kwargs: None)
@@ -1649,7 +2110,7 @@ def test_legacy_pipeline_backfill_populates_campaign_dashboard_idempotently():
 
     first = main.backfill_legacy_campaign_data()
     second = main.backfill_legacy_campaign_data()
-    dashboard = main.list_campaigns(20)
+    dashboard = main.list_campaigns(20, includeLegacy=True)
 
     assert first == {
         "campaignsCreated": 1,

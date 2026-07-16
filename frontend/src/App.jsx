@@ -301,7 +301,7 @@ function CampaignForm({ presets, connection, onCreated }) {
     limit: 10,
     email: true,
     phone: true,
-    forceRefresh: false,
+    forceRefresh: true,
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -334,7 +334,7 @@ function CampaignForm({ presets, connection, onCreated }) {
         syncZendesk: true,
       }, { timeout: 900000 });
       onCreated(data);
-      setForm((current) => ({ ...current, campaignName: "", forceRefresh: false }));
+      setForm((current) => ({ ...current, campaignName: "", forceRefresh: true }));
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -678,13 +678,14 @@ function ZendeskSetupWizard({ connection, onProvisioned }) {
     <div className="setup-config-grid">
       <label>Email lead form name<input value={config.emailFormName} onChange={(event) => changeConfig({ emailFormName: event.target.value })} /></label>
       <label>Call lead form name<input value={config.callFormName} onChange={(event) => changeConfig({ callFormName: event.target.value })} /></label>
-      <label>Brand assignment<select required value={config.brandId || ""} onChange={(event) => changeConfig({ brandId: event.target.value })}><option value="">Select an existing brand</option>{(setup?.brands || []).map((brand) => <option key={brand.id} value={brand.id}>{brand.name}{brand.default ? " (default)" : ""}</option>)}</select><small>The two forms, ticket routing, and managed views are tied to this existing Zendesk brand.</small></label>
+      <label>Brand assignment<select required value={config.brandId || ""} onChange={(event) => changeConfig({ brandId: event.target.value })}><option value="">Select an existing brand</option>{(setup?.brands || []).map((brand) => <option key={brand.id} value={brand.id}>{brand.name}{brand.default ? " (default)" : ""}{brand.unavailable ? " (unavailable)" : ""}</option>)}</select><small>{setup?.brandsLoaded ? `${setup.brands.length} existing brand${setup.brands.length === 1 ? "" : "s"} loaded from ${connection.subdomain}.` : "Loading existing brands from the connected Zendesk instance…"} The two forms, ticket routing, and managed views are tied to the selected brand.</small></label>
       <label className="setup-toggle"><input type="checkbox" checked={config.createViews} onChange={(event) => changeConfig({ createViews: event.target.checked })} /><span><strong>Create managed views</strong><small>Email, call, and deployed queues filtered by stable tags.</small></span></label>
       <label className="setup-toggle"><input type="checkbox" checked={config.createAutomation} onChange={(event) => changeConfig({ createAutomation: event.target.checked })} /><span><strong>Stage webhook automation</strong><small>Creates an active authenticated webhook and inactive deploy/email triggers.</small></span></label>
       {config.createAutomation && <label>Public webhook URL<input type="url" value={config.webhookUrl || ""} onChange={(event) => changeConfig({ webhookUrl: event.target.value })} /><small>Must be public HTTPS. Localhost cannot receive Zendesk webhook calls.</small></label>}
     </div>
     {error && <div className="inline-alert danger">{error}</div>}
     {message && <div className="inline-alert success">{message}</div>}
+    {setup?.brandLoadError && <div className="inline-alert warning">Existing Zendesk brands could not be loaded: {setup.brandLoadError}</div>}
     {!connection.connected && <div className="inline-alert warning">Connect Zendesk above before inspecting or provisioning this blueprint.</div>}
     <div className="setup-actions"><button className="ghost-button" type="button" disabled={!connection.connected || Boolean(busy)} onClick={() => runSetup("inspect")}><Eye size={17} />{busy === "inspect" ? "Inspecting…" : "Inspect instance"}</button><label className="confirm-change"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>I reviewed this plan and authorize these Zendesk configuration changes.</span></label><button className="primary-button" type="button" disabled={!connection.connected || !setup?.inspected || !config.brandId || !confirmed || Boolean(busy) || conflicts.length > 0} onClick={() => runSetup("provision")}><WandSparkles size={17} />{busy === "provision" ? "Provisioning in order…" : "Provision Zendesk setup"}</button></div>
     <div className="setup-summary-grid">
@@ -775,6 +776,8 @@ function AppShell() {
       if (shouldChooseDefault && data.campaigns?.length) {
         const defaultCampaign = populatedCampaign || data.campaigns[0];
         setSelectedCampaignId(defaultCampaign.campaignId);
+      } else if (!data.campaigns?.length && selectedCampaignId) {
+        setSelectedCampaignId("");
       }
       selectionInitialized.current = true;
     }

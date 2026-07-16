@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
-from uuid import uuid4
+from uuid import NAMESPACE_URL, uuid4, uuid5
 import base64
 from collections import deque
 import csv
@@ -731,8 +731,9 @@ class CampaignIntakeRequest(BaseModel):
     query: Optional[str] = None
     limit: int = Field(default=10, ge=1)
     channels: List[str] = Field(default_factory=lambda: ["email", "phone"])
-    forceRefresh: bool = False
+    forceRefresh: bool = True
     syncZendesk: bool = True
+    idempotencyKey: Optional[str] = None
 
 
 class DiscoveredLead(BaseModel):
@@ -1129,6 +1130,11 @@ def now_iso() -> str:
     return datetime.now().isoformat()
 
 
+def env_enabled(name: str, default: bool = False) -> bool:
+    value = compact_text(os.getenv(name), "true" if default else "false").lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def safe_json_loads(value: Optional[str], fallback: Any = None) -> Any:
     if not value:
         return fallback
@@ -1172,6 +1178,11 @@ PIPELINE_SEED_ANCHOR_TABLES = [
     "pipeline_runs",
     "approval_records",
     "lead_registry",
+]
+
+ZENDESK_CONFIG_SEED_TABLES = [
+    "zendesk_field_settings",
+    "zendesk_provisioned_resources",
 ]
 
 
@@ -1239,6 +1250,19 @@ def init_pipeline_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_lead_identity_canonical
             ON lead_identity_index(canonical_lead_key);
 
+            CREATE TABLE IF NOT EXISTS campaign_lead_identity_claims (
+                identity_key TEXT PRIMARY KEY,
+                identity_type TEXT NOT NULL,
+                canonical_lead_key TEXT NOT NULL,
+                campaign_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_campaign_lead_claim_owner
+            ON campaign_lead_identity_claims(campaign_id, canonical_lead_key);
+
             CREATE TABLE IF NOT EXISTS discovery_batches (
                 batch_id TEXT PRIMARY KEY,
                 preset_id TEXT,
@@ -1254,6 +1278,7 @@ def init_pipeline_db() -> None:
 
             CREATE TABLE IF NOT EXISTS campaigns (
                 id TEXT PRIMARY KEY,
+                idempotency_key TEXT,
                 name TEXT NOT NULL,
                 batch_id TEXT,
                 preset_id TEXT,
@@ -1524,6 +1549,7 @@ def init_pipeline_db() -> None:
                 approval_id TEXT NOT NULL,
                 canonical_lead_key TEXT NOT NULL,
                 pipeline_id TEXT,
+                external_id TEXT,
                 ticket_id INTEGER,
                 ticket_url TEXT,
                 channel TEXT NOT NULL,
@@ -1565,6 +1591,16 @@ def init_pipeline_db() -> None:
         ensure_db_column(db, "site_registry", "github_repo_url", "github_repo_url TEXT")
         ensure_db_column(db, "site_registry", "last_commit_sha", "last_commit_sha TEXT")
         ensure_db_column(db, "site_registry", "last_build_id", "last_build_id TEXT")
+        ensure_db_column(db, "campaigns", "idempotency_key", "idempotency_key TEXT")
+        ensure_db_column(db, "zendesk_ticket_links", "external_id", "external_id TEXT")
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_campaigns_idempotency_key "
+            "ON campaigns(idempotency_key) WHERE idempotency_key IS NOT NULL"
+        )
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_zendesk_ticket_links_external_id "
+            "ON zendesk_ticket_links(external_id) WHERE external_id IS NOT NULL"
+        )
 
 
 def restore_pipeline_seed_if_empty() -> Dict[str, Any]:
@@ -1651,6 +1687,118 @@ def restore_pipeline_seed_if_empty() -> Dict[str, Any]:
         )
     return result
 
+
+def restore_zendesk_config_seed_if_empty() -> Dict[str, Any]:
+    """Bootstrap only the managed Zendesk blueprint, never historical app data."""
+    seed_path = pipeline_seed_path()
+    if not os.path.exists(seed_path):
+        return {"restored": False, "reason": "seed_not_found", "path": seed_path}
+
+    try:
+        with open(seed_path, "r", encoding="utf-8") as seed_file:
+            payload = json.load(seed_file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Pipeline seed could not be read: {exc}") from exc
+
+    if payload.get("schemaVersion") != 1 or not isinstance(payload.get("tables"), dict):
+        raise RuntimeError("Pipeline seed has an unsupported schema.")
+
+    resource_rows = payload["tables"].get("zendesk_provisioned_resources", [])
+    configuration = next(
+        (
+            row
+            for row in resource_rows
+            if isinstance(row, dict) and compact_text(row.get("resource_key")) == "configuration"
+        ),
+        None,
+    )
+    configured_subdomain = compact_text((configuration or {}).get("resource_id")).lower()
+    configured_subdomain = re.sub(r"^https?://", "", configured_subdomain).split("/", 1)[0]
+    configured_subdomain = configured_subdomain.removesuffix(".zendesk.com")
+    live_subdomain = compact_text(os.getenv("ZENDESK_SUBDOMAIN")).lower()
+    live_subdomain = re.sub(r"^https?://", "", live_subdomain).split("/", 1)[0]
+    live_subdomain = live_subdomain.removesuffix(".zendesk.com")
+    if not live_subdomain or configured_subdomain != live_subdomain:
+        return {
+            "restored": False,
+            "reason": "subdomain_mismatch",
+            "configuredSubdomain": configured_subdomain or None,
+            "liveSubdomain": live_subdomain or None,
+        }
+
+    restored_counts: Dict[str, int] = {}
+    with get_pipeline_db() as db:
+        existing_counts = {
+            table: db.execute(f'SELECT COUNT(*) AS count FROM "{table}"').fetchone()["count"]
+            for table in ZENDESK_CONFIG_SEED_TABLES
+        }
+        if any(existing_counts.values()):
+            return {
+                "restored": False,
+                "reason": "zendesk_config_not_empty",
+                "existingCounts": existing_counts,
+            }
+
+        db.execute("BEGIN IMMEDIATE")
+        try:
+            for table in ZENDESK_CONFIG_SEED_TABLES:
+                rows = payload["tables"].get(table, [])
+                if not isinstance(rows, list):
+                    raise RuntimeError(f"Pipeline seed table '{table}' is invalid.")
+                if table == "zendesk_provisioned_resources":
+                    allowed_resource_keys = {
+                        "configuration",
+                        "form:email",
+                        "form:phone",
+                        *[f"field:{key}" for key in ZENDESK_FIELD_KEYS],
+                    }
+                    rows = [
+                        row
+                        for row in rows
+                        if isinstance(row, dict) and compact_text(row.get("resource_key")) in allowed_resource_keys
+                    ]
+                table_columns = {
+                    column["name"]
+                    for column in db.execute(f'PRAGMA table_info("{table}")').fetchall()
+                }
+                inserted = 0
+                for row in rows:
+                    if not isinstance(row, dict):
+                        raise RuntimeError(f"Pipeline seed row in '{table}' is invalid.")
+                    columns = [column for column in row if column in table_columns]
+                    if not columns:
+                        continue
+                    quoted_columns = ", ".join(f'"{column}"' for column in columns)
+                    placeholders = ", ".join("?" for _ in columns)
+                    before = db.total_changes
+                    db.execute(
+                        f'INSERT OR IGNORE INTO "{table}" ({quoted_columns}) VALUES ({placeholders})',
+                        tuple(row[column] for column in columns),
+                    )
+                    inserted += db.total_changes - before
+                restored_counts[table] = inserted
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+    total = sum(restored_counts.values())
+    result = {
+        "restored": total > 0,
+        "reason": "zendesk_config_restored" if total > 0 else "seed_empty",
+        "restoredCounts": restored_counts,
+        "total": total,
+    }
+    if total:
+        log_event(
+            "info",
+            "zendesk.config_seed_restored",
+            "Managed Zendesk setup restored without historical campaigns or tickets.",
+            total=total,
+            restoredCounts=restored_counts,
+        )
+    return result
+
 def canonical_lead_key_from_values(
     raw: Dict[str, Any],
     business_name: Optional[str],
@@ -1709,7 +1857,10 @@ def lead_identity_pairs(lead: DiscoveredLead) -> List[Tuple[str, str]]:
     if domain:
         pairs.append(("domain", f"domain:{domain}"))
 
-    place_id = first_present(raw, ["placeId", "place_id", "googlePlaceId", "googleId", "cid", "fid", "id"])
+    place_id_keys = ["placeId", "place_id", "googlePlaceId", "googleId", "cid", "fid"]
+    if compact_text(lead.source).lower() != "uploaded-lead-data":
+        place_id_keys.append("id")
+    place_id = first_present(raw, place_id_keys)
     if place_id:
         pairs.append(("source_place", f"source_place:{compact_text(place_id).lower()}"))
 
@@ -2003,11 +2154,27 @@ def cached_discovery_response(
         return None
 
     cached_leads = [DiscoveredLead(**lead) for lead in safe_json_loads(row["leads_json"], [])]
-    leads = [
-        lead
-        for lead in cached_leads
-        if not lead_has_website(lead) and lead_has_contact(lead)
-    ][:limit]
+    eligible: List[DiscoveredLead] = []
+    seen_keys: Set[str] = set()
+    seen_identities: Set[str] = set()
+    revalidated_duplicates = 0
+    for lead in cached_leads:
+        canonical_key = canonical_lead_key_for_lead(lead)
+        lead.canonicalLeadKey = canonical_key
+        identities = {identity_key for _identity_type, identity_key in lead_identity_pairs(lead)}
+        if lead_has_website(lead) or not lead_has_contact(lead):
+            continue
+        if (
+            canonical_key in seen_keys
+            or generated_lead_identity_conflicts(lead, canonical_key)
+            or identities.intersection(seen_identities)
+        ):
+            revalidated_duplicates += 1
+            continue
+        seen_keys.add(canonical_key)
+        seen_identities.update(identities)
+        eligible.append(lead)
+    leads = select_mixed_contact_leads(eligible, limit)
     if not leads:
         return None
 
@@ -2023,13 +2190,13 @@ def cached_discovery_response(
         sourceStatus="CACHE",
         warnings=safe_json_loads(row["warnings_json"], []),
         provinceStats=safe_json_loads(row["province_stats_json"], {}),
-        duplicatesSkipped=row["duplicates_skipped"],
+        duplicatesSkipped=(row["duplicates_skipped"] or 0) + revalidated_duplicates,
         requestedCount=limit,
         rawFetched=len(cached_leads),
         eligibleReturned=len(leads),
         websitesSkipped=sum(1 for lead in cached_leads if lead_has_website(lead)),
         noContactSkipped=sum(1 for lead in cached_leads if not lead_has_contact(lead)),
-        generatedDuplicatesSkipped=row["duplicates_skipped"],
+        generatedDuplicatesSkipped=(row["duplicates_skipped"] or 0) + revalidated_duplicates,
         emailLeads=email_count,
         phoneLeads=phone_count,
         emailAndPhoneLeads=sum(
@@ -2288,13 +2455,14 @@ def create_approval_record(
     site_content: Dict[str, Any],
     template: Dict[str, Any],
     status: str = "PENDING",
+    approval_id: Optional[str] = None,
 ) -> str:
-    approval_id = str(uuid4())
+    approval_id = compact_text(approval_id) or str(uuid4())
     timestamp = now_iso()
     with get_pipeline_db() as db:
         db.execute(
             """
-            INSERT INTO approval_records (
+            INSERT OR IGNORE INTO approval_records (
                 id, pipeline_id, canonical_lead_key, lead_key, business_name, status,
                 html, html_checksum, context_json, site_content_json, template_json,
                 created_at, updated_at, publish_mode
@@ -2333,8 +2501,9 @@ def get_zendesk_field_settings() -> Dict[str, Optional[str]]:
 
 def save_zendesk_field_settings(fields: Dict[str, Optional[str]]) -> Dict[str, Optional[str]]:
     timestamp = now_iso()
+    current = get_zendesk_field_settings()
     cleaned = {
-        key: compact_text(fields.get(key)) or None
+        key: (compact_text(fields.get(key)) or None) if key in fields else current.get(key)
         for key in ZENDESK_FIELD_KEYS
     }
     with get_pipeline_db() as db:
@@ -2470,6 +2639,112 @@ def zendesk_ticket_routing_fields(channel: str) -> Dict[str, Any]:
     return routing
 
 
+def require_zendesk_ticket_contract(channel: str, verify_live: bool = False) -> Dict[str, Any]:
+    normalized_channel = compact_text(channel).lower()
+    if normalized_channel not in {"email", "phone"}:
+        raise HTTPException(status_code=400, detail="Zendesk intake channel must be email or phone.")
+
+    readiness = zendesk_workspace_readiness()
+    resources = list_zendesk_provisioned_resources()
+    settings = get_zendesk_field_settings()
+    configuration = resources.get("configuration", {})
+    configuration_metadata = configuration.get("metadata", {})
+    brand_id = compact_text(configuration_metadata.get("brandId"))
+    form = resources.get(f"form:{normalized_channel}", {})
+    form_id = compact_text(form.get("resourceId"))
+    problems: List[str] = []
+
+    if not readiness.get("workspaceReady"):
+        problems.append("the connected Zendesk workspace is not fully provisioned")
+    if not brand_id:
+        problems.append("the selected brand ID is missing")
+    if not form_id:
+        problems.append(f"the managed {normalized_channel} form ID is missing")
+    form_metadata = form.get("metadata", {})
+    if compact_text(form_metadata.get("channel")) != normalized_channel:
+        problems.append(f"the saved {normalized_channel} form channel does not match")
+    if brand_id and compact_text(form_metadata.get("brandId")) != brand_id:
+        problems.append(f"the saved {normalized_channel} form is not assigned to the selected brand")
+
+    definitions = [definition for definition in ZENDESK_FIELD_BLUEPRINT if normalized_channel in definition["forms"]]
+    field_ids: Dict[str, str] = {}
+    for definition in definitions:
+        key = definition["key"]
+        setting_id = compact_text(settings.get(key))
+        resource = resources.get(f"field:{key}", {})
+        resource_id = compact_text(resource.get("resourceId"))
+        if not setting_id or not resource_id:
+            problems.append(f"the managed field mapping for {key} is missing")
+            continue
+        if setting_id != resource_id:
+            problems.append(f"the managed field mapping for {key} is inconsistent")
+            continue
+        field_ids[key] = setting_id
+
+    if problems:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ZENDESK_TICKET_CONTRACT_INVALID",
+                "message": "Zendesk ticket creation was stopped before any records were changed.",
+                "channel": normalized_channel,
+                "problems": list(dict.fromkeys(problems)),
+            },
+        )
+
+    if verify_live:
+        try:
+            live_brand = zendesk_api_request("get", f"/brands/{brand_id}.json").get("brand") or {}
+            live_form = zendesk_api_request("get", f"/ticket_forms/{form_id}.json").get("ticket_form") or {}
+        except Exception as error:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ZENDESK_TICKET_CONTRACT_UNREACHABLE",
+                    "message": "The selected Zendesk brand and form could not be verified.",
+                    "channel": normalized_channel,
+                    "reason": sanitize_message(error),
+                },
+            ) from error
+
+        live_problems: List[str] = []
+        if compact_text(live_brand.get("id")) != brand_id or not live_brand.get("active", True):
+            live_problems.append("the selected brand is missing or inactive")
+        if compact_text(live_form.get("id")) != form_id or not live_form.get("active", True):
+            live_problems.append(f"the managed {normalized_channel} form is missing or inactive")
+        restricted_brands = {compact_text(value) for value in (live_form.get("restricted_brand_ids") or [])}
+        if not live_form.get("in_all_brands") and brand_id not in restricted_brands:
+            live_problems.append(f"the managed {normalized_channel} form is not available on the selected brand")
+        live_field_ids = {compact_text(value) for value in (live_form.get("ticket_field_ids") or [])}
+        missing_live_fields = [key for key, value in field_ids.items() if value not in live_field_ids]
+        if missing_live_fields:
+            live_problems.append(
+                f"the managed {normalized_channel} form is missing fields: {', '.join(missing_live_fields)}"
+            )
+        if live_problems:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ZENDESK_TICKET_CONTRACT_INVALID",
+                    "message": "Zendesk ticket creation was stopped because the live brand/form contract changed.",
+                    "channel": normalized_channel,
+                    "problems": live_problems,
+                },
+            )
+
+    return {
+        "channel": normalized_channel,
+        "brandId": int(brand_id) if brand_id.isdigit() else brand_id,
+        "formId": int(form_id) if form_id.isdigit() else form_id,
+        "fieldIds": field_ids,
+    }
+
+
+def verify_zendesk_ticket_contracts(channels: List[str]) -> Dict[str, Dict[str, Any]]:
+    normalized = [value for value in dict.fromkeys(compact_text(channel).lower() for channel in channels) if value]
+    return {channel: require_zendesk_ticket_contract(channel, verify_live=True) for channel in normalized}
+
+
 def list_zendesk_ticket_links(approval_id: str) -> List[Dict[str, Any]]:
     with get_pipeline_db() as db:
         rows = db.execute(
@@ -2487,6 +2762,7 @@ def list_zendesk_ticket_links(approval_id: str) -> List[Dict[str, Any]]:
             "approvalId": row["approval_id"],
             "canonicalLeadKey": row["canonical_lead_key"],
             "pipelineId": row["pipeline_id"],
+            "externalId": row["external_id"],
             "ticketId": row["ticket_id"],
             "ticketUrl": row["ticket_url"],
             "channel": row["channel"],
@@ -2530,6 +2806,7 @@ def get_zendesk_ticket_link(
         "approvalId": row["approval_id"],
         "canonicalLeadKey": row["canonical_lead_key"],
         "pipelineId": row["pipeline_id"],
+        "externalId": row["external_id"],
         "ticketId": row["ticket_id"],
         "ticketUrl": row["ticket_url"],
         "channel": row["channel"],
@@ -2540,6 +2817,22 @@ def get_zendesk_ticket_link(
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
+
+
+def get_zendesk_ticket_link_by_external_id(external_id: str) -> Optional[Dict[str, Any]]:
+    normalized = compact_text(external_id)
+    if not normalized:
+        return None
+    with get_pipeline_db() as db:
+        row = db.execute(
+            "SELECT * FROM zendesk_ticket_links WHERE external_id = ? ORDER BY created_at DESC LIMIT 1",
+            (normalized,),
+        ).fetchone()
+    if not row:
+        return None
+    return get_zendesk_ticket_link(
+        row["approval_id"], row["channel"], row["stage"], row["ticket_id"]
+    )
 
 
 def save_zendesk_ticket_link(
@@ -2553,6 +2846,7 @@ def save_zendesk_ticket_link(
     status: str,
     tags: List[str],
     payload: Dict[str, Any],
+    external_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     timestamp = now_iso()
     link_id = str(uuid4())
@@ -2561,11 +2855,12 @@ def save_zendesk_ticket_link(
         db.execute(
             """
             INSERT INTO zendesk_ticket_links (
-                id, approval_id, canonical_lead_key, pipeline_id, ticket_id, ticket_url,
+                id, approval_id, canonical_lead_key, pipeline_id, external_id, ticket_id, ticket_url,
                 channel, stage, status, tags_json, payload_json, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(approval_id, channel, stage) DO UPDATE SET
+                external_id = COALESCE(excluded.external_id, zendesk_ticket_links.external_id),
                 ticket_id = COALESCE(excluded.ticket_id, zendesk_ticket_links.ticket_id),
                 ticket_url = COALESCE(excluded.ticket_url, zendesk_ticket_links.ticket_url),
                 status = excluded.status,
@@ -2578,6 +2873,7 @@ def save_zendesk_ticket_link(
                 approval_id,
                 canonical_key,
                 pipeline_id,
+                compact_text(external_id) or None,
                 ticket_id,
                 ticket_url,
                 channel,
@@ -3165,8 +3461,12 @@ def backfill_legacy_campaign_data() -> Dict[str, int]:
 
 
 init_pipeline_db()
-restore_pipeline_seed_if_empty()
-backfill_legacy_campaign_data()
+if env_enabled("ENABLE_ZENDESK_CONFIG_BOOTSTRAP"):
+    restore_zendesk_config_seed_if_empty()
+elif env_enabled("ENABLE_PIPELINE_SEED_RESTORE"):
+    restore_pipeline_seed_if_empty()
+if env_enabled("ENABLE_LEGACY_CAMPAIGN_BACKFILL"):
+    backfill_legacy_campaign_data()
 
 
 def infer_country_code(location: str) -> Optional[str]:
@@ -6454,6 +6754,109 @@ def zendesk_channels_for_context(context: Dict[str, Any]) -> List[str]:
     return channels
 
 
+def zendesk_ticket_field_value_matches(expected: Any, actual: Any) -> bool:
+    if isinstance(expected, bool):
+        if isinstance(actual, bool):
+            return actual is expected
+        return compact_text(actual).lower() in ({"true", "1", "yes", "on"} if expected else {"false", "0", "no", "off"})
+    return compact_text(actual) == compact_text(expected)
+
+
+def reconcile_zendesk_intake_ticket(
+    ticket: Dict[str, Any],
+    spec: Dict[str, Any],
+    base_url: str,
+    auth: Tuple[str, str],
+    headers: Dict[str, str],
+) -> Tuple[Dict[str, Any], bool, List[str]]:
+    """Repair and verify the exact managed route/field contract on an existing ticket."""
+    ticket_id = ticket.get("id")
+    if not ticket_id:
+        raise HTTPException(status_code=502, detail="Zendesk returned a ticket without an ID.")
+
+    contract = spec["contract"]
+    desired_fields = spec["customFields"]
+    current_fields = {
+        compact_text(item.get("id")): item.get("value")
+        for item in (ticket.get("custom_fields") or [])
+    }
+    mismatched_field_ids = [
+        compact_text(item.get("id"))
+        for item in desired_fields
+        if not zendesk_ticket_field_value_matches(
+            item.get("value"), current_fields.get(compact_text(item.get("id")))
+        )
+    ]
+    current_tags = {compact_text(tag) for tag in (ticket.get("tags") or []) if compact_text(tag)}
+    desired_tags = {compact_text(tag) for tag in spec["tags"] if compact_text(tag)}
+    route_mismatch = (
+        compact_text(ticket.get("brand_id")) != compact_text(contract["brandId"])
+        or compact_text(ticket.get("ticket_form_id")) != compact_text(contract["formId"])
+        or compact_text(ticket.get("external_id")) != spec["externalId"]
+    )
+    tags_missing = not desired_tags.issubset(current_tags)
+    repaired = bool(route_mismatch or mismatched_field_ids or tags_missing)
+
+    if repaired:
+        response = requests.put(
+            f"{base_url}/tickets/{ticket_id}.json",
+            json={
+                "ticket": {
+                    "external_id": spec["externalId"],
+                    "brand_id": contract["brandId"],
+                    "ticket_form_id": contract["formId"],
+                    "tags": sorted(current_tags.union(desired_tags)),
+                    "custom_fields": desired_fields,
+                }
+            },
+            auth=auth,
+            headers=headers,
+            timeout=30,
+        )
+        response.raise_for_status()
+        ticket = response.json().get("ticket") or {}
+        if not ticket.get("custom_fields"):
+            detail_response = requests.get(
+                f"{base_url}/tickets/{ticket_id}.json",
+                auth=auth,
+                headers=headers,
+                timeout=30,
+            )
+            detail_response.raise_for_status()
+            ticket = detail_response.json().get("ticket") or {}
+
+    returned_fields = {
+        compact_text(item.get("id")): item.get("value")
+        for item in (ticket.get("custom_fields") or [])
+    }
+    remaining_fields = [
+        compact_text(item.get("id"))
+        for item in desired_fields
+        if not zendesk_ticket_field_value_matches(
+            item.get("value"), returned_fields.get(compact_text(item.get("id")))
+        )
+    ]
+    routing_matches = (
+        compact_text(ticket.get("brand_id")) == compact_text(contract["brandId"])
+        and compact_text(ticket.get("ticket_form_id")) == compact_text(contract["formId"])
+        and compact_text(ticket.get("external_id")) == spec["externalId"]
+    )
+    returned_tags = {compact_text(tag) for tag in (ticket.get("tags") or []) if compact_text(tag)}
+    if not routing_matches or remaining_fields or not desired_tags.issubset(returned_tags):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "ZENDESK_TICKET_CONTRACT_REJECTED",
+                "message": "Zendesk did not preserve the requested brand, form, managed fields, and tags.",
+                "ticketId": ticket_id,
+                "channel": spec["contract"]["channel"],
+                "routingMatches": routing_matches,
+                "missingFieldIds": remaining_fields,
+            },
+        )
+    return ticket, repaired, mismatched_field_ids
+
+
 def create_zendesk_intake_tickets(
     approval_id: str,
     context: Dict[str, Any],
@@ -6461,14 +6864,12 @@ def create_zendesk_intake_tickets(
     batch_id: Optional[str] = None,
     requested_channels: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
-    zendesk_subdomain = require_env("ZENDESK_SUBDOMAIN")
-    zendesk_email = require_env("ZENDESK_EMAIL")
-    zendesk_token = require_env("ZENDESK_API_TOKEN")
-    auth = (f"{zendesk_email}/token", zendesk_token)
-    base_url = f"https://{zendesk_subdomain}.zendesk.com/api/v2"
-    headers = {"Content-Type": "application/json"}
-    business_name = compact_text(context.get("businessName"), "AI Site Factory Lead")
+    business_name = compact_text(context.get("businessName"))
     canonical_key = compact_text(context.get("canonicalLeadKey"))
+    campaign_id = compact_text(context.get("campaignId"))
+    campaign_name = compact_text(context.get("campaignName"))
+    normalized_approval_id = compact_text(approval_id)
+    normalized_pipeline_id = compact_text(pipeline_id)
     lead_email = normalize_email_identity(context.get("email"))
     lead_phone = compact_text(context.get("phone"))
     source_url = compact_text(context.get("sourceUrl"))
@@ -6482,14 +6883,180 @@ def create_zendesk_intake_tickets(
     channels = [channel for channel in available_channels if channel in requested]
     if not channels:
         return []
+
+    structural_values = {
+        "campaignId": campaign_id,
+        "campaignName": campaign_name,
+        "canonicalLeadKey": canonical_key,
+        "pipelineId": normalized_pipeline_id,
+        "approvalId": normalized_approval_id,
+        "businessName": business_name,
+    }
+    missing_structural = [key for key, value in structural_values.items() if not value]
+    if missing_structural:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "CAMPAIGN_TICKET_CONTEXT_REQUIRED",
+                "message": "Zendesk intake tickets can only be created from a named campaign.",
+                "missing": missing_structural,
+            },
+        )
+
+    contracts = {channel: require_zendesk_ticket_contract(channel) for channel in channels}
+    zendesk_subdomain = require_env("ZENDESK_SUBDOMAIN")
+    zendesk_email = require_env("ZENDESK_EMAIL")
+    zendesk_token = require_env("ZENDESK_API_TOKEN")
+    auth = (f"{zendesk_email}/token", zendesk_token)
+    base_url = f"https://{zendesk_subdomain}.zendesk.com/api/v2"
+    headers = {"Content-Type": "application/json"}
     created: List[Dict[str, Any]] = []
-    campaign_id = compact_text(context.get("campaignId"))
-    campaign_name = compact_text(context.get("campaignName"), "Unassigned campaign")
     campaign_tag = f"asf_campaign_{slugify(campaign_name, 32)}"
     contact_name = compact_text(
         context.get("contactName")
         or first_present(context.get("rawLead") or {}, ["contactName", "ownerName", "name"])
     )
+
+    channel_specs: Dict[str, Dict[str, Any]] = {}
+    for channel in channels:
+        if channel == "email" and not lead_email:
+            raise HTTPException(status_code=400, detail="The email campaign lead has no email address.")
+        if channel == "phone" and not lead_phone:
+            raise HTTPException(status_code=400, detail="The phone campaign lead has no phone number.")
+        external_id = f"asf:{campaign_id}:{canonical_key}:{channel}:intake"
+        contact_value = lead_email if channel == "email" else lead_phone
+        tags = [
+            "ai_site_factory",
+            "asf_managed",
+            "asf_intake",
+            f"ai_site_{channel}_lead",
+            source_tag,
+            "asf_stage_intake",
+            "asf_deploy_pending",
+            campaign_tag,
+            f"asf_channel_{channel}",
+        ]
+        if channel == "email":
+            tags.extend(["asf_form_email_lead", "asf_email_send_pending", "asf_can_deploy"])
+        else:
+            tags.extend(["asf_form_call_lead", "asf_call_pending", "asf_can_deploy"])
+        field_values = {
+            "campaignId": campaign_id,
+            "campaignName": campaign_name,
+            "canonicalLeadKey": canonical_key,
+            "pipelineId": normalized_pipeline_id,
+            "approvalId": normalized_approval_id,
+            "batchId": batch_id,
+            "businessName": business_name,
+            "contactName": contact_name,
+            "contactEmail": lead_email,
+            "contactPhone": lead_phone,
+            "industry": industry,
+            "location": location,
+            "address": compact_text(context.get("address")),
+            "contactChannel": channel,
+            "leadStatus": "AWAITING_DEPLOYMENT",
+            "deployRequested": False,
+            "emailSendRequested": False,
+            "phoneCallStatus": "NEW" if channel == "phone" else None,
+            "sourceUrl": source_url,
+        }
+        channel_specs[channel] = {
+            "contract": contracts[channel],
+            "externalId": external_id,
+            "contact": contact_value,
+            "tags": tags,
+            "customFields": zendesk_custom_fields(field_values),
+        }
+
+    pending_channels: List[str] = []
+    for channel in channels:
+        spec = channel_specs[channel]
+        existing = get_zendesk_ticket_link(normalized_approval_id, channel, "intake")
+        if not existing:
+            existing = get_zendesk_ticket_link_by_external_id(spec["externalId"])
+        if existing and existing.get("ticketId"):
+            detail_response = requests.get(
+                f"{base_url}/tickets/{existing['ticketId']}.json",
+                auth=auth,
+                headers=headers,
+                timeout=30,
+            )
+            if detail_response.status_code != 404:
+                detail_response.raise_for_status()
+                ticket = detail_response.json().get("ticket") or {}
+                ticket, repaired, repaired_field_ids = reconcile_zendesk_intake_ticket(
+                    ticket, spec, base_url, auth, headers
+                )
+                existing_payload = existing.get("payload") if isinstance(existing.get("payload"), dict) else {}
+                created.append(
+                    save_zendesk_ticket_link(
+                        approval_id=normalized_approval_id,
+                        canonical_key=canonical_key,
+                        pipeline_id=normalized_pipeline_id,
+                        channel=channel,
+                        stage="intake",
+                        ticket_id=ticket.get("id"),
+                        ticket_url=f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket.get('id')}",
+                        status=ticket.get("status") or existing.get("status") or "new",
+                        tags=ticket.get("tags") or spec["tags"],
+                        payload={
+                            **existing_payload,
+                            "externalId": spec["externalId"],
+                            "reconciledLocalLink": True,
+                            "repaired": repaired,
+                            "repairedFieldIds": repaired_field_ids,
+                            "reconciledAt": now_iso(),
+                        },
+                        external_id=spec["externalId"],
+                    )
+                )
+                continue
+
+        lookup_response = requests.get(
+            f"{base_url}/tickets.json",
+            params={"external_id": spec["externalId"], "per_page": 10},
+            auth=auth,
+            headers=headers,
+            timeout=30,
+        )
+        lookup_response.raise_for_status()
+        remote_matches = [
+            ticket
+            for ticket in (lookup_response.json().get("tickets") or [])
+            if compact_text(ticket.get("external_id")) == spec["externalId"]
+        ]
+        if remote_matches:
+            ticket = sorted(remote_matches, key=lambda item: int(item.get("id") or 0))[0]
+            ticket, repaired, repaired_field_ids = reconcile_zendesk_intake_ticket(
+                ticket, spec, base_url, auth, headers
+            )
+            created.append(
+                save_zendesk_ticket_link(
+                    approval_id=normalized_approval_id,
+                    canonical_key=canonical_key,
+                    pipeline_id=normalized_pipeline_id,
+                    channel=channel,
+                    stage="intake",
+                    ticket_id=ticket.get("id"),
+                    ticket_url=f"https://{zendesk_subdomain}.zendesk.com/agent/tickets/{ticket.get('id')}",
+                    status=ticket.get("status") or "new",
+                    tags=ticket.get("tags") or spec["tags"],
+                    payload={
+                        "adoptedByExternalId": True,
+                        "externalId": spec["externalId"],
+                        "repaired": repaired,
+                        "repairedFieldIds": repaired_field_ids,
+                        "adoptedAt": now_iso(),
+                    },
+                    external_id=spec["externalId"],
+                )
+            )
+            continue
+        pending_channels.append(channel)
+
+    if not pending_channels:
+        return created
 
     org_response = requests.post(
         f"{base_url}/organizations.json",
@@ -6526,7 +7093,7 @@ def create_zendesk_intake_tickets(
     organization_id = organization.get("id")
 
     user: Dict[str, Any] = {}
-    if lead_email:
+    if lead_email and "email" in pending_channels:
         user_search = requests.get(
             f"{base_url}/users/search.json",
             params={"query": lead_email},
@@ -6557,56 +7124,17 @@ def create_zendesk_intake_tickets(
             user_create.raise_for_status()
             user = user_create.json().get("user", {})
 
-    for channel in channels:
-        existing = get_zendesk_ticket_link(approval_id, channel, "intake")
-        if existing and existing.get("ticketId"):
-            created.append(existing)
-            continue
-
-        contact_value = lead_email if channel == "email" else lead_phone if channel == "phone" else "No contact found"
-        tags = [
-            "ai_site_factory",
-            "asf_managed",
-            "asf_intake",
-            f"ai_site_{channel}_lead",
-            source_tag,
-            "asf_stage_intake",
-            "asf_deploy_pending",
-            campaign_tag,
-            f"asf_channel_{channel}",
-        ]
-        if channel == "email":
-            tags.extend(["asf_form_email_lead", "asf_email_send_pending", "asf_can_deploy"])
-        elif channel == "phone":
-            tags.extend(["asf_form_call_lead", "asf_call_pending", "asf_can_deploy"])
-        else:
-            tags.append("asf_contact_unknown")
-
-        custom_fields = zendesk_custom_fields(
-            {
-                "campaignId": campaign_id,
-                "campaignName": campaign_name,
-                "canonicalLeadKey": canonical_key,
-                "pipelineId": pipeline_id,
-                "approvalId": approval_id,
-                "batchId": batch_id,
-                "businessName": business_name,
-                "contactName": contact_name,
-                "contactEmail": lead_email,
-                "contactPhone": lead_phone,
-                "industry": industry,
-                "location": location,
-                "address": compact_text(context.get("address")),
-                "contactChannel": channel,
-                "leadStatus": "AWAITING_DEPLOYMENT",
-                "deployRequested": False,
-                "emailSendRequested": False,
-                "phoneCallStatus": "NEW" if channel == "phone" else None,
-                "sourceUrl": source_url,
-            }
-        )
+    for channel in pending_channels:
+        spec = channel_specs[channel]
+        contract = spec["contract"]
+        contact_value = spec["contact"]
+        tags = spec["tags"]
+        custom_fields = spec["customFields"]
         ticket_payload: Dict[str, Any] = {
             "ticket": {
+                "external_id": spec["externalId"],
+                "brand_id": contract["brandId"],
+                "ticket_form_id": contract["formId"],
                 "subject": f"AI Site Factory {channel.title()} Intake: {business_name}",
                 "comment": {
                     "body": (
@@ -6632,28 +7160,52 @@ def create_zendesk_intake_tickets(
                 "type": "task",
                 "status": "new",
                 "tags": tags,
+                "custom_fields": custom_fields,
             }
         }
-        ticket_payload["ticket"].update(zendesk_ticket_routing_fields(channel))
-        if custom_fields:
-            ticket_payload["ticket"]["custom_fields"] = custom_fields
         if channel == "email" and user.get("id"):
             ticket_payload["ticket"]["requester_id"] = user.get("id")
 
+        idempotency_key = f"asf-{hashlib.sha256(spec['externalId'].encode('utf-8')).hexdigest()[:48]}"
         response = requests.post(
             f"{base_url}/tickets.json",
             json=ticket_payload,
             auth=auth,
-            headers={**headers, "Idempotency-Key": f"asf-{approval_id}-{channel}"},
+            headers={**headers, "Idempotency-Key": idempotency_key},
             timeout=30,
         )
         response.raise_for_status()
         ticket = response.json().get("ticket", {})
+        returned_fields = {compact_text(item.get("id")): item.get("value") for item in (ticket.get("custom_fields") or [])}
+        routing_matches = (
+            compact_text(ticket.get("brand_id")) == compact_text(contract["brandId"])
+            and compact_text(ticket.get("ticket_form_id")) == compact_text(contract["formId"])
+            and compact_text(ticket.get("external_id")) == spec["externalId"]
+        )
+        missing_values = [
+            compact_text(item.get("id"))
+            for item in custom_fields
+            if not zendesk_ticket_field_value_matches(
+                item.get("value"), returned_fields.get(compact_text(item.get("id")))
+            )
+        ]
+        if not ticket.get("id") or not routing_matches or missing_values:
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "ZENDESK_TICKET_CONTRACT_REJECTED",
+                    "message": "Zendesk did not preserve the requested brand, form, and managed field values.",
+                    "ticketId": ticket.get("id"),
+                    "channel": channel,
+                    "routingMatches": routing_matches,
+                    "missingFieldIds": missing_values,
+                },
+            )
         created.append(
             save_zendesk_ticket_link(
-                approval_id=approval_id,
+                approval_id=normalized_approval_id,
                 canonical_key=canonical_key,
-                pipeline_id=pipeline_id,
+                pipeline_id=normalized_pipeline_id,
                 channel=channel,
                 stage="intake",
                 ticket_id=ticket.get("id"),
@@ -6665,8 +7217,12 @@ def create_zendesk_intake_tickets(
                     "userId": user.get("id") if channel == "email" else None,
                     "contact": contact_value,
                     "customFields": custom_fields,
+                    "brandId": contract["brandId"],
+                    "formId": contract["formId"],
+                    "externalId": spec["externalId"],
                     "createdAt": now_iso(),
                 },
+                external_id=spec["externalId"],
             )
         )
 
@@ -7122,13 +7678,14 @@ def discover_leads(request: DiscoverLeadsRequest):
             f"Quick Help {demo_category}",
         ]
 
+        fallback_identities: Set[str] = set()
         for index, business_name in enumerate(demo_businesses[:limit], start=1):
             lead = DiscoveredLead(
                 leadKey=stable_lead_key(business_name, location, demo_category),
                 canonicalLeadKey=stable_lead_key("demo", business_name, location, demo_category),
                 businessName=business_name,
                 email=f"demo{index}@example.com",
-                phone="+27 31 000 0000",
+                phone=f"+27 31 000 {index:04d}",
                 website=None,
                 domain=None,
                 category=demo_category,
@@ -7142,6 +7699,12 @@ def discover_leads(request: DiscoverLeadsRequest):
                 notes="Demo fallback lead used because the live Apify request failed or timed out.",
                 raw={"fallback": True},
             )
+            identity_keys = {identity_key for _identity_type, identity_key in lead_identity_pairs(lead)}
+            if generated_lead_identity_conflicts(lead, lead.canonicalLeadKey or "") or identity_keys.intersection(fallback_identities):
+                duplicates_skipped += 1
+                province_stats[location]["duplicatesSkipped"] += 1
+                continue
+            fallback_identities.update(identity_keys)
             selected_leads.append(lead)
         raw_fetched = len(selected_leads)
         eligible_leads = selected_leads[:]
@@ -7233,6 +7796,17 @@ def discover_leads(request: DiscoverLeadsRequest):
 
 @app.post("/api/pipeline/run", response_model=PipelineRunResponse)
 def run_pipeline(request: PipelineRunRequest):
+    if not env_enabled("ENABLE_LEGACY_PIPELINE_RUN"):
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "code": "LEGACY_PIPELINE_DISABLED",
+                "message": (
+                    "Direct pipeline runs are disabled. Create a named campaign first, then let a Zendesk "
+                    "agent request deployment from the managed intake ticket."
+                ),
+            },
+        )
     template = dict(FREEFORM_SITE_SPEC)
     template_id = FREEFORM_TEMPLATE_ID
     if not request.leads:
@@ -7428,31 +8002,6 @@ def run_pipeline(request: PipelineRunRequest):
                 template=template,
                 status="EXPORTING",
             )
-            try:
-                intake_tickets = run_step(
-                    "zendesk_intake_tickets",
-                    "zendesk",
-                    lambda: create_zendesk_intake_tickets(
-                        approval_id=approval_id,
-                        context=cleaned_context or groq_brief,
-                        pipeline_id=pipeline_id,
-                        batch_id=request.sourceBatchId,
-                    ),
-                    retryable=True,
-                )
-                site_content["zendeskIntakeTickets"] = intake_tickets
-                with get_pipeline_db() as db:
-                    db.execute(
-                        """
-                        UPDATE approval_records
-                        SET site_content_json = ?, updated_at = ?
-                        WHERE id = ?
-                        """,
-                        (json.dumps(site_content, default=str), now_iso(), approval_id),
-                    )
-            except Exception as intake_error:
-                pipeline_warnings.append(f"Zendesk intake ticket creation failed for {lead.businessName}: {sanitize_message(intake_error)}")
-                structured_errors.append(structured_pipeline_error("zendesk_intake_tickets", intake_error, provider="zendesk", retryable=True))
             if request.forceRegenerate:
                 supersede_pending_approvals(canonical_key, approval_id, "pipeline force regenerate")
 
@@ -8168,7 +8717,41 @@ def zendesk_upsert_named_resource(
 
 @app.get("/api/settings/zendesk-setup")
 def get_zendesk_setup():
-    return zendesk_setup_resource_plan(zendesk_setup_request_values())
+    plan = zendesk_setup_resource_plan(zendesk_setup_request_values())
+    if not plan["connected"]:
+        plan["brandsLoaded"] = False
+        return plan
+    try:
+        live_brands = zendesk_list_all("/brands.json", "brands")
+        plan["brands"] = [
+            {
+                "id": compact_text(brand.get("id")),
+                "name": compact_text(brand.get("name"), f"Brand {brand.get('id')}"),
+                "subdomain": brand.get("subdomain"),
+                "default": bool(brand.get("default")),
+                "active": bool(brand.get("active", True)),
+            }
+            for brand in live_brands
+            if brand.get("id") is not None
+        ]
+        configured_brand_id = compact_text(plan.get("config", {}).get("brandId"))
+        if configured_brand_id and not any(brand["id"] == configured_brand_id for brand in plan["brands"]):
+            plan["brands"].append(
+                {
+                    "id": configured_brand_id,
+                    "name": f"Previously configured brand (ID {configured_brand_id})",
+                    "subdomain": zendesk_connection_snapshot().get("subdomain"),
+                    "default": False,
+                    "active": False,
+                    "unavailable": True,
+                }
+            )
+        plan["brandsLoaded"] = True
+        plan["brandsLoadedAt"] = now_iso()
+    except Exception as error:
+        plan["brandsLoaded"] = False
+        plan["brandLoadError"] = sanitize_message(error)
+    return plan
 
 
 @app.post("/api/settings/zendesk-setup/inspect")
@@ -8390,6 +8973,51 @@ def provision_zendesk_setup(request: ZendeskSetupRequest):
     return result
 
 
+def campaign_request_idempotency_key(request: CampaignIntakeRequest, channels: List[str]) -> str:
+    supplied = compact_text(request.idempotencyKey)
+    if supplied:
+        material = f"request:{supplied}"
+    else:
+        material = json.dumps(
+            {
+                "campaignName": compact_text(request.campaignName).lower(),
+                "presetId": compact_text(request.presetId).lower(),
+                "industry": compact_text(request.industry).lower(),
+                "location": compact_text(request.location).lower(),
+                "query": compact_text(request.query).lower(),
+                "limit": int(request.limit),
+                "channels": sorted(channels),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    subdomain = compact_text(zendesk_connection_snapshot().get("subdomain")).lower()
+    digest = hashlib.sha256(f"{subdomain}:{material}".encode("utf-8")).hexdigest()
+    return f"campaign:{digest}"
+
+
+def uploaded_campaign_idempotency_key(
+    content: bytes,
+    campaign_name: str,
+    industry: str,
+    location: str,
+    channels: List[str],
+) -> str:
+    metadata = json.dumps(
+        {
+            "campaignName": compact_text(campaign_name).lower(),
+            "industry": compact_text(industry).lower(),
+            "location": compact_text(location).lower(),
+            "channels": sorted(channels),
+            "subdomain": compact_text(zendesk_connection_snapshot().get("subdomain")).lower(),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    digest = hashlib.sha256(metadata + b"\0" + content).hexdigest()
+    return f"upload:{digest}"
+
+
 def campaign_summary_from_row(db: sqlite3.Connection, row: sqlite3.Row, include_leads: bool = False) -> Dict[str, Any]:
     email_rows = db.execute(
         "SELECT * FROM campaign_email_leads WHERE campaign_id = ? ORDER BY created_at DESC",
@@ -8414,15 +9042,18 @@ def campaign_summary_from_row(db: sqlite3.Connection, row: sqlite3.Row, include_
     repos_created = sum(item["repo_created"] or 0 for item in deployment_rows)
     pending = max(0, len(deployment_rows) - deployed - reused_deployments - failed)
     ticket_count = sum(1 for item in [*email_rows, *call_rows] if item["ticket_id"])
+    persisted_status = compact_text(row["status"], "ACTIVE").upper()
     status = (
         "COMPLETED" if total_channel_leads and live_channel_leads == total_channel_leads
         else "NEEDS_ATTENTION" if failed
-        else compact_text(row["status"], "ACTIVE").upper() if not total_channel_leads
+        else persisted_status if persisted_status in {"INTAKE_PENDING", "INTAKE_PROCESSING", "INTAKE_PARTIAL", "BLOCKED_SETUP", "IMPORT_QUEUED", "IMPORT_PROCESSING", "IMPORT_FAILED"}
+        else persisted_status if not total_channel_leads
         else "ACTIVE"
     )
 
     result: Dict[str, Any] = {
         "campaignId": row["id"],
+        "idempotencyKey": row["idempotency_key"],
         "campaignName": row["name"],
         "batchId": row["batch_id"],
         "presetId": row["preset_id"],
@@ -8517,10 +9148,13 @@ def campaign_summary_from_row(db: sqlite3.Connection, row: sqlite3.Row, include_
 
 
 @app.get("/api/campaigns")
-def list_campaigns(limit: int = 50):
+def list_campaigns(limit: int = 50, includeLegacy: bool = False):
     safe_limit = max(1, min(limit, 200))
     with get_pipeline_db() as db:
-        rows = db.execute("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT ?", (safe_limit,)).fetchall()
+        where_clause = "" if includeLegacy else "WHERE idempotency_key IS NOT NULL"
+        rows = db.execute(
+            f"SELECT * FROM campaigns {where_clause} ORDER BY created_at DESC LIMIT ?", (safe_limit,)
+        ).fetchall()
         campaigns = [campaign_summary_from_row(db, row) for row in rows]
     totals = {
         "campaigns": len(campaigns),
@@ -8535,6 +9169,8 @@ def list_campaigns(limit: int = 50):
 
 @app.post("/api/campaigns/backfill")
 def backfill_campaigns():
+    if not env_enabled("ENABLE_LEGACY_CAMPAIGN_BACKFILL"):
+        raise HTTPException(status_code=403, detail="Legacy campaign backfill is disabled.")
     stats = backfill_legacy_campaign_data()
     return {"backfill": stats, **list_campaigns(200)}
 
@@ -8542,6 +9178,8 @@ def backfill_campaigns():
 @app.post("/api/campaigns/restore-seed")
 def restore_campaign_seed():
     """Manually retry the safe empty-database restore without overwriting live records."""
+    if not env_enabled("ENABLE_PIPELINE_SEED_RESTORE"):
+        raise HTTPException(status_code=403, detail="Pipeline seed restoration is disabled.")
     result = restore_pipeline_seed_if_empty()
     return {"seed": result, **list_campaigns(200)}
 
@@ -8642,10 +9280,23 @@ def normalize_uploaded_lead(
     source_url = normalize_url(
         uploaded_row_value(row, ["sourceUrl", "source_url", "googleMapsUrl", "google_maps_url", "listingUrl", "url"])
     )
-    source_id = uploaded_row_value(row, ["placeId", "place_id", "cid", "leadKey", "lead_key", "id"])
-    lead_key = compact_text(source_id) or stable_lead_key("upload", row_number, business_name, email, phone, address)
+    source_id = uploaded_row_value(row, ["placeId", "place_id", "googlePlaceId", "google_id", "cid", "fid"])
+    if source_id:
+        canonical_key = stable_lead_key("place", source_id)
+    elif domain:
+        canonical_key = stable_lead_key("domain", business_name, domain)
+    elif email:
+        canonical_key = stable_lead_key("email", business_name, email)
+    elif phone:
+        canonical_key = stable_lead_key("phone", business_name, normalize_phone_identity(phone))
+    elif address:
+        canonical_key = stable_lead_key("address", business_name, address)
+    else:
+        canonical_key = stable_lead_key("business", business_name, location or default_location)
+    lead_key = compact_text(source_id) or canonical_key
     return DiscoveredLead(
         leadKey=lead_key,
+        canonicalLeadKey=canonical_key,
         businessName=business_name,
         email=email,
         phone=phone,
@@ -8701,12 +9352,123 @@ def get_campaign_import_job_or_404(job_id: str) -> sqlite3.Row:
     return row
 
 
+def claim_uploaded_campaign_lead_identity(
+    campaign_id: str,
+    lead: DiscoveredLead,
+) -> Optional[Dict[str, Any]]:
+    canonical_key = lead.canonicalLeadKey or canonical_lead_key_for_lead(lead)
+    identities = lead_identity_pairs(lead)
+    if not identities:
+        identities = [("canonical", f"canonical:{canonical_key}")]
+    identity_keys = [identity_key for _identity_type, identity_key in identities]
+    placeholders = ",".join("?" for _ in identity_keys)
+    timestamp = now_iso()
+
+    with get_pipeline_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        existing = db.execute(
+            f"""
+            SELECT identity_key, canonical_lead_key, campaign_id
+            FROM campaign_lead_identity_claims
+            WHERE identity_key IN ({placeholders})
+            """,
+            tuple(identity_keys),
+        ).fetchall()
+        conflict = next(
+            (
+                row
+                for row in existing
+                if row["campaign_id"] != campaign_id or row["canonical_lead_key"] != canonical_key
+            ),
+            None,
+        )
+        if conflict:
+            return {
+                "canonicalLeadKey": conflict["canonical_lead_key"],
+                "campaignIds": sorted({row["campaign_id"] for row in existing}),
+            }
+        for identity_type, identity_key in identities:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO campaign_lead_identity_claims (
+                    identity_key, identity_type, canonical_lead_key, campaign_id, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (identity_key, identity_type, canonical_key, campaign_id, timestamp, timestamp),
+            )
+    return None
+
+
+def prior_campaign_lead_match(campaign_id: str, lead: DiscoveredLead) -> Optional[Dict[str, Any]]:
+    candidate_key = lead.canonicalLeadKey or canonical_lead_key_for_lead(lead)
+    conflicts = generated_lead_identity_conflicts(lead, candidate_key)
+    conflict_keys = sorted({compact_text(value) for value in conflicts.values() if compact_text(value)})
+    if not conflict_keys:
+        return None
+
+    placeholders = ",".join("?" for _ in conflict_keys)
+    with get_pipeline_db() as db:
+        approvals = db.execute(
+            f"""
+            SELECT id, canonical_lead_key, pipeline_id
+            FROM approval_records
+            WHERE canonical_lead_key IN ({placeholders}) AND status <> 'SUPERSEDED'
+            ORDER BY created_at ASC
+            """,
+            tuple(conflict_keys),
+        ).fetchall()
+
+        prior_approvals = [
+            row
+            for row in approvals
+            if row["canonical_lead_key"] != candidate_key or row["pipeline_id"] != campaign_id
+        ]
+        if not prior_approvals:
+            return None
+
+        approval_ids = [row["id"] for row in prior_approvals]
+        approval_placeholders = ",".join("?" for _ in approval_ids)
+        email_rows = db.execute(
+            f"SELECT campaign_id, approval_id, ticket_id FROM campaign_email_leads WHERE approval_id IN ({approval_placeholders})",
+            tuple(approval_ids),
+        ).fetchall()
+        call_rows = db.execute(
+            f"SELECT campaign_id, approval_id, ticket_id FROM campaign_call_leads WHERE approval_id IN ({approval_placeholders})",
+            tuple(approval_ids),
+        ).fetchall()
+        link_rows = db.execute(
+            f"SELECT approval_id, ticket_id FROM zendesk_ticket_links WHERE approval_id IN ({approval_placeholders}) AND stage = 'intake'",
+            tuple(approval_ids),
+        ).fetchall()
+
+    ticket_ids = sorted(
+        {
+            int(row["ticket_id"])
+            for row in [*email_rows, *call_rows, *link_rows]
+            if row["ticket_id"] is not None
+        }
+    )
+    campaign_ids = sorted(
+        {
+            compact_text(row["campaign_id"])
+            for row in [*email_rows, *call_rows]
+            if compact_text(row["campaign_id"])
+        }
+        or {compact_text(row["pipeline_id"]) for row in prior_approvals if compact_text(row["pipeline_id"])}
+    )
+    return {
+        "canonicalLeadKey": prior_approvals[0]["canonical_lead_key"],
+        "approvalIds": approval_ids,
+        "ticketIds": ticket_ids,
+        "campaignIds": campaign_ids,
+    }
+
+
 def ensure_uploaded_campaign_lead(
     campaign: sqlite3.Row,
     lead: DiscoveredLead,
     channels: List[str],
 ) -> Dict[str, Any]:
-    upsert_lead_registry(lead)
     canonical_key = lead.canonicalLeadKey or canonical_lead_key_for_lead(lead)
     pipeline_id = campaign["id"]
     timestamp = now_iso()
@@ -8729,6 +9491,33 @@ def ensure_uploaded_campaign_lead(
         available.append("phone")
     if not available:
         raise ValueError("The row has no email or phone value for the selected campaign channels.")
+
+    prior = prior_campaign_lead_match(campaign["id"], lead)
+    if prior:
+        return {
+            "canonicalLeadKey": prior["canonicalLeadKey"],
+            "approvalIds": prior["approvalIds"],
+            "ticketIds": prior["ticketIds"],
+            "createdRecords": 0,
+            "skippedDuplicate": True,
+            "duplicateScope": "workspace",
+            "duplicateCampaignIds": prior["campaignIds"],
+        }
+
+    claimed_by = claim_uploaded_campaign_lead_identity(campaign["id"], lead)
+    if claimed_by:
+        prior = prior_campaign_lead_match(campaign["id"], lead) or {}
+        return {
+            "canonicalLeadKey": prior.get("canonicalLeadKey") or claimed_by["canonicalLeadKey"],
+            "approvalIds": prior.get("approvalIds") or [],
+            "ticketIds": prior.get("ticketIds") or [],
+            "createdRecords": 0,
+            "skippedDuplicate": True,
+            "duplicateScope": "workspace",
+            "duplicateCampaignIds": prior.get("campaignIds") or claimed_by["campaignIds"],
+        }
+
+    upsert_lead_registry(lead)
 
     approval_ids: List[str] = []
     ticket_ids: List[int] = []
@@ -8757,6 +9546,9 @@ def ensure_uploaded_campaign_lead(
                 },
                 template=dict(FREEFORM_SITE_SPEC),
                 status="AWAITING_DEPLOYMENT",
+                approval_id=str(
+                    uuid5(NAMESPACE_URL, f"asf:approval:{campaign['id']}:{canonical_key}:{channel}")
+                ),
             )
             deployment_id = str(uuid4())
             fields = {
@@ -8896,7 +9688,7 @@ def refresh_campaign_import_job(job_id: str) -> Dict[str, Any]:
             "UPDATE campaigns SET status = ?, discovered_count = ?, updated_at = ? WHERE id = ?",
             (
                 "ACTIVE" if status == "COMPLETED" else "IMPORT_FAILED" if status == "FAILED" else "IMPORT_PROCESSING",
-                counts.get("COMPLETE", 0) + counts.get("SKIPPED", 0), timestamp, job["campaign_id"],
+                counts.get("COMPLETE", 0), timestamp, job["campaign_id"],
             ),
         )
     refreshed = get_campaign_import_job_or_404(job_id)
@@ -8944,6 +9736,7 @@ async def create_campaign_import(
     ]
     if not selected_channels:
         raise HTTPException(status_code=400, detail="Select email leads, phone leads, or both.")
+    verify_zendesk_ticket_contracts(selected_channels)
     safe_chunk_size = max(1, min(int(chunkSize or 5), 25))
     content = await file.read()
     max_bytes = int(os.getenv("CAMPAIGN_UPLOAD_MAX_BYTES", str(50 * 1024 * 1024)))
@@ -8953,30 +9746,51 @@ async def create_campaign_import(
         raise HTTPException(status_code=413, detail=f"The lead file exceeds the {max_bytes // (1024 * 1024)} MB upload limit.")
     safe_file_name = os.path.basename(file.filename or "leads.csv")
     file_type, rows = parse_uploaded_lead_file(content, safe_file_name)
-    campaign_id = str(uuid4())
-    job_id = str(uuid4())
+    idempotency_key = uploaded_campaign_idempotency_key(
+        content, campaign_name, industry, location, selected_channels
+    )
+    with get_pipeline_db() as db:
+        existing_job = db.execute(
+            """
+            SELECT job.*
+            FROM campaign_import_jobs job
+            JOIN campaigns campaign ON campaign.id = job.campaign_id
+            WHERE campaign.idempotency_key = ?
+            ORDER BY job.created_at ASC LIMIT 1
+            """,
+            (idempotency_key,),
+        ).fetchone()
+    if existing_job:
+        result = campaign_import_job_summary(existing_job)
+        result["idempotentReplay"] = True
+        return result
+
+    campaign_id = str(uuid5(NAMESPACE_URL, idempotency_key))
+    job_id = str(uuid5(NAMESPACE_URL, f"{idempotency_key}:job"))
     extension = os.path.splitext(safe_file_name)[1].lower()
     stored_path = os.path.join(campaign_upload_dir(), f"{job_id}{extension}")
     with open(stored_path, "wb") as upload_file:
         upload_file.write(content)
     timestamp = now_iso()
+    created_job = False
     with get_pipeline_db() as db:
+        db.execute("BEGIN IMMEDIATE")
         db.execute(
             """
-            INSERT INTO campaigns (
-                id, name, batch_id, preset_id, industry, query, location, requested_count,
+            INSERT OR IGNORE INTO campaigns (
+                id, idempotency_key, name, batch_id, preset_id, industry, query, location, requested_count,
                 discovered_count, channel_filter, status, warnings_json, created_at, updated_at
-            ) VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
             """,
             (
-                campaign_id, campaign_name, "uploaded-leads", compact_text(industry, "Local service"),
+                campaign_id, idempotency_key, campaign_name, "uploaded-leads", compact_text(industry, "Local service"),
                 safe_file_name, compact_text(location, "South Africa"), len(rows),
                 ",".join(selected_channels), "IMPORT_QUEUED", "[]", timestamp, timestamp,
             ),
         )
-        db.execute(
+        job_insert = db.execute(
             """
-            INSERT INTO campaign_import_jobs (
+            INSERT OR IGNORE INTO campaign_import_jobs (
                 id, campaign_id, file_name, file_path, file_type, status, total_rows,
                 chunk_size, channels_json, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?)
@@ -8986,15 +9800,28 @@ async def create_campaign_import(
                 safe_chunk_size, json.dumps(selected_channels), timestamp, timestamp,
             ),
         )
-        for index, raw_row in enumerate(rows, start=1):
-            db.execute(
-                """
-                INSERT INTO campaign_import_items (
-                    id, job_id, row_number, raw_json, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?)
-                """,
-                (str(uuid4()), job_id, index, json.dumps(raw_row, default=str), timestamp, timestamp),
-            )
+        created_job = job_insert.rowcount == 1
+        if created_job:
+            for index, raw_row in enumerate(rows, start=1):
+                db.execute(
+                    """
+                    INSERT OR IGNORE INTO campaign_import_items (
+                        id, job_id, row_number, raw_json, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?)
+                    """,
+                    (
+                        str(uuid5(NAMESPACE_URL, f"{job_id}:row:{index}")),
+                        job_id,
+                        index,
+                        json.dumps(raw_row, default=str),
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+    if not created_job:
+        result = campaign_import_job_summary(get_campaign_import_job_or_404(job_id))
+        result["idempotentReplay"] = True
+        return result
     save_pipeline_run(
         pipeline_id=campaign_id,
         status="IMPORT_QUEUED",
@@ -9008,7 +9835,9 @@ async def create_campaign_import(
         created_at=timestamp,
     )
     log_event("info", "campaign.import.queued", "Uploaded campaign queued.", jobId=job_id, campaignId=campaign_id, rows=len(rows))
-    return campaign_import_job_summary(get_campaign_import_job_or_404(job_id))
+    result = campaign_import_job_summary(get_campaign_import_job_or_404(job_id))
+    result["idempotentReplay"] = False
+    return result
 
 
 @app.post("/api/campaigns/imports/{job_id}/process")
@@ -9017,7 +9846,9 @@ def process_campaign_import(job_id: str):
     job = get_campaign_import_job_or_404(job_id)
     if job["status"] == "COMPLETED":
         return campaign_import_job_summary(job)
+    verify_zendesk_ticket_contracts(safe_json_loads(job["channels_json"], ["email", "phone"]))
     with get_pipeline_db() as db:
+        db.execute("BEGIN IMMEDIATE")
         campaign = db.execute("SELECT * FROM campaigns WHERE id = ?", (job["campaign_id"],)).fetchone()
         items = db.execute(
             """
@@ -9091,10 +9922,302 @@ def retry_campaign_import(job_id: str):
 @app.get("/api/campaigns/{campaign_id}")
 def get_campaign(campaign_id: str):
     with get_pipeline_db() as db:
-        row = db.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
+        row = db.execute(
+            "SELECT * FROM campaigns WHERE id = ? AND idempotency_key IS NOT NULL", (campaign_id,)
+        ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Campaign not found.")
         return campaign_summary_from_row(db, row, include_leads=True)
+
+
+def campaign_discovery_plan(campaign: sqlite3.Row) -> Tuple[List[DiscoveredLead], Dict[str, Any]]:
+    batch_id = compact_text(campaign["batch_id"])
+    if not batch_id:
+        raise HTTPException(status_code=409, detail="This uploaded campaign has no discovery batch to reconcile.")
+    with get_pipeline_db() as db:
+        batch = db.execute("SELECT * FROM discovery_batches WHERE batch_id = ?", (batch_id,)).fetchone()
+    if not batch:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "CAMPAIGN_DISCOVERY_PLAN_MISSING",
+                "message": "The saved campaign lead plan is missing; intake cannot be resumed safely.",
+                "campaignId": campaign["id"],
+                "batchId": batch_id,
+            },
+        )
+    leads = [DiscoveredLead(**value) for value in safe_json_loads(batch["leads_json"], [])]
+    snapshot = {
+        "batchId": batch_id,
+        "preset": get_preset_or_404(campaign["preset_id"]),
+        "location": batch["location"],
+        "query": batch["query"],
+        "leads": [lead.model_dump() for lead in leads],
+        "sourceStatus": "SAVED_CAMPAIGN_PLAN",
+        "warnings": safe_json_loads(batch["warnings_json"], []),
+        "provinceStats": safe_json_loads(batch["province_stats_json"], {}),
+        "duplicatesSkipped": batch["duplicates_skipped"] or 0,
+        "requestedCount": campaign["requested_count"],
+        "rawFetched": batch["lead_count"] or len(leads),
+        "eligibleReturned": len(leads),
+        "cached": True,
+    }
+    return leads, snapshot
+
+
+def ensure_discovered_campaign_channel_record(
+    campaign: sqlite3.Row,
+    lead: DiscoveredLead,
+    channel: str,
+) -> sqlite3.Row:
+    campaign_id = campaign["id"]
+    canonical_key = lead.canonicalLeadKey or canonical_lead_key_for_lead(lead)
+    lead.canonicalLeadKey = canonical_key
+    upsert_lead_registry(lead)
+    table = "campaign_email_leads" if channel == "email" else "campaign_call_leads"
+    with get_pipeline_db() as db:
+        existing = db.execute(
+            f"SELECT * FROM {table} WHERE campaign_id = ? AND canonical_lead_key = ?",
+            (campaign_id, canonical_key),
+        ).fetchone()
+    if existing:
+        return existing
+
+    timestamp = now_iso()
+    contact_name = compact_text(first_present(lead.raw or {}, ["contactName", "ownerName", "name"]))
+    context = build_public_lead_context(lead, {}, canonical_key)
+    context.update(
+        {
+            "campaignId": campaign_id,
+            "campaignName": campaign["name"],
+            "batchId": campaign["batch_id"],
+            "industry": compact_text(campaign["industry"], context.get("industry")),
+            "contactName": contact_name,
+            "contactChannel": channel,
+            "intakeDeferred": True,
+        }
+    )
+    approval_id = str(uuid5(NAMESPACE_URL, f"asf:approval:{campaign_id}:{canonical_key}:{channel}"))
+    deployment_id = str(uuid5(NAMESPACE_URL, f"asf:deployment:{campaign_id}:{canonical_key}:{channel}"))
+    channel_lead_id = str(uuid5(NAMESPACE_URL, f"asf:channel-lead:{campaign_id}:{canonical_key}:{channel}"))
+    create_approval_record(
+        pipeline_id=campaign_id,
+        canonical_key=canonical_key,
+        lead_key=lead.leadKey,
+        business_name=lead.businessName,
+        site_html=None,
+        context=context,
+        site_content={
+            "deferredGeneration": True,
+            "message": "AI generation starts only when the deploy_site webhook is requested.",
+        },
+        template=dict(FREEFORM_SITE_SPEC),
+        status="AWAITING_DEPLOYMENT",
+        approval_id=approval_id,
+    )
+    fields = {
+        "campaignId": campaign_id,
+        "campaignName": campaign["name"],
+        "businessName": lead.businessName,
+        "contactName": contact_name,
+        "email": lead.email,
+        "phone": lead.phone,
+        "industry": campaign["industry"],
+        "location": lead.location,
+        "address": lead.address,
+        "sourceUrl": lead.sourceUrl,
+        "channel": channel,
+    }
+    with get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO campaign_deployments (
+                id, campaign_id, canonical_lead_key, approval_id, channel, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'AWAITING_DEPLOYMENT', ?, ?)
+            """,
+            (deployment_id, campaign_id, canonical_key, approval_id, channel, timestamp, timestamp),
+        )
+        if channel == "email":
+            db.execute(
+                """
+                INSERT OR IGNORE INTO campaign_email_leads (
+                    id, campaign_id, canonical_lead_key, approval_id, business_name, contact_name,
+                    email, source_url, status, deployment_id, fields_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'AWAITING_DEPLOYMENT', ?, ?, ?, ?)
+                """,
+                (
+                    channel_lead_id, campaign_id, canonical_key, approval_id, lead.businessName,
+                    contact_name or None, lead.email, lead.sourceUrl, deployment_id,
+                    json.dumps(fields, default=str), timestamp, timestamp,
+                ),
+            )
+        else:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO campaign_call_leads (
+                    id, campaign_id, canonical_lead_key, approval_id, business_name, contact_name,
+                    phone, source_url, status, deployment_id, fields_json, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'AWAITING_DEPLOYMENT', ?, ?, ?, ?)
+                """,
+                (
+                    channel_lead_id, campaign_id, canonical_key, approval_id, lead.businessName,
+                    contact_name or None, lead.phone, lead.sourceUrl, deployment_id,
+                    json.dumps(fields, default=str), timestamp, timestamp,
+                ),
+            )
+        row = db.execute(
+            f"SELECT * FROM {table} WHERE campaign_id = ? AND canonical_lead_key = ?",
+            (campaign_id, canonical_key),
+        ).fetchone()
+    if not row:
+        raise RuntimeError(f"Could not reconcile the local {channel} campaign record.")
+    return row
+
+
+def reconcile_discovered_campaign_intake(campaign_id: str, *, idempotent_replay: bool) -> Dict[str, Any]:
+    with get_pipeline_db() as db:
+        campaign = db.execute(
+            "SELECT * FROM campaigns WHERE id = ? AND idempotency_key IS NOT NULL", (campaign_id,)
+        ).fetchone()
+        if not campaign:
+            raise HTTPException(status_code=404, detail="Campaign not found.")
+        db.execute(
+            "UPDATE campaigns SET status = 'INTAKE_PROCESSING', updated_at = ? WHERE id = ?",
+            (now_iso(), campaign_id),
+        )
+    leads, discovery_snapshot = campaign_discovery_plan(campaign)
+    channels = [value for value in compact_text(campaign["channel_filter"]).split(",") if value]
+    warnings = [
+        value
+        for value in safe_json_loads(campaign["warnings_json"], [])
+        if not compact_text(value).startswith("Zendesk intake failed for ")
+    ]
+    expected_count = 0
+    ready_count = 0
+    errors: List[str] = []
+    synced = 0
+
+    for lead in leads:
+        available: List[str] = []
+        if normalize_email_identity(lead.email) and "email" in channels:
+            available.append("email")
+        if compact_text(lead.phone) and "phone" in channels:
+            available.append("phone")
+        for channel in available:
+            expected_count += 1
+            row = ensure_discovered_campaign_channel_record(campaign, lead, channel)
+            approval = get_approval_or_404(row["approval_id"])
+            context = safe_json_loads(approval["context_json"], {})
+            table = "campaign_email_leads" if channel == "email" else "campaign_call_leads"
+            try:
+                tickets = create_zendesk_intake_tickets(
+                    approval_id=row["approval_id"],
+                    context=context,
+                    pipeline_id=campaign_id,
+                    batch_id=campaign["batch_id"],
+                    requested_channels=[channel],
+                )
+                ticket_id = tickets[0].get("ticketId") if tickets else None
+                if not ticket_id:
+                    raise RuntimeError(f"Zendesk did not return a ticket ID for the {channel} lead.")
+                with get_pipeline_db() as db:
+                    db.execute(
+                        f"UPDATE {table} SET ticket_id = ?, status = 'TICKET_READY', updated_at = ? WHERE id = ?",
+                        (ticket_id, now_iso(), row["id"]),
+                    )
+                    db.execute(
+                        "UPDATE campaign_deployments SET error = NULL, updated_at = ? WHERE approval_id = ?",
+                        (now_iso(), row["approval_id"]),
+                    )
+                ready_count += 1
+                if not row["ticket_id"]:
+                    synced += 1
+            except Exception as error:
+                message = f"Zendesk intake failed for {lead.businessName} ({channel}): {sanitize_message(error)}"
+                errors.append(message)
+                with get_pipeline_db() as db:
+                    db.execute(
+                        "UPDATE campaign_deployments SET error = ?, updated_at = ? WHERE approval_id = ?",
+                        (sanitize_message(error), now_iso(), row["approval_id"]),
+                    )
+
+    with get_pipeline_db() as db:
+        db.execute("BEGIN IMMEDIATE")
+        db.execute(
+            """
+            UPDATE campaign_deployments
+            SET error = NULL, updated_at = ?
+            WHERE campaign_id = ? AND approval_id IN (
+                SELECT approval_id FROM campaign_email_leads
+                WHERE campaign_id = ? AND ticket_id IS NOT NULL
+                UNION
+                SELECT approval_id FROM campaign_call_leads
+                WHERE campaign_id = ? AND ticket_id IS NOT NULL
+            )
+            """,
+            (now_iso(), campaign_id, campaign_id, campaign_id),
+        )
+        ready_count = db.execute(
+            """
+            SELECT COUNT(*) AS count FROM (
+                SELECT id FROM campaign_email_leads WHERE campaign_id = ? AND ticket_id IS NOT NULL
+                UNION ALL
+                SELECT id FROM campaign_call_leads WHERE campaign_id = ? AND ticket_id IS NOT NULL
+            )
+            """,
+            (campaign_id, campaign_id),
+        ).fetchone()["count"]
+        unresolved = db.execute(
+            """
+            SELECT d.channel, d.error, COALESCE(e.business_name, c.business_name, d.canonical_lead_key) AS business_name
+            FROM campaign_deployments d
+            LEFT JOIN campaign_email_leads e ON e.approval_id = d.approval_id
+            LEFT JOIN campaign_call_leads c ON c.approval_id = d.approval_id
+            WHERE d.campaign_id = ? AND d.error IS NOT NULL
+              AND COALESCE(e.ticket_id, c.ticket_id) IS NULL
+            ORDER BY d.created_at
+            """,
+            (campaign_id,),
+        ).fetchall()
+        errors = [
+            f"Zendesk intake failed for {row['business_name']} ({row['channel']}): {row['error']}"
+            for row in unresolved
+        ]
+        warnings = [*warnings, *errors]
+        pending_count = max(0, expected_count - ready_count)
+        status = "ACTIVE" if pending_count == 0 else "INTAKE_PARTIAL"
+        timestamp = now_iso()
+        db.execute(
+            """
+            INSERT INTO pipeline_runs (
+                pipeline_id, status, template_id, source_batch_id, created_at, updated_at,
+                lead_count, completed_count, pending_count, failed_count, warnings_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(pipeline_id) DO UPDATE SET
+                status = excluded.status,
+                updated_at = excluded.updated_at,
+                lead_count = excluded.lead_count,
+                completed_count = excluded.completed_count,
+                pending_count = excluded.pending_count,
+                failed_count = excluded.failed_count,
+                warnings_json = excluded.warnings_json
+            """,
+            (
+                campaign_id, status, FREEFORM_TEMPLATE_ID, campaign["batch_id"], campaign["created_at"],
+                timestamp, expected_count, ready_count, pending_count, len(errors),
+                json.dumps(warnings, default=str),
+            ),
+        )
+        db.execute(
+            "UPDATE campaigns SET status = ?, warnings_json = ?, updated_at = ? WHERE id = ?",
+            (status, json.dumps(warnings, default=str), timestamp, campaign_id),
+        )
+        campaign = db.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
+        result = campaign_summary_from_row(db, campaign, include_leads=True)
+    result["discovery"] = discovery_snapshot
+    result["idempotentReplay"] = idempotent_replay
+    result["sync"] = {"synced": synced, "errors": errors, "pending": pending_count}
+    return result
 
 
 @app.post("/api/campaigns/intake")
@@ -9113,6 +10236,15 @@ def create_campaign_intake(request: CampaignIntakeRequest):
             detail="Campaigns cannot run in local-only mode. Zendesk ticket creation is required.",
         )
 
+    verify_zendesk_ticket_contracts(channels)
+    idempotency_key = campaign_request_idempotency_key(request, channels)
+    with get_pipeline_db() as db:
+        existing_campaign = db.execute(
+            "SELECT * FROM campaigns WHERE idempotency_key = ?", (idempotency_key,)
+        ).fetchone()
+    if existing_campaign:
+        return reconcile_discovered_campaign_intake(existing_campaign["id"], idempotent_replay=True)
+
     discovery = discover_leads(
         DiscoverLeadsRequest(
             presetId=request.presetId,
@@ -9122,174 +10254,48 @@ def create_campaign_intake(request: CampaignIntakeRequest):
             forceRefresh=request.forceRefresh,
         )
     )
-    campaign_id = str(uuid4())
-    pipeline_id = campaign_id
+    campaign_id = str(uuid5(NAMESPACE_URL, idempotency_key))
     timestamp = now_iso()
     industry = compact_text(request.industry, discovery.preset.get("industry", "Local service"))
-    warnings = list(discovery.warnings)
+    raced_campaign_id: Optional[str] = None
     with get_pipeline_db() as db:
-        db.execute(
+        insert = db.execute(
             """
-            INSERT INTO campaigns (
-                id, name, batch_id, preset_id, industry, query, location, requested_count,
+            INSERT OR IGNORE INTO campaigns (
+                id, idempotency_key, name, batch_id, preset_id, industry, query, location, requested_count,
                 discovered_count, channel_filter, status, warnings_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'INTAKE_PENDING', ?, ?, ?)
             """,
             (
-                campaign_id, campaign_name, discovery.batchId, request.presetId, industry,
-                discovery.query, discovery.location, request.limit, len(discovery.leads),
-                ",".join(channels), "INTAKE_READY", json.dumps(warnings, default=str), timestamp, timestamp,
+                campaign_id, idempotency_key, campaign_name, discovery.batchId, request.presetId, industry,
+                discovery.query, discovery.location, request.limit, len(discovery.leads), ",".join(channels),
+                json.dumps(discovery.warnings, default=str), timestamp, timestamp,
             ),
         )
-
-    channel_records = 0
-    zendesk_connected = zendesk_connection_snapshot()["connected"]
-    for lead in discovery.leads:
-        canonical_key = lead.canonicalLeadKey or canonical_lead_key_for_lead(lead)
-        context = build_public_lead_context(lead, {}, canonical_key)
-        contact_name = compact_text(first_present(lead.raw or {}, ["contactName", "ownerName", "name"]))
-        context.update(
-            {
-                "campaignId": campaign_id,
-                "campaignName": campaign_name,
-                "batchId": discovery.batchId,
-                "industry": industry or context.get("industry"),
-                "contactName": contact_name,
-                "intakeDeferred": True,
-            }
-        )
-        available = []
-        if normalize_email_identity(lead.email) and "email" in channels:
-            available.append("email")
-        if compact_text(lead.phone) and "phone" in channels:
-            available.append("phone")
-
-        for channel in available:
-            channel_context = {**context, "contactChannel": channel}
-            approval_id = create_approval_record(
-                pipeline_id=pipeline_id,
-                canonical_key=canonical_key,
-                lead_key=lead.leadKey,
-                business_name=lead.businessName,
-                site_html=None,
-                context=channel_context,
-                site_content={
-                    "deferredGeneration": True,
-                    "message": "AI generation starts only when the deploy_site webhook is requested.",
-                },
-                template=dict(FREEFORM_SITE_SPEC),
-                status="AWAITING_DEPLOYMENT",
-            )
-            channel_lead_id = str(uuid4())
-            campaign_deployment_id = str(uuid4())
-            field_values = {
-                "campaignId": campaign_id,
-                "campaignName": campaign_name,
-                "businessName": lead.businessName,
-                "contactName": contact_name,
-                "email": lead.email,
-                "phone": lead.phone,
-                "industry": industry,
-                "location": lead.location,
-                "address": lead.address,
-                "sourceUrl": lead.sourceUrl,
-                "channel": channel,
-            }
-            with get_pipeline_db() as db:
-                db.execute(
-                    """
-                    INSERT INTO campaign_deployments (
-                        id, campaign_id, canonical_lead_key, approval_id, channel, status,
-                        created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (campaign_deployment_id, campaign_id, canonical_key, approval_id, channel, "AWAITING_DEPLOYMENT", timestamp, timestamp),
-                )
-                if channel == "email":
-                    db.execute(
-                        """
-                        INSERT INTO campaign_email_leads (
-                            id, campaign_id, canonical_lead_key, approval_id, business_name,
-                            contact_name, email, source_url, status, deployment_id, fields_json,
-                            created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            channel_lead_id, campaign_id, canonical_key, approval_id, lead.businessName,
-                            contact_name or None, lead.email, lead.sourceUrl, "AWAITING_DEPLOYMENT",
-                            campaign_deployment_id, json.dumps(field_values, default=str), timestamp, timestamp,
-                        ),
-                    )
-                else:
-                    db.execute(
-                        """
-                        INSERT INTO campaign_call_leads (
-                            id, campaign_id, canonical_lead_key, approval_id, business_name,
-                            contact_name, phone, source_url, status, deployment_id, fields_json,
-                            created_at, updated_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (
-                            channel_lead_id, campaign_id, canonical_key, approval_id, lead.businessName,
-                            contact_name or None, lead.phone, lead.sourceUrl, "AWAITING_DEPLOYMENT",
-                            campaign_deployment_id, json.dumps(field_values, default=str), timestamp, timestamp,
-                        ),
-                    )
-            channel_records += 1
-
-            if request.syncZendesk and zendesk_connected:
-                try:
-                    tickets = create_zendesk_intake_tickets(
-                        approval_id=approval_id,
-                        context=channel_context,
-                        pipeline_id=pipeline_id,
-                        batch_id=discovery.batchId,
-                        requested_channels=[channel],
-                    )
-                    ticket_id = tickets[0].get("ticketId") if tickets else None
-                    if ticket_id:
-                        table = "campaign_email_leads" if channel == "email" else "campaign_call_leads"
-                        with get_pipeline_db() as db:
-                            db.execute(
-                                f"UPDATE {table} SET ticket_id = ?, status = ?, updated_at = ? WHERE approval_id = ?",
-                                (ticket_id, "TICKET_READY", now_iso(), approval_id),
-                            )
-                except Exception as error:
-                    warnings.append(f"Zendesk intake failed for {lead.businessName} ({channel}): {sanitize_message(error)}")
-
-    if request.syncZendesk and not zendesk_connected:
-        warnings.append("Zendesk is not connected. Leads were saved locally and can be synced after connection.")
-
-    save_pipeline_run(
-        pipeline_id=pipeline_id,
-        status="INTAKE_READY",
-        template_id=FREEFORM_TEMPLATE_ID,
-        source_batch_id=discovery.batchId,
-        lead_count=channel_records,
-        completed_count=0,
-        pending_count=channel_records,
-        failed_count=0,
-        warnings=warnings,
-        created_at=timestamp,
-    )
-    with get_pipeline_db() as db:
-        db.execute(
-            "UPDATE campaigns SET status = ?, warnings_json = ?, updated_at = ? WHERE id = ?",
-            ("ACTIVE", json.dumps(warnings, default=str), now_iso(), campaign_id),
-        )
-        campaign_row = db.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
-        result = campaign_summary_from_row(db, campaign_row, include_leads=True)
-    result["discovery"] = discovery.model_dump()
-    return result
+        if insert.rowcount == 0:
+            existing_campaign = db.execute(
+                "SELECT * FROM campaigns WHERE idempotency_key = ?", (idempotency_key,)
+            ).fetchone()
+            if existing_campaign:
+                raced_campaign_id = existing_campaign["id"]
+    if raced_campaign_id:
+        return reconcile_discovered_campaign_intake(raced_campaign_id, idempotent_replay=True)
+    return reconcile_discovered_campaign_intake(campaign_id, idempotent_replay=False)
 
 
 @app.post("/api/campaigns/{campaign_id}/sync-zendesk")
 def sync_campaign_to_zendesk(campaign_id: str):
     require_zendesk_workspace_ready()
+    discovery_campaign = False
     with get_pipeline_db() as db:
-        campaign = db.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
+        campaign = db.execute(
+            "SELECT * FROM campaigns WHERE id = ? AND idempotency_key IS NOT NULL", (campaign_id,)
+        ).fetchone()
         if not campaign:
             raise HTTPException(status_code=404, detail="Campaign not found.")
+        campaign_channels = [value for value in compact_text(campaign["channel_filter"]).split(",") if value]
+        verify_zendesk_ticket_contracts(campaign_channels)
+        discovery_campaign = bool(compact_text(campaign["batch_id"]))
         email_rows = db.execute(
             "SELECT * FROM campaign_email_leads WHERE campaign_id = ? AND ticket_id IS NULL",
             (campaign_id,),
@@ -9298,6 +10304,9 @@ def sync_campaign_to_zendesk(campaign_id: str):
             "SELECT * FROM campaign_call_leads WHERE campaign_id = ? AND ticket_id IS NULL",
             (campaign_id,),
         ).fetchall()
+
+    if discovery_campaign:
+        return reconcile_discovered_campaign_intake(campaign_id, idempotent_replay=True)
 
     synced = 0
     errors: List[str] = []
@@ -11028,6 +12037,14 @@ def get_lead(lead_id: str):
 
 @app.post("/api/zendesk/sync-lead")
 def sync_lead_to_zendesk(request: ZendeskSyncRequest):
+    if not env_enabled("ENABLE_LEGACY_ZENDESK_SYNC"):
+        raise HTTPException(
+            status_code=410,
+            detail={
+                "code": "LEGACY_ZENDESK_SYNC_DISABLED",
+                "message": "Use named campaign intake so every ticket has managed routing, fields, and idempotency.",
+            },
+        )
     log_event("info", "zendesk.sync.start", "Zendesk lead sync started.", leadId=request.leadId, businessName=request.businessName, email=request.email)
     zendesk_subdomain = os.getenv("ZENDESK_SUBDOMAIN")
     zendesk_email = os.getenv("ZENDESK_EMAIL")

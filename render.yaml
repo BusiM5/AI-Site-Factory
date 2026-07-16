@@ -2,12 +2,20 @@ services:
   - type: web
     name: ai-site-factory-backend
     runtime: python
-    plan: free
+    plan: starter
     buildCommand: pip install -r backend/requirements.txt
     startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
+    disk:
+      name: ai-site-factory-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: PIPELINE_DB_PATH
-        value: /opt/render/project/src/backend/data/pipeline.db
+        value: /var/data/pipeline.db
+      - key: CAMPAIGN_UPLOAD_DIR
+        value: /var/data/uploads
+      - key: ENABLE_ZENDESK_CONFIG_BOOTSTRAP
+        value: "true"
       - key: GITHUB_REPO_PRIVATE
         value: "false"
       - key: NETLIFY_DEPLOY_POLL_SECONDS
