@@ -1732,9 +1732,16 @@ def restore_pipeline_seed_if_empty() -> Dict[str, Any]:
     return result
 
 
+def pipeline_seed_restore_enabled() -> bool:
+    """Honor an explicit flag, otherwise enable the safe empty-DB restore on Render."""
+    if os.getenv("ENABLE_PIPELINE_SEED_RESTORE") is not None:
+        return env_enabled("ENABLE_PIPELINE_SEED_RESTORE")
+    return env_enabled("RENDER")
+
+
 def bootstrap_pipeline_seed_on_startup() -> Dict[str, Any]:
-    """Restore historical app data at startup only for explicitly opted-in deployments."""
-    if not env_enabled("ENABLE_PIPELINE_SEED_RESTORE"):
+    """Restore historical app data for opted-in or Render-hosted deployments."""
+    if not pipeline_seed_restore_enabled():
         return {"restored": False, "reason": "pipeline_seed_restore_disabled"}
     return restore_pipeline_seed_if_empty()
 
@@ -9648,7 +9655,7 @@ def backfill_campaigns():
 @app.post("/api/campaigns/restore-seed")
 def restore_campaign_seed():
     """Manually retry the safe empty-database restore without overwriting live records."""
-    if not env_enabled("ENABLE_PIPELINE_SEED_RESTORE"):
+    if not pipeline_seed_restore_enabled():
         raise HTTPException(status_code=403, detail="Pipeline seed restoration is disabled.")
     result = restore_pipeline_seed_if_empty()
     return {"seed": result, **list_campaigns(200)}

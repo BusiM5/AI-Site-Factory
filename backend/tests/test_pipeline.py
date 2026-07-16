@@ -219,6 +219,7 @@ def test_empty_deployment_bootstraps_only_zendesk_config(monkeypatch):
 
 def test_startup_pipeline_seed_restore_is_opt_in(monkeypatch):
     monkeypatch.delenv("ENABLE_PIPELINE_SEED_RESTORE", raising=False)
+    monkeypatch.delenv("RENDER", raising=False)
     monkeypatch.setattr(
         main,
         "restore_pipeline_seed_if_empty",
@@ -234,6 +235,15 @@ def test_startup_pipeline_seed_restore_is_opt_in(monkeypatch):
 def test_startup_pipeline_seed_restore_runs_when_enabled(monkeypatch):
     expected = {"restored": True, "reason": "seed_restored"}
     monkeypatch.setenv("ENABLE_PIPELINE_SEED_RESTORE", "true")
+    monkeypatch.setattr(main, "restore_pipeline_seed_if_empty", lambda: expected)
+
+    assert main.bootstrap_pipeline_seed_on_startup() == expected
+
+
+def test_startup_pipeline_seed_restore_defaults_on_for_render(monkeypatch):
+    expected = {"restored": True, "reason": "seed_restored"}
+    monkeypatch.delenv("ENABLE_PIPELINE_SEED_RESTORE", raising=False)
+    monkeypatch.setenv("RENDER", "true")
     monkeypatch.setattr(main, "restore_pipeline_seed_if_empty", lambda: expected)
 
     assert main.bootstrap_pipeline_seed_on_startup() == expected
