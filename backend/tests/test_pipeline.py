@@ -187,7 +187,7 @@ def test_empty_deployment_restores_previous_application_data():
     assert first_restore["restoredCounts"]["campaign_call_leads"] == 17
     assert first_restore["restoredCounts"]["campaign_deployments"] == 17
 
-    response = client.get("/api/campaigns?limit=200&includeLegacy=true")
+    response = client.get("/api/campaigns?limit=200")
     assert response.status_code == 200
     payload = response.json()
     assert payload["totals"]["campaigns"] == 37

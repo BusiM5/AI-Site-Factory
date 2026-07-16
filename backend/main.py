@@ -9625,7 +9625,7 @@ def campaign_summary_from_row(db: sqlite3.Connection, row: sqlite3.Row, include_
 
 
 @app.get("/api/campaigns")
-def list_campaigns(limit: int = 50, includeLegacy: bool = False):
+def list_campaigns(limit: int = 50, includeLegacy: bool = True):
     safe_limit = max(1, min(limit, 200))
     with get_pipeline_db() as db:
         where_clause = "" if includeLegacy else "WHERE idempotency_key IS NOT NULL"
