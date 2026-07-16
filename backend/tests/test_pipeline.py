@@ -1194,6 +1194,7 @@ def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
     monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
     main.save_zendesk_field_settings({"approvalId": "2001", "contactChannel": "2002"})
     ticket_posts = []
+    ticket_headers = []
 
     def fake_post(url, json=None, auth=None, headers=None, timeout=None):
         if url.endswith("/organizations.json"):
@@ -1202,6 +1203,7 @@ def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
             return FakeResponse(201, {"user": {"id": 77, "email": "alpha@example.com"}})
         if url.endswith("/tickets.json"):
             ticket_posts.append(json["ticket"])
+            ticket_headers.append(headers)
             return FakeResponse(201, {"ticket": {"id": 900 + len(ticket_posts), "status": "new"}})
         raise AssertionError(url)
 
@@ -1228,7 +1230,12 @@ def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
     assert len(first) == 2
     assert len(second) == 2
     assert len(ticket_posts) == 2
-    assert {ticket["tags"][2] for ticket in ticket_posts} == {"ai_site_email_lead", "ai_site_phone_lead"}
+    assert {next(tag for tag in ticket["tags"] if tag in {"ai_site_email_lead", "ai_site_phone_lead"}) for ticket in ticket_posts} == {"ai_site_email_lead", "ai_site_phone_lead"}
+    assert all("asf_managed" in ticket["tags"] for ticket in ticket_posts)
+    assert {headers["Idempotency-Key"] for headers in ticket_headers} == {
+        "asf-approval-intake-email",
+        "asf-approval-intake-phone",
+    }
     assert ticket_posts[0]["custom_fields"]
 
 
@@ -1435,6 +1442,10 @@ def test_campaign_intake_splits_email_and_call_records_without_generation(monkey
     monkeypatch.setattr(main, "compact_lead_with_groq", lambda *args: model_calls.append("groq"))
     monkeypatch.setattr(main, "generate_final_html_with_gemini", lambda *args: model_calls.append("gemini"))
     monkeypatch.setattr(main, "export_site_to_github", lambda *args, **kwargs: model_calls.append("github"))
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "zendesk_connection_snapshot", lambda: {"connected": True, "workspaceReady": True})
+    ticket_ids = iter([7301, 7302])
+    monkeypatch.setattr(main, "create_zendesk_intake_tickets", lambda **kwargs: [{"ticketId": next(ticket_ids)}])
 
     response = client.post(
         "/api/campaigns/intake",
@@ -1445,7 +1456,7 @@ def test_campaign_intake_splits_email_and_call_records_without_generation(monkey
             "location": "Durban, South Africa",
             "limit": 1,
             "channels": ["email", "phone"],
-            "syncZendesk": False,
+            "syncZendesk": True,
         },
     )
 
@@ -1455,9 +1466,73 @@ def test_campaign_intake_splits_email_and_call_records_without_generation(monkey
     assert payload["metrics"]["callLeads"] == 1
     assert payload["metrics"]["aiGenerations"] == 0
     assert payload["metrics"]["reposCreated"] == 0
-    assert payload["emailLeads"][0]["status"] == "AWAITING_DEPLOYMENT"
-    assert payload["callLeads"][0]["status"] == "AWAITING_DEPLOYMENT"
+    assert payload["emailLeads"][0]["status"] == "TICKET_READY"
+    assert payload["callLeads"][0]["status"] == "TICKET_READY"
     assert model_calls == []
+
+
+def test_campaign_creation_is_locked_until_zendesk_workspace_is_provisioned():
+    response = client.post(
+        "/api/campaigns/intake",
+        json={
+            "campaignName": "Locked campaign",
+            "presetId": "plumbers",
+            "location": "Durban",
+            "limit": 1,
+            "channels": ["email"],
+            "syncZendesk": True,
+        },
+    )
+
+    assert response.status_code == 409
+    assert response.json()["detail"]["code"] == "ZENDESK_SETUP_REQUIRED"
+
+
+def test_uploaded_campaign_processes_durable_chunks_without_generating_sites(monkeypatch):
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    ticket_ids = iter([8101, 8102])
+    monkeypatch.setattr(main, "create_zendesk_intake_tickets", lambda **kwargs: [{"ticketId": next(ticket_ids)}])
+    monkeypatch.setattr(main, "compact_lead_with_groq", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("AI must wait for deploy_site")))
+    monkeypatch.setattr(main, "generate_final_html_with_gemini", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("AI must wait for deploy_site")))
+    monkeypatch.setattr(main, "export_site_to_github", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("GitHub must wait for deploy_site")))
+
+    csv_data = (
+        "businessName,email,phone,industry,location,sourceUrl\n"
+        "Email Lead,email@example.com,,Plumbing,Durban,https://maps.example.com/email\n"
+        "Call Lead,,+27 31 555 0123,Plumbing,Durban,https://maps.example.com/call\n"
+    )
+    queued = client.post(
+        "/api/campaigns/import",
+        data={
+            "campaignName": "Uploaded leads",
+            "industry": "Plumbing",
+            "location": "Durban",
+            "channels": "email,phone",
+            "chunkSize": "1",
+        },
+        files={"file": ("leads.csv", csv_data, "text/csv")},
+    )
+
+    assert queued.status_code == 200, queued.text
+    job = queued.json()
+    assert job["status"] == "QUEUED"
+    assert job["fileRetained"] is True
+    assert job["totalRows"] == 2
+
+    first = client.post(f"/api/campaigns/imports/{job['jobId']}/process")
+    assert first.status_code == 200, first.text
+    assert first.json()["processedRows"] == 1
+    assert first.json()["fileRetained"] is True
+
+    second = client.post(f"/api/campaigns/imports/{job['jobId']}/process")
+    assert second.status_code == 200, second.text
+    completed = second.json()
+    assert completed["status"] == "COMPLETED"
+    assert completed["fileRetained"] is False
+    assert completed["succeededRows"] == 2
+    assert completed["campaign"]["metrics"]["emailLeads"] == 1
+    assert completed["campaign"]["metrics"]["callLeads"] == 1
+    assert completed["campaign"]["metrics"]["aiGenerations"] == 0
 
 
 def test_campaign_deploy_webhook_generates_once_then_deploys(monkeypatch):
@@ -1467,6 +1542,10 @@ def test_campaign_deploy_webhook_generates_once_then_deploys(monkeypatch):
     model_calls, export_calls = stub_generation(monkeypatch)
     monkeypatch.setattr(main, "deploy_github_repo_to_netlify_for_lead", fake_git_deploy_with_history)
     monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "campaign-webhook-secret")
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "zendesk_connection_snapshot", lambda: {"connected": True, "workspaceReady": True})
+    monkeypatch.setattr(main, "create_zendesk_intake_tickets", lambda **kwargs: [{"ticketId": 7401}])
+    monkeypatch.setattr(main, "update_zendesk_deployment_lifecycle", lambda *args, **kwargs: None)
 
     campaign = client.post(
         "/api/campaigns/intake",
@@ -1476,7 +1555,7 @@ def test_campaign_deploy_webhook_generates_once_then_deploys(monkeypatch):
             "location": "Durban, South Africa",
             "limit": 1,
             "channels": ["email"],
-            "syncZendesk": False,
+            "syncZendesk": True,
         },
     ).json()
     approval_id = campaign["emailLeads"][0]["approvalId"]

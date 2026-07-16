@@ -14,6 +14,7 @@ import {
   Eye,
   GitBranch,
   LayoutDashboard,
+  Lock,
   Mail,
   MapPin,
   Phone,
@@ -24,6 +25,7 @@ import {
   ShieldCheck,
   TicketCheck,
   Unplug,
+  Upload,
   UsersRound,
   Webhook,
   WandSparkles,
@@ -47,9 +49,9 @@ const FALLBACK_PRESETS = [
 
 const NAV_ITEMS = [
   { to: "/overview", label: "Overview", icon: LayoutDashboard },
-  { to: "/campaigns", label: "New campaign", icon: Plus },
-  { to: "/leads", label: "Lead workspace", icon: UsersRound },
-  { to: "/deployments", label: "Deployments", icon: Rocket },
+  { to: "/campaigns", label: "New campaign", icon: Plus, requiresSetup: true },
+  { to: "/leads", label: "Lead workspace", icon: UsersRound, requiresSetup: true },
+  { to: "/deployments", label: "Deployments", icon: Rocket, requiresSetup: true },
   { to: "/zendesk", label: "Zendesk setup", icon: Settings2 },
 ];
 
@@ -123,6 +125,25 @@ function EmptyState({ icon: Icon = Database, title, text }) {
       <p>{text}</p>
     </div>
   );
+}
+
+function WorkspaceLocked({ connection }) {
+  return (
+    <div className="workspace-locked">
+      <div><Lock size={28} /></div>
+      <span className="eyebrow">Zendesk required</span>
+      <h2>Finish the Zendesk workspace setup first.</h2>
+      <p>
+        Campaigns cannot be stored in an offline queue. Connect the instance, select an existing brand,
+        and provision the managed fields and Email/Call forms before this workspace becomes available.
+      </p>
+      <NavLink className="primary-button" to="/zendesk"><Settings2 size={17} />{connection.connected ? "Finish Zendesk setup" : "Connect Zendesk"}</NavLink>
+    </div>
+  );
+}
+
+function SetupGuard({ connection, children }) {
+  return connection.workspaceReady ? children : <WorkspaceLocked connection={connection} />;
 }
 
 function MetricCard({ icon: Icon, label, value, note, tone = "blue" }) {
@@ -280,7 +301,6 @@ function CampaignForm({ presets, connection, onCreated }) {
     limit: 10,
     email: true,
     phone: true,
-    syncZendesk: true,
     forceRefresh: false,
   });
   const [busy, setBusy] = useState(false);
@@ -311,7 +331,7 @@ function CampaignForm({ presets, connection, onCreated }) {
         limit: Number(form.limit),
         channels: [form.email && "email", form.phone && "phone"].filter(Boolean),
         forceRefresh: form.forceRefresh,
-        syncZendesk: form.syncZendesk,
+        syncZendesk: true,
       }, { timeout: 900000 });
       onCreated(data);
       setForm((current) => ({ ...current, campaignName: "", forceRefresh: false }));
@@ -338,29 +358,123 @@ function CampaignForm({ presets, connection, onCreated }) {
       <div className="form-grid three">
         <label>Industry<input value={form.industry} onChange={(event) => update({ industry: event.target.value })} /></label>
         <label>Search intent<input value={form.query} onChange={(event) => update({ query: event.target.value })} placeholder="e.g. emergency services" /></label>
-        <label>Lead target<input type="number" min="1" max="10000" value={form.limit} onChange={(event) => update({ limit: Math.max(1, Math.min(10000, Number(event.target.value) || 1)) })} /></label>
+        <label>Lead target<input type="number" min="1" value={form.limit} onChange={(event) => update({ limit: Math.max(1, Number(event.target.value) || 1) })} /></label>
       </div>
       <div className="channel-choice">
         <label className={form.email ? "checked" : ""}><input type="checkbox" checked={form.email} onChange={(event) => update({ email: event.target.checked })} /><Mail size={20} /><span><strong>Email leads</strong><small>Email form + email send checkbox</small></span></label>
         <label className={form.phone ? "checked" : ""}><input type="checkbox" checked={form.phone} onChange={(event) => update({ phone: event.target.checked })} /><Phone size={20} /><span><strong>Call leads</strong><small>Phone form + call status field</small></span></label>
       </div>
       <div className="form-options">
-        <label><input type="checkbox" checked={form.syncZendesk} onChange={(event) => update({ syncZendesk: event.target.checked })} />Create Zendesk intake tickets</label>
+        <label><input type="checkbox" checked readOnly />Create Zendesk intake tickets (required)</label>
         <label><input type="checkbox" checked={form.forceRefresh} onChange={(event) => update({ forceRefresh: event.target.checked })} />Force a fresh Apify run</label>
       </div>
       <div className="deferred-note"><Zap size={22} /><div><strong>Cost-safe by design</strong><p>This step finds and tags leads only. Gemini, GitHub, and Netlify are not called until an agent requests deployment.</p></div></div>
-      {!connection.connected && form.syncZendesk && <div className="inline-alert warning">Zendesk is not connected. The campaign will still be saved locally and can be synced later.</div>}
       {error && <div className="inline-alert danger">{error}</div>}
-      <div className="form-submit"><button className="primary-button" type="submit" disabled={busy}>{busy ? <><RefreshCw className="spin" size={18} />Finding leads…</> : <><Rocket size={18} />Launch campaign</>}</button><span>Supports 1 to 10,000 requested leads.</span></div>
+      <div className="form-submit"><button className="primary-button" type="submit" disabled={busy || !connection.workspaceReady}>{busy ? <><RefreshCw className="spin" size={18} />Finding leads…</> : <><Rocket size={18} />Launch campaign</>}</button><span>Lead target is dynamic; Zendesk tickets are created before the workspace opens.</span></div>
+    </form>
+  );
+}
+
+function UploadCampaignForm({ connection, onCreated }) {
+  const [form, setForm] = useState({ campaignName: "", industry: "Local service", location: "South Africa", email: true, phone: true, chunkSize: 5 });
+  const [file, setFile] = useState(null);
+  const [job, setJob] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const update = (patch) => setForm((current) => ({ ...current, ...patch }));
+
+  useEffect(() => {
+    if (!connection.workspaceReady) return;
+    axios.get(`${API_BASE}/api/campaigns/imports?limit=10`, { timeout: 20000 })
+      .then(({ data }) => {
+        const active = (data.jobs || []).find((item) => !["COMPLETED"].includes(item.status));
+        if (active) setJob(active);
+      })
+      .catch(() => {});
+  }, [connection.workspaceReady]);
+
+  const drainJob = async (jobId) => {
+    setBusy(true); setError("");
+    try {
+      let current = job?.jobId === jobId ? job : null;
+      while (!current || !["COMPLETED", "FAILED"].includes(current.status)) {
+        const response = await axios.post(`${API_BASE}/api/campaigns/imports/${jobId}/process`, {}, { timeout: 300000 });
+        current = response.data; setJob(current);
+      }
+      if (current.status === "COMPLETED") {
+        onCreated(current.campaign);
+        setFile(null);
+        setForm((value) => ({ ...value, campaignName: "" }));
+      }
+    } catch (requestError) {
+      setError(`${errorMessage(requestError)} The import is saved and can be resumed.`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const submit = async (event) => {
+    event.preventDefault(); setError("");
+    if (!file) { setError("Choose a CSV, JSON, or JSONL lead file."); return; }
+    if (!form.email && !form.phone) { setError("Select at least one lead channel."); return; }
+    setBusy(true);
+    try {
+      const payload = new FormData();
+      payload.append("file", file);
+      payload.append("campaignName", form.campaignName);
+      payload.append("industry", form.industry);
+      payload.append("location", form.location);
+      payload.append("channels", [form.email && "email", form.phone && "phone"].filter(Boolean).join(","));
+      payload.append("chunkSize", String(form.chunkSize));
+      const { data } = await axios.post(`${API_BASE}/api/campaigns/import`, payload, { timeout: 120000 });
+      setJob(data); setBusy(false);
+      await drainJob(data.jobId);
+    } catch (requestError) {
+      setError(errorMessage(requestError)); setBusy(false);
+    }
+  };
+
+  const retry = async () => {
+    if (!job?.jobId) return;
+    setBusy(true); setError("");
+    try {
+      const { data } = await axios.post(`${API_BASE}/api/campaigns/imports/${job.jobId}/retry`, {}, { timeout: 30000 });
+      setJob(data); setBusy(false); await drainJob(job.jobId);
+    } catch (requestError) { setError(errorMessage(requestError)); setBusy(false); }
+  };
+
+  return (
+    <form className="campaign-form upload-campaign" onSubmit={submit}>
+      <div className="form-grid two">
+        <label>Campaign name<input required value={form.campaignName} onChange={(event) => update({ campaignName: event.target.value })} placeholder="e.g. Uploaded Durban Leads" /></label>
+        <label>Default industry<input required value={form.industry} onChange={(event) => update({ industry: event.target.value })} /></label>
+      </div>
+      <div className="form-grid two">
+        <label>Default location<input required value={form.location} onChange={(event) => update({ location: event.target.value })} /></label>
+        <label>Rows per chunk<input type="number" min="1" max="25" value={form.chunkSize} onChange={(event) => update({ chunkSize: Math.max(1, Math.min(25, Number(event.target.value) || 5)) })} /><small>Each row can create an email ticket, a call ticket, or both.</small></label>
+      </div>
+      <label className={`upload-dropzone ${file ? "selected" : ""}`}><Upload size={25} /><span><strong>{file?.name || "Choose lead data"}</strong><small>CSV, JSON, or JSONL · flexible Apify/Amplifier-style field names</small></span><input type="file" accept=".csv,.json,.jsonl,application/json,text/csv" onChange={(event) => setFile(event.target.files?.[0] || null)} /></label>
+      <div className="channel-choice">
+        <label className={form.email ? "checked" : ""}><input type="checkbox" checked={form.email} onChange={(event) => update({ email: event.target.checked })} /><Mail size={20} /><span><strong>Email leads</strong><small>Requires an email value</small></span></label>
+        <label className={form.phone ? "checked" : ""}><input type="checkbox" checked={form.phone} onChange={(event) => update({ phone: event.target.checked })} /><Phone size={20} /><span><strong>Call leads</strong><small>Requires a phone value</small></span></label>
+      </div>
+      {job && <div className="import-progress"><div><strong>{job.fileName}</strong><StatusBadge status={job.status} /></div><div className="progress-track"><i style={{ width: `${job.progressPercent || 0}%` }} /></div><p>{Number(job.processedRows || 0).toLocaleString()} of {Number(job.totalRows || 0).toLocaleString()} rows processed · {job.succeededRows || 0} created · {job.skippedRows || 0} duplicates · {job.failedRows || 0} failed</p>{job.fileRetained && <small>The original file is retained until this job completes.</small>}</div>}
+      {error && <div className="inline-alert danger">{error}</div>}
+      <div className="form-submit">
+        <button className="primary-button" type="submit" disabled={busy || !file || !connection.workspaceReady}>{busy ? <><RefreshCw className="spin" size={18} />Processing chunks…</> : <><Upload size={18} />Upload and create tickets</>}</button>
+        {job && job.status !== "COMPLETED" && <button className="ghost-button" type="button" disabled={busy} onClick={job.status === "FAILED" ? retry : () => drainJob(job.jobId)}>{job.status === "FAILED" ? "Retry failed rows" : "Resume import"}</button>}
+      </div>
     </form>
   );
 }
 
 function CampaignsPage({ presets, connection, onCreated }) {
+  const [mode, setMode] = useState("discover");
   return (
     <div className="page-stack">
-      <PageSection title="Create a lead campaign" eyebrow="Apify intake" description="Name the campaign, define the market, and choose which Zendesk queues to create.">
-        <CampaignForm presets={presets} connection={connection} onCreated={onCreated} />
+      <PageSection title="Create a lead campaign" eyebrow="Zendesk-first intake" description="Discover new leads or upload an existing lead file. Both paths create tagged Zendesk tickets and defer site generation.">
+        <div className="campaign-mode-tabs"><button type="button" className={mode === "discover" ? "active" : ""} onClick={() => setMode("discover")}><MapPin size={17} />Find leads</button><button type="button" className={mode === "upload" ? "active" : ""} onClick={() => setMode("upload")}><Upload size={17} />Upload lead data</button></div>
+        {mode === "discover" ? <CampaignForm presets={presets} connection={connection} onCreated={onCreated} /> : <UploadCampaignForm connection={connection} onCreated={onCreated} />}
       </PageSection>
       <div className="form-tag-grid">
         <article><Mail size={22} /><div><strong>Email form</strong><p>Business, contact email, location, source URL, campaign IDs, deploy checkbox, and email-send checkbox.</p><code>asf_form_email_lead</code></div></article>
@@ -488,9 +602,9 @@ function ConnectionPanel({ connection, onConnected, onDisconnected }) {
       </form>
       <aside className={`connection-status ${connection.connected ? "connected" : ""}`}>
         <div>{connection.connected ? <ShieldCheck size={28} /> : <CircleUserRound size={28} />}</div>
-        <span>{connection.connected ? "Connected" : "Optional connection"}</span>
-        <h3>{connection.connected ? connection.subdomain : "Work locally first"}</h3>
-        <p>{connection.connected ? `${connection.username} · credentials from ${connection.source}` : "You can use the campaign dashboard without connecting. Zendesk is only required to create tickets and receive webhook updates."}</p>
+        <span>{connection.workspaceReady ? "Workspace ready" : connection.connected ? "Setup incomplete" : "Connection required"}</span>
+        <h3>{connection.connected ? connection.subdomain : "Connect before campaigns"}</h3>
+        <p>{connection.connected ? `${connection.username} · credentials from ${connection.source}${connection.workspaceReady ? " · fields and forms provisioned" : " · select a brand and provision below"}` : "Campaign creation, lead queues, and deployments stay locked until Zendesk is connected and provisioned."}</p>
         {connection.workspaceUrl && <a href={connection.workspaceUrl} target="_blank" rel="noreferrer">Open Zendesk <ExternalLink size={14} /></a>}
       </aside>
     </div>
@@ -502,7 +616,7 @@ function ProvisionStatus({ status }) {
   return <span className={`provision-status ${status || "planned"}`}>{status === "ready" || status === "configured" ? <Check size={12} /> : status === "conflict" ? <AlertTriangle size={12} /> : <Plus size={12} />}{label}</span>;
 }
 
-function ZendeskSetupWizard({ connection }) {
+function ZendeskSetupWizard({ connection, onProvisioned }) {
   const defaultWebhookUrl = `${API_BASE}/api/zendesk/webhook`;
   const [setup, setSetup] = useState(null);
   const [config, setConfig] = useState({ emailFormName: "AI Site Factory - Email Lead", callFormName: "AI Site Factory - Call Lead", emailViewName: "AI Site Factory - Email Leads", callViewName: "AI Site Factory - Call Leads", deployedViewName: "AI Site Factory - Deployed Sites", webhookName: "AI Site Factory - Ticket actions", brandId: "", createViews: true, createAutomation: false, webhookUrl: defaultWebhookUrl });
@@ -513,7 +627,15 @@ function ZendeskSetupWizard({ connection }) {
 
   const applySetup = useCallback((data) => {
     setSetup(data);
-    setConfig((current) => ({ ...current, ...(data.config || {}), brandId: data.config?.brandId || "", webhookUrl: data.config?.webhookUrl || current.webhookUrl || defaultWebhookUrl }));
+    setConfig((current) => {
+      const savedWebhookUrl = data.config?.webhookUrl || "";
+      let canonicalWebhookUrl = defaultWebhookUrl;
+      if (savedWebhookUrl) {
+        try { canonicalWebhookUrl = `${new URL(savedWebhookUrl).origin}/api/zendesk/webhook`; }
+        catch { canonicalWebhookUrl = defaultWebhookUrl; }
+      }
+      return { ...current, ...(data.config || {}), brandId: data.config?.brandId || current.brandId || data.brands?.find((brand) => brand.default)?.id || "", webhookUrl: canonicalWebhookUrl };
+    });
   }, [defaultWebhookUrl]);
 
   useEffect(() => {
@@ -534,7 +656,11 @@ function ZendeskSetupWizard({ connection }) {
     try {
       const { data } = await axios.post(`${API_BASE}/api/settings/zendesk-setup/${mode}`, { ...config, brandId: config.brandId || null, confirm: mode === "provision" ? confirmed : false }, { timeout: mode === "provision" ? 300000 : 90000 });
       applySetup(data); setMessage(data.message || (mode === "inspect" ? "Instance inspected. Review the matches and planned resources below." : "Zendesk setup completed."));
-      if (mode === "provision") setConfirmed(false);
+      if (mode === "provision") {
+        setConfirmed(false);
+        const connectionResponse = await axios.get(`${API_BASE}/api/settings/zendesk-connection`, { timeout: 20000 });
+        onProvisioned?.(connectionResponse.data);
+      }
     } catch (requestError) { setError(errorMessage(requestError)); } finally { setBusy(""); }
   };
 
@@ -552,7 +678,7 @@ function ZendeskSetupWizard({ connection }) {
     <div className="setup-config-grid">
       <label>Email lead form name<input value={config.emailFormName} onChange={(event) => changeConfig({ emailFormName: event.target.value })} /></label>
       <label>Call lead form name<input value={config.callFormName} onChange={(event) => changeConfig({ callFormName: event.target.value })} /></label>
-      <label>Brand assignment<select value={config.brandId || ""} onChange={(event) => changeConfig({ brandId: event.target.value })}><option value="">All brands (recommended)</option>{(setup?.brands || []).map((brand) => <option key={brand.id} value={brand.id}>{brand.name}{brand.default ? " (default)" : ""}</option>)}</select><small>All brands avoids coupling the workflow to a brand. Select one only when the forms must be restricted.</small></label>
+      <label>Brand assignment<select required value={config.brandId || ""} onChange={(event) => changeConfig({ brandId: event.target.value })}><option value="">Select an existing brand</option>{(setup?.brands || []).map((brand) => <option key={brand.id} value={brand.id}>{brand.name}{brand.default ? " (default)" : ""}</option>)}</select><small>The two forms, ticket routing, and managed views are tied to this existing Zendesk brand.</small></label>
       <label className="setup-toggle"><input type="checkbox" checked={config.createViews} onChange={(event) => changeConfig({ createViews: event.target.checked })} /><span><strong>Create managed views</strong><small>Email, call, and deployed queues filtered by stable tags.</small></span></label>
       <label className="setup-toggle"><input type="checkbox" checked={config.createAutomation} onChange={(event) => changeConfig({ createAutomation: event.target.checked })} /><span><strong>Stage webhook automation</strong><small>Creates an active authenticated webhook and inactive deploy/email triggers.</small></span></label>
       {config.createAutomation && <label>Public webhook URL<input type="url" value={config.webhookUrl || ""} onChange={(event) => changeConfig({ webhookUrl: event.target.value })} /><small>Must be public HTTPS. Localhost cannot receive Zendesk webhook calls.</small></label>}
@@ -560,7 +686,7 @@ function ZendeskSetupWizard({ connection }) {
     {error && <div className="inline-alert danger">{error}</div>}
     {message && <div className="inline-alert success">{message}</div>}
     {!connection.connected && <div className="inline-alert warning">Connect Zendesk above before inspecting or provisioning this blueprint.</div>}
-    <div className="setup-actions"><button className="ghost-button" type="button" disabled={!connection.connected || Boolean(busy)} onClick={() => runSetup("inspect")}><Eye size={17} />{busy === "inspect" ? "Inspecting…" : "Inspect instance"}</button><label className="confirm-change"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>I reviewed this plan and authorize these Zendesk configuration changes.</span></label><button className="primary-button" type="button" disabled={!connection.connected || !setup?.inspected || !confirmed || Boolean(busy) || conflicts.length > 0} onClick={() => runSetup("provision")}><WandSparkles size={17} />{busy === "provision" ? "Provisioning in order…" : "Provision Zendesk setup"}</button></div>
+    <div className="setup-actions"><button className="ghost-button" type="button" disabled={!connection.connected || Boolean(busy)} onClick={() => runSetup("inspect")}><Eye size={17} />{busy === "inspect" ? "Inspecting…" : "Inspect instance"}</button><label className="confirm-change"><input type="checkbox" checked={confirmed} onChange={(event) => setConfirmed(event.target.checked)} /><span>I reviewed this plan and authorize these Zendesk configuration changes.</span></label><button className="primary-button" type="button" disabled={!connection.connected || !setup?.inspected || !config.brandId || !confirmed || Boolean(busy) || conflicts.length > 0} onClick={() => runSetup("provision")}><WandSparkles size={17} />{busy === "provision" ? "Provisioning in order…" : "Provision Zendesk setup"}</button></div>
     <div className="setup-summary-grid">
       <article><span>Ticket fields</span><strong>{fields.length}</strong><small>{readyCount(fields)} ready · {createCount(fields)} to create</small></article>
       <article><span>Channel forms</span><strong>{forms.length}</strong><small>{readyCount(forms)} ready · {createCount(forms)} to create</small></article>
@@ -589,11 +715,11 @@ function ZendeskPage({ connection, setConnection }) {
   const webhookUrl = `${API_BASE}/api/zendesk/webhook`;
   return (
     <div className="page-stack">
-      <PageSection title="Connect a Zendesk instance" eyebrow="Dedicated setup" description="Use a subdomain, agent username, and API token. This is optional until you want to create or update tickets.">
+      <PageSection title="Connect a Zendesk instance" eyebrow="Required workspace setup" description="Use a subdomain, agent username, and API token. Campaign work remains locked until this instance is provisioned.">
         <ConnectionPanel connection={connection} onConnected={setConnection} onDisconnected={setConnection} />
       </PageSection>
       <PageSection title="Provision the instance blueprint" eyebrow="Fields → forms → views → automation" description="Inspect the connected instance, review exact matches and missing resources, then provision the two channel workflows in dependency order.">
-        <ZendeskSetupWizard connection={connection} />
+        <ZendeskSetupWizard connection={connection} onProvisioned={setConnection} />
       </PageSection>
       <PageSection title="Runtime contract" eyebrow="Two agent approvals" description="The provisioner can stage these rules, or your Zendesk administrator can build equivalent triggers using the displayed fields, forms, and tags.">
         <div className="webhook-grid">
@@ -614,7 +740,7 @@ function AppShell() {
   const [totals, setTotals] = useState({ campaigns: 0, leads: 0, deployments: 0, pending: 0, aiGenerations: 0, reposCreated: 0 });
   const [selectedCampaignId, setSelectedCampaignIdState] = useState(() => localStorage.getItem("asf_campaign_id") || "");
   const [detail, setDetail] = useState(null);
-  const [connection, setConnection] = useState({ connected: false, subdomain: "", username: "", source: "none" });
+  const [connection, setConnection] = useState({ connected: false, workspaceReady: false, setupStatus: "CONNECTION_REQUIRED", subdomain: "", username: "", source: "none" });
   const [history, setHistory] = useState([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -628,10 +754,10 @@ function AppShell() {
   }, []);
 
   const loadDetail = useCallback(async (campaignId) => {
-    if (!campaignId) { setDetail(null); return; }
+    if (!campaignId || !connection.workspaceReady) { setDetail(null); return; }
     try { const { data } = await axios.get(`${API_BASE}/api/campaigns/${campaignId}`, { timeout: 30000 }); setDetail(data); }
     catch (error) { setNotice({ tone: "danger", text: errorMessage(error) }); setDetail(null); }
-  }, []);
+  }, [connection.workspaceReady]);
 
   const refresh = useCallback(async (quiet = false) => {
     if (!quiet) setRefreshing(true);
@@ -639,7 +765,6 @@ function AppShell() {
       axios.get(`${API_BASE}/api/presets`, { timeout: 20000 }),
       axios.get(`${API_BASE}/api/campaigns?limit=100`, { timeout: 30000 }),
       axios.get(`${API_BASE}/api/settings/zendesk-connection`, { timeout: 20000 }),
-      axios.get(`${API_BASE}/api/deployments/history?limit=100`, { timeout: 30000 }),
     ]);
     if (requests[0].status === "fulfilled") setPresets(requests[0].value.data.presets || FALLBACK_PRESETS);
     if (requests[1].status === "fulfilled") {
@@ -653,8 +778,18 @@ function AppShell() {
       }
       selectionInitialized.current = true;
     }
-    if (requests[2].status === "fulfilled") setConnection(requests[2].value.data);
-    if (requests[3].status === "fulfilled") setHistory(requests[3].value.data.deployments || []);
+    if (requests[2].status === "fulfilled") {
+      const nextConnection = requests[2].value.data;
+      setConnection(nextConnection);
+      if (nextConnection.workspaceReady) {
+        try {
+          const historyResponse = await axios.get(`${API_BASE}/api/deployments/history?limit=100`, { timeout: 30000 });
+          setHistory(historyResponse.data.deployments || []);
+        } catch { setHistory([]); }
+      } else {
+        setHistory([]); setDetail(null);
+      }
+    }
     if (requests.every((item) => item.status === "rejected")) setNotice({ tone: "danger", text: "The backend could not be reached. Check that the API is running." });
     setLoading(false); setRefreshing(false);
   }, [selectedCampaignId, setSelectedCampaignId]);
@@ -666,7 +801,13 @@ function AppShell() {
     return () => window.clearInterval(timer);
   }, [refresh, selectedCampaignId, loadDetail]);
 
-  const selectAndOpen = (campaignId) => { setSelectedCampaignId(campaignId); navigate("/leads"); };
+  const selectAndOpen = (campaignId) => {
+    if (!connection.workspaceReady) {
+      setNotice({ tone: "warning", text: "Finish the Zendesk brand, field, and form setup before opening campaign workspaces." });
+      navigate("/zendesk"); return;
+    }
+    setSelectedCampaignId(campaignId); navigate("/leads");
+  };
   const created = (campaign) => {
     setSelectedCampaignId(campaign.campaignId); setDetail(campaign);
     setNotice({ tone: "success", text: `${campaign.campaignName} created with ${campaign.metrics.channelLeads} channel records. No sites were generated yet.` });
@@ -684,16 +825,16 @@ function AppShell() {
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand"><div><Zap size={20} /></div><span><strong>AI Site Factory</strong><small>Lead-to-site campaigns</small></span></div>
-        <nav>{NAV_ITEMS.map(({ to, label, icon: Icon }) => <NavLink aria-label={label} key={to} to={to}><Icon size={18} /><span>{label}</span></NavLink>)}</nav>
-        <div className={`sidebar-connection ${connection.connected ? "connected" : ""}`}><i /> <div><span>{connection.connected ? "Zendesk connected" : "Zendesk optional"}</span><small>{connection.connected ? connection.subdomain : "Local mode"}</small></div></div>
+        <nav>{NAV_ITEMS.map(({ to, label, icon: Icon, requiresSetup }) => requiresSetup && !connection.workspaceReady ? <button aria-label={`${label} locked`} className="nav-locked" key={to} type="button" onClick={() => navigate("/zendesk")}><Icon size={18} /><span>{label}</span><Lock size={12} /></button> : <NavLink aria-label={label} key={to} to={to}><Icon size={18} /><span>{label}</span></NavLink>)}</nav>
+        <div className={`sidebar-connection ${connection.workspaceReady ? "connected" : ""}`}><i /> <div><span>{connection.workspaceReady ? "Zendesk workspace ready" : connection.connected ? "Zendesk setup incomplete" : "Zendesk required"}</span><small>{connection.connected ? connection.subdomain : "Campaigns locked"}</small></div></div>
       </aside>
       <main>
         <header className="topbar"><div><span>Workspace</span><h1>{pageName}</h1></div><div className="topbar-actions">{notice && <div className={`notice ${notice.tone}`}>{notice.text}<button type="button" onClick={() => setNotice(null)}>×</button></div>}<button className="refresh-button" type="button" onClick={() => refresh(false)} disabled={refreshing}><RefreshCw size={17} className={refreshing ? "spin" : ""} />Refresh</button></div></header>
         <div className="page-content">{loading ? <div className="loading-state"><RefreshCw className="spin" /><strong>Loading campaign workspace…</strong></div> : <Routes>
           <Route path="/overview" element={<OverviewPage campaigns={campaigns} totals={totals} onSelectCampaign={selectAndOpen} />} />
-          <Route path="/campaigns" element={<CampaignsPage presets={presets} connection={connection} onCreated={created} />} />
-          <Route path="/leads" element={<LeadWorkspacePage campaigns={campaigns} selectedCampaignId={selectedCampaignId} setSelectedCampaignId={setSelectedCampaignId} detail={detail} connection={connection} onSync={syncCampaign} syncing={syncing} />} />
-          <Route path="/deployments" element={<DeploymentsPage campaigns={campaigns} selectedCampaignId={selectedCampaignId} setSelectedCampaignId={setSelectedCampaignId} detail={detail} history={history} />} />
+          <Route path="/campaigns" element={<SetupGuard connection={connection}><CampaignsPage presets={presets} connection={connection} onCreated={created} /></SetupGuard>} />
+          <Route path="/leads" element={<SetupGuard connection={connection}><LeadWorkspacePage campaigns={campaigns} selectedCampaignId={selectedCampaignId} setSelectedCampaignId={setSelectedCampaignId} detail={detail} connection={connection} onSync={syncCampaign} syncing={syncing} /></SetupGuard>} />
+          <Route path="/deployments" element={<SetupGuard connection={connection}><DeploymentsPage campaigns={campaigns} selectedCampaignId={selectedCampaignId} setSelectedCampaignId={setSelectedCampaignId} detail={detail} history={history} /></SetupGuard>} />
           <Route path="/zendesk" element={<ZendeskPage connection={connection} setConnection={setConnection} />} />
           <Route path="*" element={<Navigate to="/overview" replace />} />
         </Routes>}</div>

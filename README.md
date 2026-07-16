@@ -27,10 +27,12 @@ For the live proof-of-concept deployment checklist, strict GitHub -> Netlify art
 - `GET /api/presets` returns the available Google Maps business presets.
 - `GET /api/templates` returns the landing-page template metadata.
 - `POST /api/leads/discover` searches Apify Google Maps across all nine South African provinces, normalizes leads, stores canonical lead keys, and skips previously seen leads.
-- `POST /api/campaigns/intake` creates a named campaign, discovers up to 10,000 requested leads, splits email and call records into separate SQLite tables, and optionally creates tagged Zendesk intake tickets without generating a site.
+- `POST /api/campaigns/intake` creates a named campaign with a dynamic lead target, splits email and call records into separate SQLite tables, and requires tagged Zendesk intake tickets without generating a site.
+- `POST /api/campaigns/import` stores a CSV, JSON, or JSONL file and creates a durable, resumable campaign import job. Flexible Apify/Amplifier-style headings are normalized into the managed lead fields.
+- `GET /api/campaigns/imports`, `GET /api/campaigns/imports/{job_id}`, and `POST /api/campaigns/imports/{job_id}/process` expose and advance the persisted import queue in small Zendesk-safe chunks. Failed rows can be reset with `POST /api/campaigns/imports/{job_id}/retry`.
 - `GET /api/campaigns` and `GET /api/campaigns/{campaign_id}` return campaign funnel, channel, AI-generation, repository, pending, failed, and live metrics.
-- `POST /api/campaigns/{campaign_id}/sync-zendesk` sends locally saved campaign records to Zendesk after a connection is configured.
-- `GET`, `PUT`, and `DELETE /api/settings/zendesk-connection` manage the optional runtime Zendesk connection used by the dedicated setup screen. Tokens are never returned by the API.
+- `POST /api/campaigns/{campaign_id}/sync-zendesk` retries ticket creation for an already connected and provisioned workspace.
+- `GET`, `PUT`, and `DELETE /api/settings/zendesk-connection` expose or manage the Zendesk connection used by the dedicated setup screen. `backend/.env` is the durable source; UI credentials are session-only overrides and tokens are never returned by the API.
 - `GET /api/settings/zendesk-setup` returns the preconfigured field, form, view, tag, and automation blueprint without contacting Zendesk.
 - `POST /api/settings/zendesk-setup/inspect` performs a read-only instance inventory and reports exact matches, compatible existing fields, missing resources, type conflicts, available brands, and plan-dependent capabilities.
 - `POST /api/settings/zendesk-setup/provision` requires explicit confirmation and provisions in dependency order: ticket fields, two channel forms, optional views, then an optional authenticated webhook with inactive triggers. Reruns reuse or reconcile saved/exact-name resources rather than duplicating them.
@@ -46,16 +48,18 @@ For the live proof-of-concept deployment checklist, strict GitHub -> Netlify art
 
 ## Campaign workflow
 
-1. Name a campaign and choose email leads, call leads, or both.
-2. Apify discovery stores canonical lead data and creates channel-specific intake records.
+1. Connect Zendesk, select an existing brand, and provision the managed fields and two forms. Campaign creation, lead queues, and deployments remain locked until this is ready.
+2. Name a campaign, choose email leads, call leads, or both, then either run Apify discovery or upload lead data.
 3. Zendesk receives separate, tagged email and call tickets. No AI, GitHub, or Netlify work runs yet.
 4. An agent ticks the deploy field. The `deploy_site` webhook generates the HTML, exports the repository, deploys Netlify, and writes the live URL back to the same ticket.
 5. A second channel for the same canonical lead reuses the existing artifact or live deployment.
 6. Email tickets can fire the separate `send_email` webhook after the agent reviews the generated template. Call tickets retain the live link for the agent's call workflow.
 
-Campaign persistence uses `campaigns`, `campaign_email_leads`, `campaign_call_leads`, and `campaign_deployments`. The deployment row stores its campaign, approval, canonical lead, and channel so graphs can distinguish pending requests, AI generations, repositories created, failures, and live sites.
+Campaign persistence uses `campaigns`, `campaign_email_leads`, `campaign_call_leads`, and `campaign_deployments`. Uploaded files add `campaign_import_jobs` and per-row `campaign_import_items`; the source file is retained while the job is pending and removed after every row completes. The deployment row stores its campaign, approval, canonical lead, and channel so graphs can distinguish pending requests, AI generations, repositories created, failures, and live sites.
 
-The Zendesk setup wizard uses all brands by default. An administrator can instead restrict both forms to one discovered brand. Provisioned form and brand IDs are persisted locally and automatically added to new intake tickets; custom field IDs are discovered and saved rather than typed into the UI. Existing compatible text fields are adopted without changing their type, while unsafe mismatches block provisioning before any writes. Optional webhook triggers are created inactive for review and testing.
+The Zendesk setup wizard requires one existing brand selected from the live instance inventory. Both forms and managed views are scoped to that brand, and its ID is added to every intake ticket. Custom field IDs are discovered and saved rather than typed into the UI. Existing compatible text fields are adopted without changing their type, while unsafe mismatches block provisioning before any writes. Optional webhook triggers are created inactive for review and testing.
+
+Ticket lifecycle tags are stable automation contracts. Intake uses `asf_managed`, source (`asf_source_apify_google_maps` or `asf_source_upload`), channel/form, and `asf_deploy_pending` tags. Deployment progresses through `asf_deploy_requested`, `asf_stage_generating`, `asf_artifact_ready`, `asf_repo_ready`, `asf_stage_deploying`, and finally `asf_deployed` plus `asf_stage_live`. Failures use `asf_generation_failed` or `asf_deploy_failed` with `asf_stage_failed`.
 
 On backend startup, `backfill_legacy_campaign_data()` imports pre-campaign discovery batches, pipeline runs, approvals, Zendesk tickets, GitHub exports, and deployment history into these tables. Deterministic legacy IDs and `INSERT OR IGNORE` make the migration safe to run repeatedly. `POST /api/campaigns/backfill` can trigger the same idempotent import manually.
 

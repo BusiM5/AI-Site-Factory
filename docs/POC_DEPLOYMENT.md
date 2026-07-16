@@ -155,7 +155,7 @@ The recommended path is the app's **Zendesk setup** screen:
 1. Connect with an administrator subdomain, email, and API token.
 2. Inspect the instance. This step is read-only and discovers existing fields, forms, views, webhooks, triggers, and brands.
 3. Review the 20 preconfigured fields and the separate email/call form membership. Compatible existing string fields are reused; unsafe type conflicts must be resolved first.
-4. Keep **All brands** selected unless the forms should be restricted to one brand.
+4. Select the existing Zendesk brand that will own the managed forms, views, and intake tickets.
 5. Optionally select managed views and webhook automation, confirm the disclaimer, and provision.
 
 Provisioning creates fields before forms, then views, then automation. It never deletes Zendesk resources and is safe to rerun. Automation creates one active authenticated webhook and three inactive triggers (email deploy, call deploy, and approved email send) so an administrator can test them before enabling them. Ticket forms require a Zendesk plan that supports multiple forms.
@@ -201,7 +201,7 @@ The deploy trigger is valid for both `email` and `phone` channel tickets. Config
 }
 ```
 
-Stable form/view tags include `asf_form_email_lead`, `asf_form_call_lead`, `asf_channel_email`, `asf_channel_phone`, `asf_deploy_pending`, `asf_can_deploy`, `asf_email_send_pending`, `asf_call_pending`, and `asf_deployed`.
+Stable form/view tags include `asf_managed`, `asf_form_email_lead`, `asf_form_call_lead`, `asf_channel_email`, `asf_channel_phone`, `asf_source_apify_google_maps`, `asf_source_upload`, `asf_deploy_pending`, `asf_deploy_requested`, `asf_stage_generating`, `asf_artifact_ready`, `asf_repo_ready`, `asf_stage_deploying`, `asf_can_deploy`, `asf_email_send_pending`, `asf_call_pending`, `asf_deployed`, `asf_stage_live`, `asf_generation_failed`, `asf_deploy_failed`, and `asf_stage_failed`.
 
 ## Demo warm-up checklist
 
