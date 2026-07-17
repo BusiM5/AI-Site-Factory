@@ -310,19 +310,17 @@ function CampaignForm({ presets, connection, onCreated }) {
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const selectedPreset = presets.find((item) => item.id === form.presetId) || presets[0];
   const update = (patch) => setForm((current) => ({ ...current, ...patch }));
-
-  useEffect(() => {
-    if (!selectedPreset) return;
-    setForm((current) => ({ ...current, industry: selectedPreset.industry }));
-  }, [form.presetId, selectedPreset]);
 
   const submit = async (event) => {
     event.preventDefault();
     setError("");
     if (!form.email && !form.phone) {
       setError("Select at least one lead channel.");
+      return;
+    }
+    if (form.presetId === "custom" && (!form.industry.trim() || !form.query.trim())) {
+      setError("Enter both an industry and search intent for a custom campaign.");
       return;
     }
     setBusy(true);
@@ -353,16 +351,20 @@ function CampaignForm({ presets, connection, onCreated }) {
         <label>Campaign name<input required value={form.campaignName} onChange={(event) => update({ campaignName: event.target.value })} placeholder="e.g. Durban Plumbers - July" /></label>
         <label>Location<input required value={form.location} onChange={(event) => update({ location: event.target.value })} placeholder="City, province, or country" /></label>
       </div>
+      <div className="preset-heading"><strong>Choose a starting point</strong><span>Select a preset or define your own industry and search intent.</span></div>
       <div className="preset-selector">
+        <button className={form.presetId === "custom" ? "selected custom" : "custom"} type="button" onClick={() => update({ presetId: "custom", industry: form.presetId === "custom" ? form.industry : "" })}>
+          <strong>Custom campaign</strong><span>Enter any industry and search intent.</span>
+        </button>
         {presets.map((preset) => (
-          <button className={form.presetId === preset.id ? "selected" : ""} type="button" key={preset.id} onClick={() => update({ presetId: preset.id })}>
+          <button className={form.presetId === preset.id ? "selected" : ""} type="button" key={preset.id} onClick={() => update({ presetId: preset.id, industry: preset.industry })}>
             <strong>{preset.label}</strong><span>{preset.description}</span>
           </button>
         ))}
       </div>
       <div className="form-grid three">
-        <label>Industry<input value={form.industry} onChange={(event) => update({ industry: event.target.value })} /></label>
-        <label>Search intent<input value={form.query} onChange={(event) => update({ query: event.target.value })} placeholder="e.g. emergency services" /></label>
+        <label>Industry<input required value={form.industry} onChange={(event) => update({ industry: event.target.value, presetId: "custom" })} placeholder="e.g. Solar energy" /></label>
+        <label>Search intent<input required={form.presetId === "custom"} value={form.query} onChange={(event) => update({ query: event.target.value })} placeholder="e.g. commercial solar installers" /><small>{form.presetId === "custom" ? "Required for custom campaigns." : "Optional: refine the selected preset."}</small></label>
         <label>Lead target<input type="number" min="1" value={form.limit} onChange={(event) => update({ limit: Math.max(1, Number(event.target.value) || 1) })} /></label>
       </div>
       <div className="channel-choice">
@@ -762,7 +764,10 @@ function AppShell() {
   const loadDetail = useCallback(async (campaignId) => {
     if (!campaignId || !connection.workspaceReady) { setDetail(null); return; }
     try { const { data } = await axios.get(`${API_BASE}/api/campaigns/${campaignId}`, { timeout: 30000 }); setDetail(data); }
-    catch (error) { setNotice({ tone: "danger", text: errorMessage(error) }); setDetail(null); }
+    catch (error) {
+      setDetail(null);
+      if (error?.response?.status !== 404) setNotice({ tone: "danger", text: errorMessage(error) });
+    }
   }, [connection.workspaceReady]);
 
   const refresh = useCallback(async (quiet = false) => {
@@ -815,12 +820,13 @@ function AppShell() {
     setLoading(false); setRefreshing(false);
   }, [selectedCampaignId, setSelectedCampaignId]);
 
+  const detailRouteActive = location.pathname.startsWith("/leads") || location.pathname.startsWith("/deployments");
   useEffect(() => { refresh(true); }, [refresh]);
-  useEffect(() => { loadDetail(selectedCampaignId); }, [selectedCampaignId, loadDetail]);
+  useEffect(() => { if (detailRouteActive) loadDetail(selectedCampaignId); }, [selectedCampaignId, loadDetail, detailRouteActive]);
   useEffect(() => {
-    const timer = window.setInterval(() => { refresh(true); if (selectedCampaignId) loadDetail(selectedCampaignId); }, 20000);
+    const timer = window.setInterval(() => { refresh(true); if (detailRouteActive && selectedCampaignId) loadDetail(selectedCampaignId); }, 20000);
     return () => window.clearInterval(timer);
-  }, [refresh, selectedCampaignId, loadDetail]);
+  }, [refresh, selectedCampaignId, loadDetail, detailRouteActive]);
 
   const selectAndOpen = (campaignId) => {
     if (!connection.workspaceReady) {

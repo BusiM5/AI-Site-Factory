@@ -719,6 +719,7 @@ class ZendeskWebhookRequest(BaseModel):
 
 class DiscoverLeadsRequest(BaseModel):
     presetId: str
+    industry: Optional[str] = None
     location: str = "South Africa"
     query: Optional[str] = None
     limit: int = 3
@@ -926,6 +927,26 @@ def get_preset_or_404(preset_id: str) -> Dict[str, Any]:
         if preset["id"] == preset_id:
             return preset
     raise HTTPException(status_code=404, detail="Lead preset not found.")
+
+
+def resolve_lead_preset(preset_id: str, industry: Optional[str], query: Optional[str]) -> Dict[str, Any]:
+    normalized_id = compact_text(preset_id).lower()
+    if normalized_id != "custom":
+        return get_preset_or_404(normalized_id)
+
+    custom_industry = compact_text(industry)
+    custom_query = compact_text(query)
+    if not custom_industry:
+        raise HTTPException(status_code=400, detail="Industry is required for a custom campaign.")
+    if not custom_query:
+        raise HTTPException(status_code=400, detail="Search intent is required for a custom campaign.")
+    return {
+        "id": "custom",
+        "label": custom_industry,
+        "industry": custom_industry,
+        "query": custom_query,
+        "description": "User-defined campaign search.",
+    }
 
 
 def get_template_or_404(template_id: str) -> Dict[str, Any]:
@@ -8034,7 +8055,7 @@ def get_site_templates():
 
 @app.post("/api/leads/discover", response_model=DiscoverLeadsResponse)
 def discover_leads(request: DiscoverLeadsRequest):
-    preset = get_preset_or_404(request.presetId)
+    preset = resolve_lead_preset(request.presetId, request.industry, request.query)
     location = compact_text(request.location, "Durban, South Africa")
     limit = max(1, request.limit or 5)
     apify_limit = max(limit * 5, 5)
@@ -10399,9 +10420,7 @@ def retry_campaign_import(job_id: str):
 @app.get("/api/campaigns/{campaign_id}")
 def get_campaign(campaign_id: str):
     with get_pipeline_db() as db:
-        row = db.execute(
-            "SELECT * FROM campaigns WHERE id = ? AND idempotency_key IS NOT NULL", (campaign_id,)
-        ).fetchone()
+        row = db.execute("SELECT * FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="Campaign not found.")
         return campaign_summary_from_row(db, row, include_leads=True)
@@ -10725,6 +10744,7 @@ def create_campaign_intake(request: CampaignIntakeRequest):
     discovery = discover_leads(
         DiscoverLeadsRequest(
             presetId=request.presetId,
+            industry=request.industry,
             location=request.location,
             query=request.query,
             limit=request.limit,

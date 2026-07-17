@@ -192,6 +192,9 @@ def test_empty_deployment_restores_previous_application_data():
     payload = response.json()
     assert payload["totals"]["campaigns"] == 37
     assert payload["totals"]["leads"] == 28
+    detail = client.get(f"/api/campaigns/{payload['campaigns'][0]['campaignId']}")
+    assert detail.status_code == 200
+    assert detail.json()["campaignId"] == payload["campaigns"][0]["campaignId"]
 
     second_restore = main.restore_pipeline_seed_if_empty()
     assert second_restore["restored"] is False
@@ -494,6 +497,43 @@ def test_discover_leads_searches_requested_location_and_caches(monkeypatch):
     assert second.json()["cached"] is True
     assert len(second.json()["leads"]) == 2
     assert calls == [("family restaurants in Gauteng, South Africa", "Gauteng, South Africa", 10)]
+
+
+def test_discover_leads_accepts_custom_industry_and_search_intent(monkeypatch):
+    calls = []
+
+    def fake_apify(query, limit, location="South Africa"):
+        calls.append((query, location, limit))
+        return [apify_item(12, category="Solar Energy", province="Western Cape")]
+
+    monkeypatch.setattr(main, "run_apify_google_maps", fake_apify)
+    response = client.post(
+        "/api/leads/discover",
+        json={
+            "presetId": "custom",
+            "industry": "Solar Energy",
+            "location": "Cape Town, South Africa",
+            "query": "commercial solar installers",
+            "limit": 1,
+        },
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["preset"]["id"] == "custom"
+    assert payload["preset"]["industry"] == "Solar Energy"
+    assert payload["leads"][0]["category"] == "Solar Energy"
+    assert calls == [("commercial solar installers in Cape Town, South Africa", "Cape Town, South Africa", 5)]
+
+
+def test_custom_discovery_requires_industry_and_search_intent():
+    response = client.post(
+        "/api/leads/discover",
+        json={"presetId": "custom", "industry": "", "location": "South Africa", "query": ""},
+    )
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Industry is required for a custom campaign."
 
 
 def test_discover_force_refresh_can_reuse_discovered_leads(monkeypatch):
