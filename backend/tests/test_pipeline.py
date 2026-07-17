@@ -1921,13 +1921,22 @@ def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
     field_ids = configure_managed_zendesk_contract()
     ticket_posts = []
     ticket_headers = []
+    requester_posts = []
     remote_tickets = {}
 
     def fake_post(url, json=None, auth=None, headers=None, timeout=None):
         if url.endswith("/organizations.json"):
             return FakeResponse(201, {"organization": {"id": 42}})
-        if url.endswith("/users.json"):
-            return FakeResponse(201, {"user": {"id": 77, "email": "alpha@example.com"}})
+        if url.endswith("/users/create_or_update.json"):
+            user = json["user"]
+            requester_posts.append(user)
+            assert user["name"] == "Alpha Plumbing"
+            assert user["email"] == "alpha@example.com"
+            assert user["phone"] == "+27 31 000 0000"
+            assert user["role"] == "end-user"
+            assert user["skip_verify_email"] is True
+            assert user["external_id"].startswith("asf-requester-")
+            return FakeResponse(200, {"user": {**user, "id": 77}})
         if url.endswith("/tickets.json"):
             ticket_posts.append(json["ticket"])
             ticket_headers.append(headers)
@@ -1969,6 +1978,7 @@ def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
     assert len(first) == 2
     assert len(second) == 2
     assert len(ticket_posts) == 2
+    assert len(requester_posts) == 1
     assert {(ticket["brand_id"], ticket["ticket_form_id"]) for ticket in ticket_posts} == {(88, 5001), (88, 5002)}
     assert {ticket["external_id"] for ticket in ticket_posts} == {
         "asf:campaign-intake:canonical-intake:email:intake",
@@ -1976,6 +1986,7 @@ def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
     }
     assert {next(tag for tag in ticket["tags"] if tag in {"ai_site_email_lead", "ai_site_phone_lead"}) for ticket in ticket_posts} == {"ai_site_email_lead", "ai_site_phone_lead"}
     assert all("asf_managed" in ticket["tags"] for ticket in ticket_posts)
+    assert all(ticket["requester_id"] == 77 for ticket in ticket_posts)
     assert len({headers["Idempotency-Key"] for headers in ticket_headers}) == 2
     assert all(headers["Idempotency-Key"].startswith("asf-") for headers in ticket_headers)
     for ticket in ticket_posts:
@@ -1986,6 +1997,57 @@ def test_zendesk_intake_creates_email_and_phone_tickets_once(monkeypatch):
         assert values[field_ids["businessName"]] == "Alpha Plumbing"
         assert values[field_ids["industry"]] == "Plumbing"
         assert values[field_ids["location"]] == "Durban"
+
+
+def test_zendesk_intake_creates_phone_only_business_requester_without_fake_email(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    configure_managed_zendesk_contract()
+    ticket_posts = []
+
+    def fake_post(url, json=None, auth=None, headers=None, timeout=None):
+        if url.endswith("/organizations.json"):
+            return FakeResponse(201, {"organization": {"id": 42}})
+        if url.endswith("/users/create_or_update.json"):
+            user = json["user"]
+            assert user["name"] == "Phone Only Solar"
+            assert user["phone"] == "+27 31 000 0000"
+            assert "email" not in user
+            return FakeResponse(200, {"user": {**user, "id": 78}})
+        if url.endswith("/tickets.json"):
+            ticket_posts.append(json["ticket"])
+            return FakeResponse(201, {"ticket": {**json["ticket"], "id": 902, "status": "new"}})
+        raise AssertionError(url)
+
+    def fake_get(url, **kwargs):
+        if url.endswith("/tickets.json"):
+            return FakeResponse(200, {"tickets": []})
+        raise AssertionError(url)
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    monkeypatch.setattr(main.requests, "get", fake_get)
+
+    result = main.create_zendesk_intake_tickets(
+        "approval-phone-requester",
+        {
+            "campaignId": "campaign-phone-requester",
+            "campaignName": "Durban Solar - July",
+            "canonicalLeadKey": "canonical-phone-requester",
+            "businessName": "Phone Only Solar",
+            "industry": "Solar",
+            "location": "Durban",
+            "phone": "+27 31 000 0000",
+        },
+        "pipeline-phone-requester",
+        requested_channels=["phone"],
+    )
+
+    assert len(result) == 1
+    assert len(ticket_posts) == 1
+    assert ticket_posts[0]["requester_id"] == 78
+    assert result[0]["payload"]["userId"] == 78
+    assert result[0]["payload"]["requesterName"] == "Phone Only Solar"
 
 
 def test_zendesk_intake_rejects_missing_contract_before_http(monkeypatch):

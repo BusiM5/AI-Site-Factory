@@ -7373,6 +7373,50 @@ def zendesk_ticket_field_value_matches(expected: Any, actual: Any) -> bool:
     return compact_text(actual) == compact_text(expected)
 
 
+def ensure_zendesk_intake_requester(
+    business_name: str,
+    canonical_key: str,
+    lead_email: Optional[str],
+    lead_phone: Optional[str],
+    organization_id: Optional[int],
+    base_url: str,
+    auth: Tuple[str, str],
+    headers: Dict[str, str],
+) -> Dict[str, Any]:
+    """Create or reuse the business end user used as requester on new intake tickets."""
+    requester_external_id = f"asf-requester-{hashlib.sha256(canonical_key.encode('utf-8')).hexdigest()[:48]}"
+    user_payload: Dict[str, Any] = {
+        "name": business_name,
+        "external_id": requester_external_id,
+        "organization_id": organization_id,
+        "role": "end-user",
+        "skip_verify_email": True,
+    }
+    if lead_email:
+        user_payload["email"] = lead_email
+    if lead_phone:
+        user_payload["phone"] = lead_phone
+
+    response = requests.post(
+        f"{base_url}/users/create_or_update.json",
+        json={"user": user_payload},
+        auth=auth,
+        headers=headers,
+        timeout=30,
+    )
+    response.raise_for_status()
+    requester = response.json().get("user") or {}
+    if not requester.get("id"):
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "ZENDESK_REQUESTER_NOT_CREATED",
+                "message": "Zendesk did not return an end-user ID for the business requester.",
+            },
+        )
+    return requester
+
+
 def reconcile_zendesk_intake_ticket(
     ticket: Dict[str, Any],
     spec: Dict[str, Any],
@@ -7703,37 +7747,16 @@ def create_zendesk_intake_tickets(
         organization = org_response.json().get("organization", {})
     organization_id = organization.get("id")
 
-    user: Dict[str, Any] = {}
-    if lead_email and "email" in pending_channels:
-        user_search = requests.get(
-            f"{base_url}/users/search.json",
-            params={"query": lead_email},
-            auth=auth,
-            headers=headers,
-            timeout=30,
-        )
-        user_search.raise_for_status()
-        users = user_search.json().get("users", [])
-        if users:
-            user = users[0]
-        else:
-            user_create = requests.post(
-                f"{base_url}/users.json",
-                json={
-                    "user": {
-                        "name": business_name,
-                        "email": lead_email,
-                        "organization_id": organization_id,
-                        "role": "end-user",
-                        "tags": ["ai_site_factory", "ai_site_email_contact"],
-                    }
-                },
-                auth=auth,
-                headers=headers,
-                timeout=30,
-            )
-            user_create.raise_for_status()
-            user = user_create.json().get("user", {})
+    requester = ensure_zendesk_intake_requester(
+        business_name=business_name,
+        canonical_key=canonical_key,
+        lead_email=lead_email,
+        lead_phone=lead_phone,
+        organization_id=organization_id,
+        base_url=base_url,
+        auth=auth,
+        headers=headers,
+    )
 
     for channel in pending_channels:
         spec = channel_specs[channel]
@@ -7774,8 +7797,7 @@ def create_zendesk_intake_tickets(
                 "custom_fields": custom_fields,
             }
         }
-        if channel == "email" and user.get("id"):
-            ticket_payload["ticket"]["requester_id"] = user.get("id")
+        ticket_payload["ticket"]["requester_id"] = requester["id"]
 
         idempotency_key = f"asf-{hashlib.sha256(spec['externalId'].encode('utf-8')).hexdigest()[:48]}"
         response = requests.post(
@@ -7812,6 +7834,16 @@ def create_zendesk_intake_tickets(
                     "missingFieldIds": missing_values,
                 },
             )
+        if compact_text(ticket.get("requester_id")) != compact_text(requester["id"]):
+            raise HTTPException(
+                status_code=502,
+                detail={
+                    "code": "ZENDESK_REQUESTER_NOT_ASSIGNED",
+                    "message": "Zendesk created the intake ticket without the business requester.",
+                    "ticketId": ticket.get("id"),
+                    "channel": channel,
+                },
+            )
         created.append(
             save_zendesk_ticket_link(
                 approval_id=normalized_approval_id,
@@ -7825,7 +7857,8 @@ def create_zendesk_intake_tickets(
                 tags=tags,
                 payload={
                     "organizationId": organization_id,
-                    "userId": user.get("id") if channel == "email" else None,
+                    "userId": requester["id"],
+                    "requesterName": business_name,
                     "contact": contact_value,
                     "customFields": custom_fields,
                     "brandId": contract["brandId"],
