@@ -1204,6 +1204,29 @@ PIPELINE_SEED_ANCHOR_TABLES = [
     "lead_registry",
 ]
 
+PIPELINE_DATA_CLEANUP_VERSION = "demo-reset-2026-07-17-v1"
+PIPELINE_OPERATIONAL_TABLES = [
+    "campaign_import_items",
+    "campaign_import_jobs",
+    "campaign_lead_identity_claims",
+    "deploy_webhook_claims",
+    "zendesk_webhook_events",
+    "zendesk_ticket_links",
+    "campaign_email_leads",
+    "campaign_call_leads",
+    "campaign_deployments",
+    "campaigns",
+    "approval_records",
+    "deployment_history",
+    "github_site_repos",
+    "site_registry",
+    "pipeline_steps",
+    "pipeline_runs",
+    "discovery_batches",
+    "lead_identity_index",
+    "lead_registry",
+]
+
 ZENDESK_CONFIG_SEED_TABLES = [
     "zendesk_field_settings",
     "zendesk_provisioned_resources",
@@ -1258,6 +1281,12 @@ def init_pipeline_db() -> None:
                 first_seen_at TEXT NOT NULL,
                 last_seen_at TEXT NOT NULL,
                 discovery_count INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS app_metadata (
+                key TEXT PRIMARY KEY,
+                value TEXT,
+                updated_at TEXT NOT NULL
             );
 
             CREATE TABLE IF NOT EXISTS lead_identity_index (
@@ -1751,6 +1780,71 @@ def restore_pipeline_seed_if_empty() -> Dict[str, Any]:
             restoredCounts=restored_counts,
         )
     return result
+
+
+def clear_pipeline_operational_data(cleanup_version: str = PIPELINE_DATA_CLEANUP_VERSION) -> Dict[str, Any]:
+    """Delete campaign/demo activity while retaining Zendesk configuration and field mappings."""
+    deleted_counts: Dict[str, int] = {}
+    with get_pipeline_db() as db:
+        db.execute("PRAGMA foreign_keys = OFF")
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            available_tables = {
+                row["name"]
+                for row in db.execute("SELECT name FROM sqlite_master WHERE type = 'table'").fetchall()
+            }
+            for table in PIPELINE_OPERATIONAL_TABLES:
+                if table not in available_tables:
+                    continue
+                count = db.execute(f'SELECT COUNT(*) AS count FROM "{table}"').fetchone()["count"]
+                db.execute(f'DELETE FROM "{table}"')
+                deleted_counts[table] = count
+            db.execute(
+                """
+                INSERT INTO app_metadata (key, value, updated_at) VALUES ('pipeline_data_cleanup_version', ?, ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+                """,
+                (cleanup_version, now_iso()),
+            )
+            foreign_key_issues = db.execute("PRAGMA foreign_key_check").fetchall()
+            if foreign_key_issues:
+                raise RuntimeError(f"Operational data cleanup violates a foreign key: {dict(foreign_key_issues[0])}")
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.execute("PRAGMA foreign_keys = ON")
+
+    LEADS_DB.clear()
+    CONTENT_DB.clear()
+    PREVIEW_DB.clear()
+    DISCOVERY_DB.clear()
+    PIPELINE_DB.clear()
+    total = sum(deleted_counts.values())
+    log_event(
+        "info",
+        "pipeline.operational_data_cleared",
+        "Historical campaign and demo activity was removed; configuration was retained.",
+        cleanupVersion=cleanup_version,
+        total=total,
+        deletedCounts=deleted_counts,
+    )
+    return {"cleared": True, "cleanupVersion": cleanup_version, "total": total, "deletedCounts": deleted_counts}
+
+
+def cleanup_pipeline_operational_data_on_startup() -> Dict[str, Any]:
+    """Run the requested demo reset once on Render, with an environment override available."""
+    enabled = env_enabled("ENABLE_PIPELINE_DATA_CLEANUP") if os.getenv("ENABLE_PIPELINE_DATA_CLEANUP") is not None else env_enabled("RENDER")
+    if not enabled:
+        return {"cleared": False, "reason": "pipeline_data_cleanup_disabled"}
+    with get_pipeline_db() as db:
+        marker = db.execute(
+            "SELECT value FROM app_metadata WHERE key = 'pipeline_data_cleanup_version'"
+        ).fetchone()
+    if marker and marker["value"] == PIPELINE_DATA_CLEANUP_VERSION:
+        return {"cleared": False, "reason": "cleanup_already_applied", "cleanupVersion": marker["value"]}
+    return clear_pipeline_operational_data()
 
 
 def pipeline_seed_restore_enabled() -> bool:
@@ -3549,6 +3643,7 @@ def backfill_legacy_campaign_data() -> Dict[str, int]:
 
 init_pipeline_db()
 bootstrap_pipeline_seed_on_startup()
+cleanup_pipeline_operational_data_on_startup()
 bootstrap_zendesk_config_on_startup()
 if env_enabled("ENABLE_LEGACY_CAMPAIGN_BACKFILL"):
     backfill_legacy_campaign_data()

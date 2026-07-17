@@ -178,27 +178,27 @@ def isolated_pipeline_db(tmp_path, monkeypatch):
     yield
 
 
-def test_empty_deployment_restores_previous_application_data():
+def test_empty_deployment_restores_configuration_without_demo_activity():
     first_restore = main.restore_pipeline_seed_if_empty()
 
     assert first_restore["restored"] is True
-    assert first_restore["restoredCounts"]["campaigns"] == 37
-    assert first_restore["restoredCounts"]["campaign_email_leads"] == 11
-    assert first_restore["restoredCounts"]["campaign_call_leads"] == 17
-    assert first_restore["restoredCounts"]["campaign_deployments"] == 17
+    assert first_restore["restoredCounts"]["campaigns"] == 0
+    assert first_restore["restoredCounts"]["campaign_email_leads"] == 0
+    assert first_restore["restoredCounts"]["campaign_call_leads"] == 0
+    assert first_restore["restoredCounts"]["campaign_deployments"] == 0
+    assert first_restore["restoredCounts"]["zendesk_field_settings"] == 20
+    assert first_restore["restoredCounts"]["zendesk_provisioned_resources"] == 30
 
     response = client.get("/api/campaigns?limit=200")
     assert response.status_code == 200
     payload = response.json()
-    assert payload["totals"]["campaigns"] == 37
-    assert payload["totals"]["leads"] == 28
-    detail = client.get(f"/api/campaigns/{payload['campaigns'][0]['campaignId']}")
-    assert detail.status_code == 200
-    assert detail.json()["campaignId"] == payload["campaigns"][0]["campaignId"]
+    assert payload["totals"]["campaigns"] == 0
+    assert payload["totals"]["leads"] == 0
+    assert payload["campaigns"] == []
 
     second_restore = main.restore_pipeline_seed_if_empty()
     assert second_restore["restored"] is False
-    assert second_restore["reason"] == "database_not_empty"
+    assert second_restore["reason"] == "seed_empty"
 
 
 def test_empty_deployment_bootstraps_only_zendesk_config(monkeypatch):
@@ -250,6 +250,64 @@ def test_startup_pipeline_seed_restore_defaults_on_for_render(monkeypatch):
     monkeypatch.setattr(main, "restore_pipeline_seed_if_empty", lambda: expected)
 
     assert main.bootstrap_pipeline_seed_on_startup() == expected
+
+
+def test_operational_data_cleanup_retains_zendesk_configuration():
+    restored = main.restore_pipeline_seed_if_empty()
+    assert restored["restored"] is True
+    timestamp = main.now_iso()
+    with main.get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT INTO campaigns (
+                id, name, industry, query, location, requested_count, discovered_count,
+                channel_filter, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "campaign-cleanup-test",
+                "Disposable demo campaign",
+                "Testing",
+                "test leads",
+                "Durban",
+                1,
+                0,
+                "email",
+                "INTAKE_READY",
+                timestamp,
+                timestamp,
+            ),
+        )
+
+    result = main.clear_pipeline_operational_data("test-demo-reset")
+
+    assert result["cleared"] is True
+    assert result["deletedCounts"]["campaigns"] == 1
+    with main.get_pipeline_db() as db:
+        for table in main.PIPELINE_OPERATIONAL_TABLES:
+            assert db.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM zendesk_field_settings").fetchone()[0] == 20
+        assert db.execute("SELECT COUNT(*) FROM zendesk_provisioned_resources").fetchone()[0] == 30
+        marker = db.execute(
+            "SELECT value FROM app_metadata WHERE key = 'pipeline_data_cleanup_version'"
+        ).fetchone()
+        assert marker["value"] == "test-demo-reset"
+
+
+def test_render_operational_cleanup_runs_once(monkeypatch):
+    main.restore_pipeline_seed_if_empty()
+    monkeypatch.setenv("RENDER", "true")
+
+    first = main.cleanup_pipeline_operational_data_on_startup()
+    second = main.cleanup_pipeline_operational_data_on_startup()
+
+    assert first["cleared"] is True
+    assert first["cleanupVersion"] == main.PIPELINE_DATA_CLEANUP_VERSION
+    assert second == {
+        "cleared": False,
+        "reason": "cleanup_already_applied",
+        "cleanupVersion": main.PIPELINE_DATA_CLEANUP_VERSION,
+    }
 
 
 def test_startup_zendesk_bootstrap_defaults_on(monkeypatch):
