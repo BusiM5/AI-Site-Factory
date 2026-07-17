@@ -1,0 +1,11 @@
+.git/
+.pytest_cache/
+.venv/
+.vscode/
+backend/
+docs/
+generated-sites/
+scripts/
+frontend/node_modules/
+frontend/dist/
+*.log

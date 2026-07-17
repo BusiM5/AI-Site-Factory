@@ -25,3 +25,5 @@ generated-sites/
 
 dist/
 build/
+.vercel/
+.env.local
