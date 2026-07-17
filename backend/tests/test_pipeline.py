@@ -163,6 +163,29 @@ def test_existing_legacy_fallback_svg_is_upgraded_without_touching_other_data_im
     assert upgraded_again.count(payloads[0]) == 1
 
 
+def test_uploaded_google_main_image_is_preserved_as_the_site_hero():
+    main_image_url = "https://lh3.googleusercontent.com/example-business-photo=w1200-h800"
+    lead = main.DiscoveredLead(
+        leadKey="place-image-test",
+        businessName="Image Test Restaurant",
+        phone="+27 31 555 0100",
+        category="Restaurant",
+        location="Durban",
+        raw={"imageUrl": main_image_url},
+    )
+
+    context = main.build_public_lead_context(lead, {}, "canonical-image-test")
+    generated = main.ensure_generated_hero_and_working_links(
+        '<!doctype html><html><body><img src="data:image/svg+xml;base64,OLD" alt="Generated hero"></body></html>',
+        context,
+    )
+    fallback = main.build_bootstrap_gsap_landing_html(context, dict(main.FREEFORM_SITE_SPEC))
+
+    assert context["mainImageUrl"] == main_image_url
+    assert f'src="{main_image_url}"' in generated
+    assert f'src="{main_image_url}"' in fallback
+
+
 @pytest.fixture(autouse=True)
 def isolated_pipeline_db(tmp_path, monkeypatch):
     monkeypatch.setenv("PIPELINE_DB_PATH", str(tmp_path / "pipeline.db"))

@@ -119,7 +119,7 @@ Rules:
 - The page must include Bootstrap 5.3.8 and at least two additional styling libraries. Prefer Bootstrap 5.3.8, Tailwind browser CDN, and Animate.css when unsure.
 - Include a visible dynamic color/theme widget that lets visitors change site colors and persists selections with localStorage.
 - Include accessible semantic sections, mobile-first responsive layout, clear contact options, and grounded calls to action.
-- Include a prominent generated hero/banner image personalised to the business name, industry, location, and public lead context. Prefer an inline SVG or data URI so the page works as a single file; do not rely on stock-photo URLs.
+- When mainImageUrl is supplied, use that exact public business-listing image as the prominent hero/banner image. Otherwise, include a generated hero image personalised to the business name, industry, location, and public lead context; prefer an inline SVG or data URI and do not rely on unrelated stock-photo URLs.
 - Personalise the copy with concrete supplied details such as business name, category/industry, city/location, address, rating/review count, source listing, phone, email, service keywords, differentiators, and proof points when they are present. Avoid generic filler when a supplied detail is available.
 - CTA buttons must have working destinations: use mailto: for email leads, tel: for phone leads, the supplied website URL if present, or valid in-page anchors such as #services and #contact. Do not use empty hrefs, href="#", javascript:void(0), or non-functional buttons.
 - Do not include external tracking pixels, forms that submit data, or claims of consent.
@@ -4187,6 +4187,17 @@ def build_public_lead_context(
     email = contact_details.get("email") or lead.email
     phone = contact_details.get("phone") or lead.phone
     website = contact_details.get("website") or lead.website
+    raw_lead = lead.raw or {}
+    main_image_url = uploaded_row_value(
+        raw_lead,
+        ["mainImageUrl", "main_image_url", "imageUrl", "image_url", "photoUrl", "photo_url"],
+    )
+    if not main_image_url:
+        images = raw_lead.get("images") or raw_lead.get("imageUrls") or raw_lead.get("image_urls")
+        if isinstance(images, list) and images:
+            first_image = images[0]
+            main_image_url = first_image.get("url") if isinstance(first_image, dict) else first_image
+    main_image_url = normalize_url(main_image_url)
     return {
         "canonicalLeadKey": canonical_key,
         "leadKey": lead.leadKey,
@@ -4205,13 +4216,14 @@ def build_public_lead_context(
         "reviewsCount": lead.reviewsCount,
         "source": lead.source,
         "sourceUrl": lead.sourceUrl,
+        "mainImageUrl": main_image_url,
         "notes": contact_details.get("notes") or lead.notes,
         "summary": contact_details.get("notes") or lead.notes or f"{lead.businessName} is a local {lead.category} business.",
         "targetCustomers": "Local customers",
         "differentiators": [],
         "serviceKeywords": [lead.category],
         "sourceNote": "Public Google Maps, business listing, and website context.",
-        "rawLead": lead.raw or {},
+        "rawLead": raw_lead,
         "noWebsiteLead": not bool(normalize_url(website) or normalize_domain(lead.domain)),
     }
 
@@ -4221,7 +4233,7 @@ def compact_lead_with_groq(context: Dict[str, Any]) -> Dict[str, Any]:
         "Compact this public lead into a concise business brief for Gemini to build a landing page. "
         "Use as much of the lead as is useful, including raw listing fields, but remove repetition. "
         "Return strict JSON with keys: businessName, industry, location, address, email, phone, "
-        "summary, serviceKeywords, differentiators, proofPoints, sourceLabel, sourceUrl, noWebsiteLead, "
+        "summary, serviceKeywords, differentiators, proofPoints, sourceLabel, sourceUrl, mainImageUrl, noWebsiteLead, "
         "contactType, designHints, complianceNotes. Arrays must be arrays. "
         "Do not invent private facts, services, guarantees, prices, awards, or consent.\n\n"
         f"Lead context: {model_safe_json(context)}"
@@ -4255,6 +4267,7 @@ def compact_lead_with_groq(context: Dict[str, Any]) -> Dict[str, Any]:
     brief.setdefault("summary", context.get("summary"))
     brief.setdefault("sourceLabel", context.get("source") or "public business listing")
     brief.setdefault("sourceUrl", context.get("sourceUrl"))
+    brief.setdefault("mainImageUrl", context.get("mainImageUrl"))
     brief.setdefault("noWebsiteLead", True)
     brief.setdefault("designHints", [])
     brief.setdefault("complianceNotes", "Use public lead details only; outreach requires opt-in or agent consent handling.")
@@ -4283,15 +4296,26 @@ def ensure_generated_hero_and_working_links(site_html: str, context: Dict[str, A
     html_value = site_html
     lower_html = html_value.lower()
     contact_href, contact_label = contact_cta_for_context(context)
+    main_image_url = normalize_url(context.get("mainImageUrl"))
 
-    if "<img" not in lower_html and "<svg" not in lower_html:
+    if main_image_url and main_image_url not in html_value:
+        image_pattern = r'(<img\b[^>]*?\bsrc=)(["\'])(.*?)(\2)'
+        if re.search(image_pattern, html_value, flags=re.IGNORECASE | re.DOTALL):
+            html_value = re.sub(
+                image_pattern,
+                lambda match: f'{match.group(1)}{match.group(2)}{html.escape(main_image_url, quote=True)}{match.group(4)}',
+                html_value,
+                count=1,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            lower_html = html_value.lower()
+
+    if "<img" not in lower_html and (main_image_url or "<svg" not in lower_html):
         business_name = compact_text(context.get("businessName"), "Local Business")
         industry = compact_text(context.get("industry"), "Local Service")
         location = compact_text(context.get("location"), "South Africa")
-        hero_image = fallback_image_data_uri(
-            business_name,
-            "#0f9f96",
-            f"{industry} in {location}",
+        hero_image = main_image_url or fallback_image_data_uri(
+            business_name, "#0f9f96", f"{industry} in {location}",
             compact_text(context.get("address") or context.get("sourceLabel") or context.get("source"), "Generated for this business"),
         )
         hero_markup = f"""
@@ -4301,7 +4325,7 @@ def ensure_generated_hero_and_working_links(site_html: str, context: Dict[str, A
     <h2>{html.escape(business_name)}</h2>
     <p>Generated visual based on the supplied public business details.</p>
   </div>
-  <img src="{hero_image}" alt="Generated banner image for {html.escape(business_name)}">
+  <img src="{html.escape(hero_image, quote=True)}" alt="Main image for {html.escape(business_name)}">
 </section>
 """
         hero_css = """
@@ -4496,11 +4520,8 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
     elif reviews_raw:
         detail_bits.append(f"{reviews_raw} public reviews")
 
-    hero_image = fallback_image_data_uri(
-        business_name_raw,
-        accent,
-        f"{industry_raw} in {location_raw}",
-        " | ".join(detail_bits[:3]),
+    hero_image = normalize_url(context.get("mainImageUrl")) or fallback_image_data_uri(
+        business_name_raw, accent, f"{industry_raw} in {location_raw}", " | ".join(detail_bits[:3]),
     )
 
     contact_target = "#contact"
