@@ -211,6 +211,12 @@ def test_empty_deployment_restores_configuration_without_demo_activity():
     assert first_restore["restoredCounts"]["campaign_deployments"] == 0
     assert first_restore["restoredCounts"]["zendesk_field_settings"] == 20
     assert first_restore["restoredCounts"]["zendesk_provisioned_resources"] == 30
+    restored_fields = main.get_zendesk_field_settings()
+    assert restored_fields["canonicalLeadKey"] == "28939446436508"
+    assert restored_fields["pipelineId"] == "28939465524508"
+    assert restored_fields["approvalId"] == "28939458660636"
+    assert restored_fields["deployRequested"] == "28939474364188"
+    assert restored_fields["liveUrl"] == "28939458703388"
 
     response = client.get("/api/campaigns?limit=200")
     assert response.status_code == 200
@@ -1957,6 +1963,46 @@ def test_zendesk_setup_provisions_inactive_live_only_cancellation_triggers(monke
         assert '"action":"cancel_deployment"' in webhook_action["value"][1]
 
 
+def test_live_zendesk_field_reconciliation_replaces_stale_restored_ids(monkeypatch):
+    current_ids = configure_managed_zendesk_contract()
+    stale_ids = {key: str(8000 + index) for index, key in enumerate(main.ZENDESK_FIELD_KEYS)}
+    main.save_zendesk_field_settings(stale_ids)
+    live_fields = [
+        {
+            "id": current_ids[definition["key"]],
+            "title": definition["title"],
+            "type": definition["type"],
+            "agent_description": f"[AI Site Factory key={definition['key']}] {definition['description']}",
+        }
+        for definition in main.ZENDESK_FIELD_BLUEPRINT
+    ]
+    canonical_definition = next(
+        definition for definition in main.ZENDESK_FIELD_BLUEPRINT if definition["key"] == "canonicalLeadKey"
+    )
+    live_fields.insert(
+        0,
+        {
+            "id": stale_ids["canonicalLeadKey"],
+            "title": canonical_definition["title"],
+            "type": canonical_definition["type"],
+            "agent_description": "Legacy duplicate without the managed marker.",
+        },
+    )
+    monkeypatch.setattr(main, "zendesk_connection_snapshot", lambda: {"connected": True})
+    monkeypatch.setattr(
+        main,
+        "zendesk_list_all",
+        lambda path, key: live_fields if path == "/ticket_fields.json" and key == "ticket_fields" else [],
+    )
+
+    result = main.reconcile_zendesk_field_settings_from_live_instance()
+
+    assert result["reconciled"] is True
+    assert result["resolvedCount"] == len(main.ZENDESK_FIELD_KEYS)
+    assert set(result["changed"]) == set(main.ZENDESK_FIELD_KEYS)
+    assert main.get_zendesk_field_settings() == current_ids
+
+
 def test_managed_zendesk_fields_encode_dropdown_values_and_route_channel_forms():
     main.save_zendesk_field_settings({"contactChannel": "1001", "leadStatus": "1002", "phoneCallStatus": "1003"})
     main.save_zendesk_provisioned_resource("field:contactChannel", "ticket_field", "1001", "Channel", {"type": "tagger"})
@@ -2390,6 +2436,30 @@ def test_cancellation_webhook_recovers_missing_state_and_live_url(monkeypatch):
     for field in ticket["custom_fields"]:
         if str(field["id"]) == field_ids["deployRequested"]:
             field["value"] = False
+    main.save_zendesk_field_settings(
+        {
+            "canonicalLeadKey": "88001",
+            "pipelineId": "88002",
+            "approvalId": "88003",
+            "deployRequested": "88004",
+            "liveUrl": "88005",
+        }
+    )
+    live_fields = [
+        {
+            "id": field_ids[definition["key"]],
+            "title": definition["title"],
+            "type": definition["type"],
+            "agent_description": f"[AI Site Factory key={definition['key']}] {definition['description']}",
+        }
+        for definition in main.ZENDESK_FIELD_BLUEPRINT
+    ]
+    monkeypatch.setattr(main, "zendesk_connection_snapshot", lambda: {"connected": True})
+    monkeypatch.setattr(
+        main,
+        "zendesk_list_all",
+        lambda path, key: live_fields if path == "/ticket_fields.json" and key == "ticket_fields" else [],
+    )
     monkeypatch.setattr(
         main,
         "zendesk_api_request",
@@ -2409,6 +2479,8 @@ def test_cancellation_webhook_recovers_missing_state_and_live_url(monkeypatch):
     )
 
     assert recovered["id"] == ticket["_approval_id"]
+    assert main.get_zendesk_field_settings()["canonicalLeadKey"] == field_ids["canonicalLeadKey"]
+    assert main.get_zendesk_field_settings()["approvalId"] == field_ids["approvalId"]
     link = main.get_zendesk_ticket_link(ticket["_approval_id"], "email", "intake", 5806)
     assert link["payload"]["liveUrl"] == "https://recovered-site.netlify.app"
 

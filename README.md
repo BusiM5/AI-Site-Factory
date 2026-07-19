@@ -60,6 +60,8 @@ Campaign persistence uses `campaigns`, `campaign_email_leads`, `campaign_call_le
 
 The Zendesk setup wizard requires one existing brand selected from the live instance inventory. Both forms and managed views are scoped to that brand, and its ID is added to every intake ticket. Custom field IDs are discovered and saved rather than typed into the UI. Existing compatible text fields are adopted without changing their type, while unsafe mismatches block provisioning before any writes. Optional webhook triggers are created inactive for review and testing.
 
+On application startup, saved Zendesk field IDs are reconciled against the live fields' stable `[AI Site Factory key=...]` markers. This prevents an ephemeral Render restart from restoring stale IDs and causing otherwise valid webhook tickets to fail identity validation.
+
 Ticket lifecycle tags are stable automation contracts. Intake uses `asf_managed`, source (`asf_source_apify_google_maps` or `asf_source_upload`), channel/form, and `asf_deploy_pending` tags. Deployment progresses through `asf_deploy_requested`, `asf_stage_generating`, `asf_artifact_ready`, `asf_repo_ready`, `asf_stage_deploying`, and finally `asf_deployed` plus `asf_stage_live`. Cancellation uses `asf_deployment_cancelled` plus `asf_stage_cancelled`; failures use `asf_generation_failed` or `asf_deploy_failed` with `asf_stage_failed`.
 
 On backend startup, `backfill_legacy_campaign_data()` imports pre-campaign discovery batches, pipeline runs, approvals, Zendesk tickets, GitHub exports, and deployment history into these tables. Deterministic legacy IDs and `INSERT OR IGNORE` make the migration safe to run repeatedly. `POST /api/campaigns/backfill` can trigger the same idempotent import manually.

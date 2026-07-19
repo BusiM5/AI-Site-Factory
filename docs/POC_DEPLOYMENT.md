@@ -160,6 +160,8 @@ The recommended path is the app's **Zendesk setup** screen:
 
 Provisioning creates fields before forms, then views, then automation. It never deletes Zendesk resources and is safe to rerun. Automation creates one active authenticated webhook and five inactive triggers (email deploy, call deploy, email cancellation, call cancellation, and approved email send) so an administrator can test them before enabling them. Ticket forms require a Zendesk plan that supports multiple forms.
 
+Every backend startup reconciles the stored custom-field IDs against the live field markers before webhook traffic is accepted. Keep the markers in each managed field's agent description; they allow an ephemeral Render instance to replace stale seed IDs safely without renaming or recreating fields.
+
 For a manual setup, use the contract below.
 
 Update the AI Site Factory webhook:

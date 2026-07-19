@@ -9367,6 +9367,114 @@ def inspect_zendesk_inventory() -> Tuple[Dict[str, List[Dict[str, Any]]], Dict[s
     return inventory, errors
 
 
+def reconcile_zendesk_field_settings_from_live_instance() -> Dict[str, Any]:
+    """Replace stale ephemeral field IDs with marker-verified IDs from Zendesk."""
+    if not zendesk_connection_snapshot()["connected"]:
+        return {"reconciled": False, "reason": "zendesk_not_connected", "changed": {}}
+
+    ticket_fields = zendesk_list_all("/ticket_fields.json", "ticket_fields")
+    saved_settings = get_zendesk_field_settings()
+    saved_resources = list_zendesk_provisioned_resources()
+    resolved: Dict[str, Optional[str]] = {}
+    changed: Dict[str, Dict[str, Optional[str]]] = {}
+    missing: List[str] = []
+    conflicts: List[str] = []
+
+    for definition in ZENDESK_FIELD_BLUEPRINT:
+        key = definition["key"]
+        marker = f"[AI Site Factory key={key}]"
+        saved_resource = saved_resources.get(f"field:{key}", {})
+        match = next(
+            (
+                field
+                for field in ticket_fields
+                if marker in compact_text(field.get("agent_description"))
+            ),
+            None,
+        )
+        source: Optional[str] = "marker" if match else None
+        if not match:
+            match, source = zendesk_match_resource(
+                ticket_fields,
+                saved_resource.get("resourceId") or saved_settings.get(key),
+                definition["title"],
+                name_key="title",
+            )
+        if not match:
+            missing.append(key)
+            continue
+        if not zendesk_field_types_compatible(definition["type"], compact_text(match.get("type"))):
+            conflicts.append(key)
+            continue
+
+        field_id = compact_text(match.get("id"))
+        if not field_id:
+            missing.append(key)
+            continue
+        resolved[key] = field_id
+        if compact_text(saved_settings.get(key)) != field_id:
+            changed[key] = {
+                "from": compact_text(saved_settings.get(key)) or None,
+                "to": field_id,
+                "matchSource": source,
+            }
+        save_zendesk_provisioned_resource(
+            f"field:{key}",
+            "ticket_field",
+            field_id,
+            definition["title"],
+            {
+                "type": compact_text(match.get("type"), definition["type"]),
+                "blueprintType": definition["type"],
+                "forms": definition["forms"],
+                "reconciledFrom": source,
+            },
+        )
+
+    if resolved:
+        save_zendesk_field_settings(resolved)
+    result = {
+        "reconciled": not missing and not conflicts and len(resolved) == len(ZENDESK_FIELD_KEYS),
+        "reason": "live_field_ids_reconciled" if not missing and not conflicts else "live_field_ids_partial",
+        "resolvedCount": len(resolved),
+        "changed": changed,
+        "missing": missing,
+        "conflicts": conflicts,
+    }
+    log_event(
+        "info" if result["reconciled"] else "warning",
+        "zendesk.field_ids_reconciled",
+        "Managed Zendesk field IDs were reconciled against the live instance.",
+        **result,
+    )
+    return result
+
+
+def reconcile_zendesk_fields_on_startup() -> Dict[str, Any]:
+    """Block application startup until live Zendesk field IDs are refreshed when configured."""
+    if not env_enabled("ENABLE_ZENDESK_FIELD_RECONCILIATION", default=True):
+        return {"reconciled": False, "reason": "zendesk_field_reconciliation_disabled", "changed": {}}
+    try:
+        return reconcile_zendesk_field_settings_from_live_instance()
+    except Exception as error:
+        message = sanitize_message(error)
+        log_event(
+            "error",
+            "zendesk.field_ids_reconciliation_failed",
+            "Live Zendesk field reconciliation failed; the last saved mapping remains in use.",
+            error=message,
+        )
+        return {
+            "reconciled": False,
+            "reason": "zendesk_field_reconciliation_failed",
+            "changed": {},
+            "error": message,
+        }
+
+
+app.router.add_event_handler("startup", reconcile_zendesk_fields_on_startup)
+
+
 def zendesk_match_resource(
     items: List[Dict[str, Any]],
     saved_id: Optional[Any],
@@ -11974,8 +12082,53 @@ def recover_managed_zendesk_webhook_approval(request: ZendeskWebhookRequest) -> 
             detail="Only a managed deploy or cancellation webhook can recover a missing deferred approval.",
         )
 
-    contract = require_zendesk_ticket_contract(requested_channel)
+    try:
+        contract = require_zendesk_ticket_contract(requested_channel)
+    except HTTPException as error:
+        detail = error.detail if isinstance(error.detail, dict) else {}
+        if error.status_code != 409 or detail.get("code") != "ZENDESK_TICKET_CONTRACT_INVALID":
+            raise
+        reconciliation = reconcile_zendesk_field_settings_from_live_instance()
+        if not reconciliation.get("reconciled"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ZENDESK_FIELD_MAPPING_NOT_READY",
+                    "message": "The live Zendesk field mapping could not be fully reconciled before ticket recovery.",
+                    "missing": reconciliation.get("missing", []),
+                    "conflicts": reconciliation.get("conflicts", []),
+                },
+            ) from error
+        contract = require_zendesk_ticket_contract(requested_channel)
     ticket = zendesk_api_request("get", f"/tickets/{ticket_id}.json").get("ticket") or {}
+    initial_field_values = {
+        compact_text(item.get("id")): item.get("value")
+        for item in (ticket.get("custom_fields") or [])
+    }
+    mapping_mismatch = (
+        compact_text(request.approvalId)
+        and compact_text(
+            initial_field_values.get(compact_text(contract["fieldIds"].get("approvalId")))
+        ) != compact_text(request.approvalId)
+    ) or (
+        compact_text(request.canonicalLeadKey)
+        and compact_text(
+            initial_field_values.get(compact_text(contract["fieldIds"].get("canonicalLeadKey")))
+        ) != compact_text(request.canonicalLeadKey)
+    )
+    if mapping_mismatch:
+        reconciliation = reconcile_zendesk_field_settings_from_live_instance()
+        if not reconciliation.get("reconciled"):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "ZENDESK_FIELD_MAPPING_NOT_READY",
+                    "message": "The live Zendesk field mapping could not be fully reconciled before ticket recovery.",
+                    "missing": reconciliation.get("missing", []),
+                    "conflicts": reconciliation.get("conflicts", []),
+                },
+            )
+        contract = require_zendesk_ticket_contract(requested_channel)
     ticket_tags = {compact_text(tag) for tag in (ticket.get("tags") or []) if compact_text(tag)}
     required_tags = {
         "ai_site_factory",
