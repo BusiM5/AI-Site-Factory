@@ -158,7 +158,7 @@ The recommended path is the app's **Zendesk setup** screen:
 4. Select the existing Zendesk brand that will own the managed forms, views, and intake tickets.
 5. Optionally select managed views and webhook automation, confirm the disclaimer, and provision.
 
-Provisioning creates fields before forms, then views, then automation. It never deletes Zendesk resources and is safe to rerun. Automation creates one active authenticated webhook and three inactive triggers (email deploy, call deploy, and approved email send) so an administrator can test them before enabling them. Ticket forms require a Zendesk plan that supports multiple forms.
+Provisioning creates fields before forms, then views, then automation. It never deletes Zendesk resources and is safe to rerun. Automation creates one active authenticated webhook and five inactive triggers (email deploy, call deploy, email cancellation, call cancellation, and approved email send) so an administrator can test them before enabling them. Ticket forms require a Zendesk plan that supports multiple forms.
 
 For a manual setup, use the contract below.
 
@@ -201,7 +201,22 @@ The deploy trigger is valid for both `email` and `phone` channel tickets. Config
 }
 ```
 
-Stable form/view tags include `asf_managed`, `asf_form_email_lead`, `asf_form_call_lead`, `asf_channel_email`, `asf_channel_phone`, `asf_source_apify_google_maps`, `asf_source_upload`, `asf_deploy_pending`, `asf_deploy_requested`, `asf_stage_generating`, `asf_artifact_ready`, `asf_repo_ready`, `asf_stage_deploying`, `asf_can_deploy`, `asf_email_send_pending`, `asf_call_pending`, `asf_deployed`, `asf_stage_live`, `asf_generation_failed`, `asf_deploy_failed`, and `asf_stage_failed`.
+Create separate email and phone cancellation triggers. Each should run when the ticket is below solved, is on the corresponding managed form, has `AI Site Factory - Deploy site` set to false, includes `asf_deployed`, and does not include its channel's cancellation fired tag. Send:
+
+```json
+{
+  "action": "cancel_deployment",
+  "approvalId": "{{ticket.ticket_field_APPROVAL_ID_FIELD_ID}}",
+  "canonicalLeadKey": "{{ticket.ticket_field_CANONICAL_LEAD_KEY_FIELD_ID}}",
+  "zendeskTicketId": "{{ticket.id}}",
+  "channel": "{{ticket.ticket_field_CONTACT_CHANNEL_FIELD_ID}}",
+  "actor": "Zendesk"
+}
+```
+
+Cancellation disables the existing Netlify site, clears the live URL on the ticket and local deployment state, and leaves the GitHub repository intact. Rechecking the deploy field can re-enable and redeploy it.
+
+Stable form/view tags include `asf_managed`, `asf_form_email_lead`, `asf_form_call_lead`, `asf_channel_email`, `asf_channel_phone`, `asf_source_apify_google_maps`, `asf_source_upload`, `asf_deploy_pending`, `asf_deploy_requested`, `asf_stage_generating`, `asf_artifact_ready`, `asf_repo_ready`, `asf_stage_deploying`, `asf_can_deploy`, `asf_email_send_pending`, `asf_call_pending`, `asf_deployed`, `asf_stage_live`, `asf_deployment_cancelled`, `asf_stage_cancelled`, `asf_cancel_email_fired`, `asf_cancel_phone_fired`, `asf_generation_failed`, `asf_deploy_failed`, and `asf_stage_failed`.
 
 ## Demo warm-up checklist
 

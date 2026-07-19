@@ -664,6 +664,10 @@ ZENDESK_SETUP_TAGS = [
     "asf_call_pending",
     "asf_deployed",
     "asf_stage_live",
+    "asf_deployment_cancelled",
+    "asf_stage_cancelled",
+    "asf_cancel_email_fired",
+    "asf_cancel_phone_fired",
     "asf_generation_failed",
     "asf_deploy_failed",
     "asf_stage_failed",
@@ -6494,6 +6498,80 @@ def netlify_current_build_from_list(
     return exact
 
 
+def enable_netlify_site(site_id: str, headers: Dict[str, str]) -> None:
+    response = requests.put(
+        f"https://api.netlify.com/api/v1/sites/{site_id}/enable",
+        headers=headers,
+        timeout=30,
+    )
+    if response.status_code not in {200, 204}:
+        response.raise_for_status()
+
+
+def cancel_netlify_site_for_lead(canonical_key: str) -> Dict[str, Any]:
+    token = require_env("NETLIFY_AUTH_TOKEN")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "AI-Site-Factory",
+    }
+    with get_pipeline_db() as db:
+        site = db.execute(
+            "SELECT * FROM site_registry WHERE canonical_lead_key = ?",
+            (canonical_key,),
+        ).fetchone()
+
+    if not site:
+        return {"status": "NO_SITE", "siteId": None, "previousUrl": None}
+    if compact_text(site["last_deploy_state"]).lower() in {"cancelled", "disabled"}:
+        return {
+            "status": "ALREADY_CANCELLED",
+            "siteId": site["site_id"],
+            "siteName": site["site_name"],
+            "previousUrl": site["url"],
+        }
+
+    response = requests.put(
+        f"https://api.netlify.com/api/v1/sites/{site['site_id']}/disable",
+        headers=headers,
+        params={"reason": "AI Site Factory deployment checkbox was unchecked in Zendesk."},
+        timeout=30,
+    )
+    if response.status_code not in {200, 204, 404}:
+        response.raise_for_status()
+
+    timestamp = now_iso()
+    history = latest_deployment_history_for_lead(canonical_key)
+    with get_pipeline_db() as db:
+        db.execute(
+            """
+            UPDATE site_registry
+            SET url = NULL, last_deploy_state = 'cancelled', updated_at = ?
+            WHERE canonical_lead_key = ?
+            """,
+            (timestamp, canonical_key),
+        )
+        if history:
+            raw = safe_json_loads(history["raw_json"], {})
+            if isinstance(raw, dict):
+                raw.update({"state": "cancelled", "cancelledAt": timestamp})
+            db.execute(
+                """
+                UPDATE deployment_history
+                SET state = 'cancelled', approval_status = 'CANCELLED', raw_json = ?
+                WHERE id = ?
+                """,
+                (json.dumps(raw, default=str), history["id"]),
+            )
+
+    return {
+        "status": "CANCELLED" if response.status_code != 404 else "ALREADY_REMOVED",
+        "siteId": site["site_id"],
+        "siteName": site["site_name"],
+        "previousUrl": site["url"],
+        "cancelledAt": timestamp,
+    }
+
+
 def deploy_github_repo_to_netlify_for_lead(
     canonical_key: str,
     business_name: str,
@@ -6579,6 +6657,8 @@ def deploy_github_repo_to_netlify_for_lead(
     if existing_site:
         site_id = existing_site["site_id"]
         site_name = existing_site["site_name"]
+        if compact_text(existing_site["last_deploy_state"]).lower() in {"cancelled", "disabled"}:
+            enable_netlify_site(site_id, headers)
         site_response = requests.patch(
             f"https://api.netlify.com/api/v1/sites/{site_id}",
             headers={**headers, "Content-Type": "application/json"},
@@ -6929,6 +7009,8 @@ def deploy_direct_netlify_fallback_for_lead(
         )
         if verify_response.status_code == 200:
             verified_existing_site = verify_response.json()
+            if compact_text(existing_site["last_deploy_state"]).lower() in {"cancelled", "disabled"}:
+                enable_netlify_site(existing_site["site_id"], headers)
         elif verify_response.status_code in {403, 404}:
             account_migration = True
             log_event(
@@ -9111,6 +9193,8 @@ def zendesk_setup_resource_plan(values: Dict[str, Any]) -> Dict[str, Any]:
             planned_resource("webhook:actions", "webhook", values["webhookName"]),
             planned_resource("trigger:deploy_email", "trigger", "AI Site Factory - Deploy email lead"),
             planned_resource("trigger:deploy_phone", "trigger", "AI Site Factory - Deploy call lead"),
+            planned_resource("trigger:cancel_email", "trigger", "AI Site Factory - Cancel email deployment"),
+            planned_resource("trigger:cancel_phone", "trigger", "AI Site Factory - Cancel call deployment"),
             planned_resource("trigger:send_email", "trigger", "AI Site Factory - Send approved email"),
         ],
         "brands": ([
@@ -9276,6 +9360,8 @@ def build_zendesk_setup_inspection(
         ("automation", "webhook:actions", "webhook", values["webhookName"], "webhooks", "name"),
         ("automation", "trigger:deploy_email", "trigger", "AI Site Factory - Deploy email lead", "triggers", "title"),
         ("automation", "trigger:deploy_phone", "trigger", "AI Site Factory - Deploy call lead", "triggers", "title"),
+        ("automation", "trigger:cancel_email", "trigger", "AI Site Factory - Cancel email deployment", "triggers", "title"),
+        ("automation", "trigger:cancel_phone", "trigger", "AI Site Factory - Cancel call deployment", "triggers", "title"),
         ("automation", "trigger:send_email", "trigger", "AI Site Factory - Send approved email", "triggers", "title"),
     ]
     grouped: Dict[str, List[Dict[str, Any]]] = {"forms": [], "views": [], "automation": []}
@@ -9575,16 +9661,19 @@ def provision_zendesk_setup(request: ZendeskSetupRequest):
         trigger_specs = [
             ("trigger:deploy_email", "AI Site Factory - Deploy email lead", "email", form_objects["email"]["id"], "deployRequested", "asf_deploy_email_fired", "deploy_site"),
             ("trigger:deploy_phone", "AI Site Factory - Deploy call lead", "phone", form_objects["phone"]["id"], "deployRequested", "asf_deploy_phone_fired", "deploy_site"),
+            ("trigger:cancel_email", "AI Site Factory - Cancel email deployment", "email", form_objects["email"]["id"], "deployRequested", "asf_cancel_email_fired", "cancel_deployment"),
+            ("trigger:cancel_phone", "AI Site Factory - Cancel call deployment", "phone", form_objects["phone"]["id"], "deployRequested", "asf_cancel_phone_fired", "cancel_deployment"),
             ("trigger:send_email", "AI Site Factory - Send approved email", "email", form_objects["email"]["id"], "emailSendRequested", "asf_email_send_fired", "send_email"),
         ]
         for resource_key, name, channel, form_id, checkbox_key, fired_tag, webhook_action in trigger_specs:
+            checkbox_value = "false" if webhook_action == "cancel_deployment" else "true"
             conditions = [
                 {"field": "status", "operator": "less_than", "value": "solved"},
                 {"field": "ticket_form_id", "operator": "is", "value": compact_text(form_id)},
-                {"field": f"custom_fields_{field_ids[checkbox_key]}", "operator": "is", "value": "true"},
+                {"field": f"custom_fields_{field_ids[checkbox_key]}", "operator": "is", "value": checkbox_value},
                 {"field": "current_tags", "operator": "not_includes", "value": fired_tag},
             ]
-            if webhook_action == "send_email":
+            if webhook_action in {"send_email", "cancel_deployment"}:
                 conditions.append({"field": "current_tags", "operator": "includes", "value": "asf_deployed"})
             webhook_body = json.dumps(
                 {"action": webhook_action, "approvalId": approval_placeholder, "canonicalLeadKey": canonical_placeholder, "zendeskTicketId": "{{ticket.id}}", "channel": channel},
@@ -11191,6 +11280,31 @@ def update_campaign_workflow(
         )
 
 
+def cancel_campaign_workflow(approval_id: str) -> None:
+    timestamp = now_iso()
+    with get_pipeline_db() as db:
+        deployment = db.execute(
+            "SELECT * FROM campaign_deployments WHERE approval_id = ?",
+            (approval_id,),
+        ).fetchone()
+        if not deployment:
+            return
+        db.execute(
+            """
+            UPDATE campaign_deployments
+            SET status = 'CANCELLED', live_url = NULL, deployment_history_id = NULL,
+                requested_at = NULL, completed_at = ?, error = NULL, updated_at = ?
+            WHERE approval_id = ?
+            """,
+            (timestamp, timestamp, approval_id),
+        )
+        table = "campaign_email_leads" if deployment["channel"] == "email" else "campaign_call_leads"
+        db.execute(
+            f"UPDATE {table} SET status = 'CANCELLED', deploy_requested = 0, updated_at = ? WHERE approval_id = ?",
+            (timestamp, approval_id),
+        )
+
+
 def campaign_outreach_template(context: Dict[str, Any], site_url: str) -> Dict[str, Any]:
     business_name = compact_text(context.get("businessName"), "your business")
     industry = compact_text(context.get("industry"), "business")
@@ -11219,6 +11333,10 @@ ZENDESK_LIFECYCLE_TAGS = {
     "asf_stage_deploying",
     "asf_deployed",
     "asf_stage_live",
+    "asf_deployment_cancelled",
+    "asf_stage_cancelled",
+    "asf_cancel_email_fired",
+    "asf_cancel_phone_fired",
     "asf_generation_failed",
     "asf_deploy_failed",
     "asf_stage_failed",
@@ -11289,6 +11407,114 @@ def safe_update_zendesk_deployment_lifecycle(
             lifecycleStatus=status,
         )
         return None
+
+
+def cancel_approval_deployment(
+    row: sqlite3.Row,
+    ticket_id: Optional[int],
+    channel: str,
+) -> Dict[str, Any]:
+    cancellation = cancel_netlify_site_for_lead(row["canonical_lead_key"])
+    timestamp = now_iso()
+    github_export = safe_json_loads(row["github_export_json"], {})
+    next_status = "PENDING" if row["html"] and github_export.get("commitSha") else "AWAITING_DEPLOYMENT"
+
+    with get_pipeline_db() as db:
+        db.execute(
+            """
+            UPDATE approval_records
+            SET status = ?, deployment_history_id = NULL, outreach_json = NULL,
+                updated_at = ?, notes = ?
+            WHERE id = ?
+            """,
+            (
+                next_status,
+                timestamp,
+                "Deployment cancelled after the Zendesk deploy checkbox was unchecked.",
+                row["id"],
+            ),
+        )
+        db.execute("DELETE FROM deploy_webhook_claims WHERE approval_id = ?", (row["id"],))
+    cancel_campaign_workflow(row["id"])
+
+    ticket_result: Optional[Dict[str, Any]] = None
+    if ticket_id:
+        link = get_zendesk_ticket_link(row["id"], channel, "intake", ticket_id)
+        tags = update_zendesk_ticket_tags(
+            int(ticket_id),
+            remove=[
+                *ZENDESK_LIFECYCLE_TAGS,
+                "asf_deploy_email_fired",
+                "asf_deploy_phone_fired",
+            ],
+            add=[
+                "asf_managed",
+                f"asf_channel_{channel}",
+                "asf_deployment_cancelled",
+                "asf_stage_cancelled",
+            ],
+        )
+        custom_fields = zendesk_custom_fields(
+            {
+                "deployRequested": False,
+                "leadStatus": "AWAITING_DEPLOYMENT",
+                "contactChannel": channel,
+            }
+        )
+        live_url_field_id = compact_text(get_zendesk_field_settings().get("liveUrl"))
+        if live_url_field_id:
+            custom_fields.append(
+                {
+                    "id": int(live_url_field_id) if live_url_field_id.isdigit() else live_url_field_id,
+                    "value": None,
+                }
+            )
+        extra_fields: Dict[str, Any] = {"status": "open"}
+        if custom_fields:
+            extra_fields["custom_fields"] = custom_fields
+        ticket = update_zendesk_ticket_comment(
+            int(ticket_id),
+            (
+                "AI Site Factory deployment cancelled\n\n"
+                "The Netlify site has been disabled because the Deploy site checkbox was unchecked. "
+                "The GitHub artifact remains available for audit. Rechecking the field will start a new deployment."
+            ),
+            public=False,
+            extra_ticket_fields=extra_fields,
+        )
+        payload = {
+            **((link or {}).get("payload") or {}),
+            "deployRequested": False,
+            "deploymentCancelled": True,
+            "deploymentCancelledAt": timestamp,
+            "previousLiveUrl": cancellation.get("previousUrl"),
+            "liveUrl": None,
+        }
+        saved = save_zendesk_ticket_link(
+            row["id"],
+            row["canonical_lead_key"],
+            row["pipeline_id"],
+            channel,
+            "intake",
+            int(ticket_id),
+            (link or {}).get("ticketUrl"),
+            ticket.get("status") or "open",
+            tags,
+            payload,
+        )
+        ticket_result = {
+            "ticketId": int(ticket_id),
+            "ticketUrl": saved.get("ticketUrl"),
+            "tags": tags,
+        }
+
+    return {
+        "approvalId": row["id"],
+        "status": "CANCELLED",
+        "nextApprovalStatus": next_status,
+        "netlify": cancellation,
+        "zendesk": ticket_result,
+    }
 
 
 def update_existing_intake_ticket(
@@ -12113,6 +12339,12 @@ def resolve_webhook_approval(request: ZendeskWebhookRequest) -> sqlite3.Row:
 
 
 DEPLOY_WEBHOOK_ACTIONS = {"deploy", "deploy_site", "approve_deploy", "deploy_requested"}
+CANCEL_DEPLOYMENT_WEBHOOK_ACTIONS = {
+    "cancel_deployment",
+    "cancel_deploy",
+    "undeploy_site",
+    "deployment_cancelled",
+}
 
 
 def deploy_webhook_lease_seconds() -> int:
@@ -12458,6 +12690,10 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
             if not complete_deploy_webhook_claim(approval_id, deploy_claim_token, completed_result):
                 raise HTTPException(status_code=409, detail="Deployment claim could not be completed by its owner.")
             result = completed_result
+        elif action in CANCEL_DEPLOYMENT_WEBHOOK_ACTIONS:
+            if channel not in {"email", "phone"}:
+                raise HTTPException(status_code=409, detail="Cancellation webhook requires an email or phone campaign channel.")
+            result["cancellation"] = cancel_approval_deployment(row, ticket_id, channel)
         elif action in {"send_email", "email_send", "send_approved_email", "email_send_requested"}:
             if channel != "email":
                 raise HTTPException(status_code=409, detail="Email send webhook can only run for email-channel Zendesk tickets.")

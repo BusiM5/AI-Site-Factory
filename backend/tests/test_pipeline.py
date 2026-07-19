@@ -1549,6 +1549,73 @@ def test_direct_netlify_deploy_migrates_stale_site_to_current_account(monkeypatc
     assert registry["publish_mode"] == "direct-netlify"
 
 
+def test_cancel_netlify_site_disables_live_site_and_clears_registry_url(monkeypatch):
+    monkeypatch.setenv("NETLIFY_AUTH_TOKEN", "netlify-token")
+    timestamp = main.now_iso()
+    with main.get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT INTO site_registry (
+                canonical_lead_key, site_id, site_name, url, created_at, updated_at,
+                last_deploy_state, deployment_count, publish_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, 'ready', 1, 'github-netlify')
+            """,
+            (
+                "canonical-cancel",
+                "site-cancel",
+                "cancel-site",
+                "https://cancel-site.netlify.app",
+                timestamp,
+                timestamp,
+            ),
+        )
+        db.execute(
+            """
+            INSERT INTO deployment_history (
+                id, canonical_lead_key, site_id, site_name, url, state,
+                deployed_at, approval_status, raw_json
+            ) VALUES (?, ?, ?, ?, ?, 'ready', ?, 'APPROVED', ?)
+            """,
+            (
+                "history-cancel",
+                "canonical-cancel",
+                "site-cancel",
+                "cancel-site",
+                "https://cancel-site.netlify.app",
+                timestamp,
+                '{"state":"ready","url":"https://cancel-site.netlify.app"}',
+            ),
+        )
+
+    calls = []
+
+    def fake_put(url, headers=None, params=None, timeout=None):
+        calls.append((url, params))
+        return FakeResponse(204, {})
+
+    monkeypatch.setattr(main.requests, "put", fake_put)
+
+    result = main.cancel_netlify_site_for_lead("canonical-cancel")
+
+    assert result["status"] == "CANCELLED"
+    assert result["previousUrl"] == "https://cancel-site.netlify.app"
+    assert calls == [
+        (
+            "https://api.netlify.com/api/v1/sites/site-cancel/disable",
+            {"reason": "AI Site Factory deployment checkbox was unchecked in Zendesk."},
+        )
+    ]
+    with main.get_pipeline_db() as db:
+        site = db.execute(
+            "SELECT * FROM site_registry WHERE canonical_lead_key = 'canonical-cancel'"
+        ).fetchone()
+        history = db.execute("SELECT * FROM deployment_history WHERE id = 'history-cancel'").fetchone()
+    assert site["url"] is None
+    assert site["last_deploy_state"] == "cancelled"
+    assert history["state"] == "cancelled"
+    assert history["approval_status"] == "CANCELLED"
+
+
 def test_no_owner_fields_in_responses(monkeypatch):
     monkeypatch.setattr(main, "run_apify_google_maps", lambda query, limit, location="South Africa": [apify_item(1, province="Gauteng")])
     discovery = client.post("/api/leads/discover", json={"presetId": "restaurants", "location": "South Africa", "limit": 1}).json()
@@ -1808,6 +1875,41 @@ def test_zendesk_setup_provisions_fields_before_forms_and_reruns_idempotently(mo
     assert all(form["ticket_field_ids"] for form in state["ticket_forms"])
     assert second.json()["fields"][0]["status"] == "ready"
     assert main.get_zendesk_field_settings()["approvalId"]
+
+
+def test_zendesk_setup_provisions_inactive_live_only_cancellation_triggers(monkeypatch):
+    state, _ = zendesk_setup_fake(monkeypatch)
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "webhook-secret")
+
+    response = client.post(
+        "/api/settings/zendesk-setup/provision",
+        json={
+            "confirm": True,
+            "brandId": "88",
+            "createViews": False,
+            "createAutomation": True,
+            "webhookUrl": "https://backend.example/api/zendesk/webhook",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    cancellation_triggers = [
+        trigger for trigger in state["triggers"]
+        if trigger["title"] in {
+            "AI Site Factory - Cancel email deployment",
+            "AI Site Factory - Cancel call deployment",
+        }
+    ]
+    assert len(cancellation_triggers) == 2
+    for trigger in cancellation_triggers:
+        assert trigger["active"] is False
+        conditions = trigger["conditions"]["all"]
+        assert any(condition["field"].startswith("custom_fields_") and condition["value"] == "false" for condition in conditions)
+        assert {condition["value"] for condition in conditions if condition["field"] == "current_tags"} >= {
+            "asf_deployed"
+        }
+        webhook_action = next(action for action in trigger["actions"] if action["field"] == "notification_webhook")
+        assert '"action":"cancel_deployment"' in webhook_action["value"][1]
 
 
 def test_managed_zendesk_fields_encode_dropdown_values_and_route_channel_forms():
@@ -2528,6 +2630,88 @@ def test_zendesk_webhook_deploy_triggers_existing_approval_path(monkeypatch):
     assert response.status_code == 200
     assert response.json()["result"]["deployment"]["status"] == "APPROVED"
     assert response.json()["result"]["deployment"]["publishMode"] == "github-netlify"
+
+
+def test_zendesk_webhook_cancellation_resets_ticket_and_deploy_claim(monkeypatch):
+    configure_managed_zendesk_contract()
+    approval_id = create_pending_approval_for_webhook()
+    main.save_zendesk_ticket_link(
+        approval_id,
+        "canonical-webhook",
+        "pipeline-webhook",
+        "email",
+        "intake",
+        778,
+        "https://zendesk.test/778",
+        "open",
+        ["asf_managed", "asf_deployed", "asf_stage_live", "asf_deploy_email_fired"],
+        {"deployRequested": True, "liveUrl": "https://cancel.example"},
+    )
+    with main.get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT INTO deploy_webhook_claims (
+                approval_id, state, attempt_count, completed_at, result_json, updated_at
+            ) VALUES (?, 'COMPLETED', 1, ?, '{}', ?)
+            """,
+            (approval_id, main.now_iso(), main.now_iso()),
+        )
+
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "secret")
+    monkeypatch.setattr(
+        main,
+        "cancel_netlify_site_for_lead",
+        lambda canonical_key: {
+            "status": "CANCELLED",
+            "siteId": "site-cancel",
+            "previousUrl": "https://cancel.example",
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "update_zendesk_ticket_tags",
+        lambda ticket_id, remove=None, add=None: ["asf_managed", "asf_deployment_cancelled", *list(add or [])],
+    )
+    captured = {}
+
+    def fake_comment(ticket_id, body, public, extra_ticket_fields=None):
+        captured["ticketId"] = ticket_id
+        captured["body"] = body
+        captured["public"] = public
+        captured["fields"] = extra_ticket_fields
+        return {"id": ticket_id, "status": "open"}
+
+    monkeypatch.setattr(main, "update_zendesk_ticket_comment", fake_comment)
+
+    response = client.post(
+        "/api/zendesk/webhook",
+        json={
+            "action": "cancel_deployment",
+            "approvalId": approval_id,
+            "canonicalLeadKey": "canonical-webhook",
+            "channel": "email",
+            "zendeskTicketId": 778,
+        },
+        headers={"x-ai-site-factory-secret": "secret"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["result"]["cancellation"]["status"] == "CANCELLED"
+    assert captured["ticketId"] == 778
+    assert captured["public"] is False
+    assert "Netlify site has been disabled" in captured["body"]
+    field_values = {str(field["id"]): field["value"] for field in captured["fields"]["custom_fields"]}
+    settings = main.get_zendesk_field_settings()
+    assert field_values[settings["deployRequested"]] is False
+    assert field_values[settings["liveUrl"]] is None
+    with main.get_pipeline_db() as db:
+        approval = db.execute("SELECT * FROM approval_records WHERE id = ?", (approval_id,)).fetchone()
+        claim = db.execute("SELECT * FROM deploy_webhook_claims WHERE approval_id = ?", (approval_id,)).fetchone()
+    assert approval["status"] == "PENDING"
+    assert claim is None
+    link = main.get_zendesk_ticket_link(approval_id, "email", "intake", 778)
+    assert link["payload"]["deployRequested"] is False
+    assert link["payload"]["liveUrl"] is None
 
 
 def test_webhook_carries_invoking_ticket_into_approval(monkeypatch):
