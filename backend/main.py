@@ -6508,7 +6508,52 @@ def enable_netlify_site(site_id: str, headers: Dict[str, str]) -> None:
         response.raise_for_status()
 
 
-def cancel_netlify_site_for_lead(canonical_key: str) -> Dict[str, Any]:
+def netlify_site_matches_live_url(site: Dict[str, Any], live_url: str) -> bool:
+    target_host = urlparse(compact_text(live_url)).netloc.lower().split(":", 1)[0]
+    if not target_host:
+        target_host = compact_text(live_url).lower().split("/", 1)[0].split(":", 1)[0]
+    if not target_host:
+        return False
+    candidate_hosts = {
+        urlparse(compact_text(site.get("ssl_url"))).netloc.lower().split(":", 1)[0],
+        urlparse(compact_text(site.get("url"))).netloc.lower().split(":", 1)[0],
+        compact_text(site.get("custom_domain")).lower().split(":", 1)[0],
+        f"{compact_text(site.get('name')).lower()}.netlify.app",
+    }
+    candidate_hosts.update(
+        compact_text(domain).lower().split(":", 1)[0]
+        for domain in (site.get("domain_aliases") or [])
+    )
+    return target_host in {host for host in candidate_hosts if host}
+
+
+def find_netlify_site_by_live_url(live_url: str, headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    if not compact_text(live_url):
+        return None
+    per_page = 100
+    for page in range(1, 101):
+        response = requests.get(
+            "https://api.netlify.com/api/v1/sites",
+            headers=headers,
+            params={"per_page": per_page, "page": page},
+            timeout=45,
+        )
+        response.raise_for_status()
+        sites = response.json()
+        if not isinstance(sites, list):
+            return None
+        matching = next(
+            (site for site in sites if isinstance(site, dict) and netlify_site_matches_live_url(site, live_url)),
+            None,
+        )
+        if matching:
+            return matching
+        if len(sites) < per_page:
+            break
+    return None
+
+
+def cancel_netlify_site_for_lead(canonical_key: str, live_url: Optional[str] = None) -> Dict[str, Any]:
     token = require_env("NETLIFY_AUTH_TOKEN")
     headers = {
         "Authorization": f"Bearer {token}",
@@ -6520,8 +6565,53 @@ def cancel_netlify_site_for_lead(canonical_key: str) -> Dict[str, Any]:
             (canonical_key,),
         ).fetchone()
 
+    recovered_from_url = False
+    if not site and compact_text(live_url):
+        recovered_site = find_netlify_site_by_live_url(compact_text(live_url), headers)
+        if recovered_site and compact_text(recovered_site.get("id")):
+            timestamp = now_iso()
+            recovered_url = (
+                compact_text(recovered_site.get("ssl_url"))
+                or compact_text(recovered_site.get("url"))
+                or compact_text(live_url)
+            )
+            with get_pipeline_db() as db:
+                db.execute(
+                    """
+                    INSERT INTO site_registry (
+                        canonical_lead_key, site_id, site_name, url, admin_url,
+                        created_at, updated_at, last_deploy_state, deployment_count, publish_mode
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ready', 1, 'recovered-netlify')
+                    ON CONFLICT(canonical_lead_key) DO UPDATE SET
+                        site_id = excluded.site_id,
+                        site_name = excluded.site_name,
+                        url = excluded.url,
+                        admin_url = excluded.admin_url,
+                        updated_at = excluded.updated_at
+                    """,
+                    (
+                        canonical_key,
+                        compact_text(recovered_site.get("id")),
+                        compact_text(recovered_site.get("name")),
+                        recovered_url,
+                        compact_text(recovered_site.get("admin_url")) or None,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                site = db.execute(
+                    "SELECT * FROM site_registry WHERE canonical_lead_key = ?",
+                    (canonical_key,),
+                ).fetchone()
+            recovered_from_url = True
+
     if not site:
-        return {"status": "NO_SITE", "siteId": None, "previousUrl": None}
+        return {
+            "status": "NO_SITE",
+            "siteId": None,
+            "previousUrl": compact_text(live_url) or None,
+            "recoveredFromLiveUrl": False,
+        }
     if compact_text(site["last_deploy_state"]).lower() in {"cancelled", "disabled"}:
         return {
             "status": "ALREADY_CANCELLED",
@@ -6569,6 +6659,7 @@ def cancel_netlify_site_for_lead(canonical_key: str) -> Dict[str, Any]:
         "siteName": site["site_name"],
         "previousUrl": site["url"],
         "cancelledAt": timestamp,
+        "recoveredFromLiveUrl": recovered_from_url,
     }
 
 
@@ -11414,7 +11505,31 @@ def cancel_approval_deployment(
     ticket_id: Optional[int],
     channel: str,
 ) -> Dict[str, Any]:
-    cancellation = cancel_netlify_site_for_lead(row["canonical_lead_key"])
+    link = get_zendesk_ticket_link(row["id"], channel, "intake", ticket_id) if ticket_id else None
+    link_payload = (link or {}).get("payload") or {}
+    known_live_url = compact_text(link_payload.get("liveUrl"))
+    if not known_live_url:
+        live_url_field_id = compact_text(get_zendesk_field_settings().get("liveUrl"))
+        known_live_url = compact_text(
+            next(
+                (
+                    item.get("value")
+                    for item in (link_payload.get("customFields") or [])
+                    if compact_text(item.get("id")) == live_url_field_id
+                ),
+                "",
+            )
+        )
+    cancellation = cancel_netlify_site_for_lead(row["canonical_lead_key"], known_live_url)
+    if cancellation.get("status") == "NO_SITE":
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "NETLIFY_SITE_NOT_FOUND_FOR_CANCELLATION",
+                "message": "The deployed Netlify site could not be located from local state or the Zendesk live URL.",
+                "ticketId": ticket_id,
+            },
+        )
     timestamp = now_iso()
     github_export = safe_json_loads(row["github_export_json"], {})
     next_status = "PENDING" if row["html"] and github_export.get("commitSha") else "AWAITING_DEPLOYMENT"
@@ -11439,7 +11554,6 @@ def cancel_approval_deployment(
 
     ticket_result: Optional[Dict[str, Any]] = None
     if ticket_id:
-        link = get_zendesk_ticket_link(row["id"], channel, "intake", ticket_id)
         tags = update_zendesk_ticket_tags(
             int(ticket_id),
             remove=[
@@ -11846,10 +11960,18 @@ def recover_managed_zendesk_webhook_approval(request: ZendeskWebhookRequest) -> 
     action = compact_text(request.action).lower().replace("-", "_")
     if not ticket_id or requested_channel not in {"email", "phone"}:
         raise HTTPException(status_code=404, detail="Could not resolve approval for Zendesk webhook.")
-    if action not in {"deploy", "deploy_site", "approve_deploy", "deploy_requested"}:
+    deploy_recovery_actions = {"deploy", "deploy_site", "approve_deploy", "deploy_requested"}
+    cancellation_recovery_actions = {
+        "cancel_deployment",
+        "cancel_deploy",
+        "undeploy_site",
+        "deployment_cancelled",
+    }
+    is_cancellation = action in cancellation_recovery_actions
+    if action not in deploy_recovery_actions | cancellation_recovery_actions:
         raise HTTPException(
             status_code=409,
-            detail="Only a managed deploy webhook can recover a missing deferred approval.",
+            detail="Only a managed deploy or cancellation webhook can recover a missing deferred approval.",
         )
 
     contract = require_zendesk_ticket_contract(requested_channel)
@@ -11862,6 +11984,8 @@ def recover_managed_zendesk_webhook_approval(request: ZendeskWebhookRequest) -> 
         f"asf_channel_{requested_channel}",
         "asf_form_email_lead" if requested_channel == "email" else "asf_form_call_lead",
     }
+    if is_cancellation:
+        required_tags.add("asf_deployed")
     if (
         compact_text(ticket.get("id")) != compact_text(ticket_id)
         or compact_text(ticket.get("brand_id")) != compact_text(contract["brandId"])
@@ -11913,7 +12037,7 @@ def recover_managed_zendesk_webhook_approval(request: ZendeskWebhookRequest) -> 
         or channel_value not in expected_channel_values
         or (compact_text(request.approvalId) and compact_text(request.approvalId) != approval_id)
         or (compact_text(request.canonicalLeadKey) and compact_text(request.canonicalLeadKey) != canonical_key)
-        or not zendesk_ticket_field_value_matches(True, deploy_requested)
+        or not zendesk_ticket_field_value_matches(not is_cancellation, deploy_requested)
     )
     if missing_values or identity_mismatch:
         raise HTTPException(
@@ -11988,6 +12112,7 @@ def recover_managed_zendesk_webhook_approval(request: ZendeskWebhookRequest) -> 
         "recoveredFromManagedTicket": True,
         "recoveredAt": timestamp,
         "externalId": external_id,
+        "liveUrl": compact_text(managed_value("liveUrl")) or None,
         "customFields": ticket.get("custom_fields") or [],
     }
 

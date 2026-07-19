@@ -54,7 +54,7 @@ For the live proof-of-concept deployment checklist, strict GitHub -> Netlify art
 4. An agent ticks the deploy field. The `deploy_site` webhook generates the HTML, exports the repository, deploys Netlify, and writes the live URL back to the same ticket.
 5. A second channel for the same canonical lead reuses the existing artifact or live deployment.
 6. Email tickets can fire the separate `send_email` webhook after the agent reviews the generated template. Call tickets retain the live link for the agent's call workflow.
-7. If an agent later unticks the deploy field on a live ticket, the `cancel_deployment` webhook disables the Netlify site, clears the live URL, and retains the GitHub artifact. Ticking it again can re-enable and redeploy the same lead-owned site.
+7. If an agent later unticks the deploy field on a live ticket, the `cancel_deployment` webhook disables the Netlify site, clears the live URL, and retains the GitHub artifact. If Render has restarted without its local registry, the backend recovers the exact Netlify site from the managed ticket's live URL first. Ticking the field again can re-enable and redeploy the same lead-owned site.
 
 Campaign persistence uses `campaigns`, `campaign_email_leads`, `campaign_call_leads`, and `campaign_deployments`. Uploaded files add `campaign_import_jobs` and per-row `campaign_import_items`; the source file is retained while the job is pending and removed after every row completes. The deployment row stores its campaign, approval, canonical lead, and channel so graphs can distinguish pending requests, AI generations, repositories created, failures, and live sites.
 

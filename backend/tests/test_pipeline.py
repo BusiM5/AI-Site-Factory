@@ -1616,6 +1616,51 @@ def test_cancel_netlify_site_disables_live_site_and_clears_registry_url(monkeypa
     assert history["approval_status"] == "CANCELLED"
 
 
+def test_cancel_netlify_site_recovers_registry_from_zendesk_live_url(monkeypatch):
+    monkeypatch.setenv("NETLIFY_AUTH_TOKEN", "netlify-token")
+    calls = []
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        assert url == "https://api.netlify.com/api/v1/sites"
+        assert params == {"per_page": 100, "page": 1}
+        return FakeResponse(
+            200,
+            [
+                {
+                    "id": "site-recovered",
+                    "name": "recovered-site",
+                    "ssl_url": "https://recovered-site.netlify.app",
+                    "url": "http://recovered-site.netlify.app",
+                    "admin_url": "https://app.netlify.com/sites/recovered-site",
+                }
+            ],
+        )
+
+    def fake_put(url, headers=None, params=None, timeout=None):
+        calls.append((url, params))
+        return FakeResponse(204, {})
+
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    monkeypatch.setattr(main.requests, "put", fake_put)
+
+    result = main.cancel_netlify_site_for_lead(
+        "canonical-recovered",
+        "https://recovered-site.netlify.app",
+    )
+
+    assert result["status"] == "CANCELLED"
+    assert result["recoveredFromLiveUrl"] is True
+    assert result["siteId"] == "site-recovered"
+    assert calls[0][0].endswith("/sites/site-recovered/disable")
+    with main.get_pipeline_db() as db:
+        site = db.execute(
+            "SELECT * FROM site_registry WHERE canonical_lead_key = 'canonical-recovered'"
+        ).fetchone()
+    assert site["site_id"] == "site-recovered"
+    assert site["url"] is None
+    assert site["last_deploy_state"] == "cancelled"
+
+
 def test_no_owner_fields_in_responses(monkeypatch):
     monkeypatch.setattr(main, "run_apify_google_maps", lambda query, limit, location="South Africa": [apify_item(1, province="Gauteng")])
     discovery = client.post("/api/leads/discover", json={"presetId": "restaurants", "location": "South Africa", "limit": 1}).json()
@@ -1971,6 +2016,7 @@ def managed_orphan_zendesk_ticket(
     business_name="Recovered Plumbing",
     contact_email=None,
     contact_phone=None,
+    live_url=None,
 ):
     pipeline_id = pipeline_id or campaign_id
     contact_email = contact_email or ("recovered@example.com" if channel == "email" else None)
@@ -1994,6 +2040,7 @@ def managed_orphan_zendesk_ticket(
         "deployRequested": True,
         "emailSendRequested": False,
         "phoneCallStatus": "NEW" if channel == "phone" else None,
+        "liveUrl": live_url,
         "sourceUrl": "https://maps.example.com/recovered",
     }
     form_id = 5001 if channel == "email" else 5002
@@ -2326,6 +2373,44 @@ def test_webhook_recovers_missing_deferred_approval_from_exact_managed_ticket(mo
     link = main.get_zendesk_ticket_link(ticket["_approval_id"], "email", "intake", 5806)
     assert link["externalId"] == ticket["external_id"]
     assert link["payload"]["recoveredFromManagedTicket"] is True
+
+
+def test_cancellation_webhook_recovers_missing_state_and_live_url(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    field_ids = configure_managed_zendesk_contract()
+    ticket = managed_orphan_zendesk_ticket(
+        field_ids,
+        live_url="https://recovered-site.netlify.app",
+    )
+    ticket["tags"] = [
+        tag for tag in ticket["tags"] if tag != "asf_deploy_requested"
+    ] + ["asf_deployed", "asf_stage_live"]
+    for field in ticket["custom_fields"]:
+        if str(field["id"]) == field_ids["deployRequested"]:
+            field["value"] = False
+    monkeypatch.setattr(
+        main,
+        "zendesk_api_request",
+        lambda method, path, **kwargs: {"ticket": ticket}
+        if path == "/tickets/5806.json"
+        else (_ for _ in ()).throw(AssertionError(path)),
+    )
+
+    recovered = main.resolve_webhook_approval(
+        main.ZendeskWebhookRequest(
+            action="cancel_deployment",
+            approvalId=ticket["_approval_id"],
+            canonicalLeadKey=ticket["_canonical_key"],
+            zendeskTicketId=5806,
+            channel="email",
+        )
+    )
+
+    assert recovered["id"] == ticket["_approval_id"]
+    link = main.get_zendesk_ticket_link(ticket["_approval_id"], "email", "intake", 5806)
+    assert link["payload"]["liveUrl"] == "https://recovered-site.netlify.app"
 
 
 def test_orphan_recovery_keeps_same_campaign_and_pipeline_counts_for_multiple_tickets(monkeypatch):
@@ -2661,7 +2746,7 @@ def test_zendesk_webhook_cancellation_resets_ticket_and_deploy_claim(monkeypatch
     monkeypatch.setattr(
         main,
         "cancel_netlify_site_for_lead",
-        lambda canonical_key: {
+        lambda canonical_key, live_url=None: {
             "status": "CANCELLED",
             "siteId": "site-cancel",
             "previousUrl": "https://cancel.example",

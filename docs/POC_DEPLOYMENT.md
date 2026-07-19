@@ -214,7 +214,7 @@ Create separate email and phone cancellation triggers. Each should run when the 
 }
 ```
 
-Cancellation disables the existing Netlify site, clears the live URL on the ticket and local deployment state, and leaves the GitHub repository intact. Rechecking the deploy field can re-enable and redeploy it.
+Cancellation disables the existing Netlify site, clears the live URL on the ticket and local deployment state, and leaves the GitHub repository intact. After a stateless Render restart, the handler can recover the exact site from the managed Zendesk live URL before disabling it. Rechecking the deploy field can re-enable and redeploy it.
 
 Stable form/view tags include `asf_managed`, `asf_form_email_lead`, `asf_form_call_lead`, `asf_channel_email`, `asf_channel_phone`, `asf_source_apify_google_maps`, `asf_source_upload`, `asf_deploy_pending`, `asf_deploy_requested`, `asf_stage_generating`, `asf_artifact_ready`, `asf_repo_ready`, `asf_stage_deploying`, `asf_can_deploy`, `asf_email_send_pending`, `asf_call_pending`, `asf_deployed`, `asf_stage_live`, `asf_deployment_cancelled`, `asf_stage_cancelled`, `asf_cancel_email_fired`, `asf_cancel_phone_fired`, `asf_generation_failed`, `asf_deploy_failed`, and `asf_stage_failed`.
 
