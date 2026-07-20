@@ -4401,9 +4401,10 @@ def ensure_generated_hero_and_working_links(site_html: str, context: Dict[str, A
     lower_html = html_value.lower()
     contact_href, contact_label = contact_cta_for_context(context)
     main_image_url = normalize_url(context.get("mainImageUrl"))
+    main_image_markup_url = html.escape(main_image_url, quote=True) if main_image_url else ""
     business_theme = business_theme_for_context(context)
 
-    if main_image_url and main_image_url not in html_value:
+    if main_image_url and main_image_url not in html_value and main_image_markup_url not in html_value:
         image_tags = list(re.finditer(r"<img\b[^>]*>", html_value, flags=re.IGNORECASE | re.DOTALL))
         preferred_image = next(
             (
@@ -4435,7 +4436,7 @@ def ensure_generated_hero_and_working_links(site_html: str, context: Dict[str, A
             html_value = html_value[:preferred_image.start()] + replacement + html_value[preferred_image.end():]
             lower_html = html_value.lower()
 
-    if (main_image_url and main_image_url not in html_value) or (
+    if (main_image_url and main_image_url not in html_value and main_image_markup_url not in html_value) or (
         "<img" not in lower_html and (main_image_url or "<svg" not in lower_html)
     ):
         business_name = compact_text(context.get("businessName"), "Local Business")
@@ -14404,7 +14405,7 @@ def refresh_deployed_business_media(
         ensure_generated_hero_and_working_links(existing_file["content"], context),
         context,
     )
-    if main_image_url not in refreshed_html:
+    if main_image_url not in refreshed_html and html.escape(main_image_url, quote=True) not in refreshed_html:
         raise HTTPException(status_code=500, detail="The refreshed HTML did not preserve the requested business image.")
 
     owner, repo_name = repo_full_name.split("/", 1)

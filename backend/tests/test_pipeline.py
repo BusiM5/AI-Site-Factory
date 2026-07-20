@@ -243,7 +243,7 @@ def test_business_theme_defaults_are_industry_aligned_and_persist_on_upgrade():
 
 
 def test_main_business_image_is_injected_without_replacing_a_logo():
-    main_image_url = "https://lh3.googleusercontent.com/main-business-photo=w1200-h800"
+    main_image_url = "https://streetviewpixels-pa.googleapis.com/v1/thumbnail?panoid=business&w=408&h=240"
     source = '<!doctype html><html><head></head><body><img class="logo" src="logo.svg" alt="Logo"><main>Content</main></body></html>'
 
     generated = main.ensure_generated_hero_and_working_links(
@@ -257,7 +257,7 @@ def test_main_business_image_is_injected_without_replacing_a_logo():
     )
 
     assert 'class="logo" src="logo.svg"' in generated
-    assert f'src="{main_image_url}"' in generated
+    assert 'src="https://streetviewpixels-pa.googleapis.com/v1/thumbnail?panoid=business&amp;w=408&amp;h=240"' in generated
     assert "data-ai-business-main-image-container" in generated
 
 
