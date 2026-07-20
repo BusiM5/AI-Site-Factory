@@ -121,6 +121,7 @@ Rules:
 - Include accessible semantic sections, mobile-first responsive layout, clear contact options, and grounded calls to action.
 - When mainImageUrl is supplied, use that exact public business-listing image as the prominent hero/banner image. Otherwise, include a generated hero image personalised to the business name, industry, location, and public lead context; prefer an inline SVG or data URI and do not rely on unrelated stock-photo URLs.
 - Use the supplied brandTheme as the default page palette. Keep the colours appropriate to the business industry and maintain accessible text contrast; the colour widget may let visitors override those defaults.
+- Treat the supplied businessProfile as the authoritative copy plan. Use its tagline, services heading, services intro, and four distinct services; weave in the business name and location naturally. Never repeat generic cards such as "Local service" when a specific profile is available.
 - Personalise the copy with concrete supplied details such as business name, category/industry, city/location, address, rating/review count, source listing, phone, email, service keywords, differentiators, and proof points when they are present. Avoid generic filler when a supplied detail is available.
 - CTA buttons must have working destinations: use mailto: for email leads, tel: for phone leads, the supplied website URL if present, or valid in-page anchors such as #services and #contact. Do not use empty hrefs, href="#", javascript:void(0), or non-functional buttons.
 - Do not include external tracking pixels, forms that submit data, or claims of consent.
@@ -151,6 +152,248 @@ BUSINESS_THEME_FALLBACKS = [
     ("#7c3aed", "#f5f3ff", "violet"),
     ("#b45309", "#fff7ed", "amber"),
     ("#15803d", "#f0fdf4", "green"),
+]
+
+GENERIC_INDUSTRY_LABELS = {
+    "",
+    "business",
+    "local business",
+    "local service",
+    "local services",
+    "service",
+    "services",
+    "unknown",
+}
+
+BUSINESS_PROFILE_RULES = [
+    {
+        "keywords": ("physio", "physical therapy"),
+        "industry": "Physiotherapy",
+        "tagline": "Move with confidence. Recover with care.",
+        "servicesHeading": "Physiotherapy support for movement and recovery",
+        "services": [
+            ("Physiotherapy Care", "Professional support centred on movement, comfort, and everyday function."),
+            ("Mobility Support", "Practical guidance that helps customers work towards easier, more confident movement."),
+            ("Recovery-Focused Support", "A considered approach for people navigating recovery and returning to daily activities."),
+            ("Movement Guidance", "Clear next steps and customer-focused guidance for individual movement needs."),
+        ],
+    },
+    {
+        "keywords": ("account", "bookkeep", "tax", "financial"),
+        "industry": "Accounting",
+        "tagline": "Clear numbers. Confident business decisions.",
+        "servicesHeading": "Practical accounting support for growing businesses",
+        "services": [
+            ("Business Accounting", "Clear, organised accounting support designed around day-to-day business needs."),
+            ("Bookkeeping Support", "Practical assistance for keeping financial records accurate, current, and easy to understand."),
+            ("Financial Record Organisation", "Structured support that turns business records into clearer financial information."),
+            ("Business Advisory", "Grounded financial guidance to help business owners consider their next steps with confidence."),
+        ],
+    },
+    {
+        "keywords": ("restaurant", "food", "cafe", "bakery", "catering", "takeaway"),
+        "industry": "Food & Hospitality",
+        "tagline": "Good food, warm welcomes, memorable local moments.",
+        "servicesHeading": "Food and hospitality made for local customers",
+        "services": [
+            ("Food & Menu Experience", "A clear introduction to the flavours and food experience customers can expect."),
+            ("Dine-In Visits", "Useful location and contact information for customers planning their next visit."),
+            ("Takeaway Enquiries", "A simple contact route for customers checking availability and collection options."),
+            ("Group & Event Enquiries", "Direct contact details for customers planning a shared meal or special occasion."),
+        ],
+    },
+    {
+        "keywords": ("dental", "dentist", "dentistry"),
+        "industry": "Dental Care",
+        "tagline": "Friendly dental care with a clear path forward.",
+        "servicesHeading": "Dental support focused on patient confidence",
+        "services": [
+            ("Dental Consultations", "A straightforward first step for discussing dental needs and available care."),
+            ("Preventive Care", "Patient-focused guidance that supports ongoing oral health and regular care."),
+            ("Restorative Support", "Clear information and contact options for customers exploring restorative dental care."),
+            ("Patient Guidance", "Helpful next steps for appointments, questions, and individual dental concerns."),
+        ],
+    },
+    {
+        "keywords": ("production", "productions"),
+        "industry": "Creative Production",
+        "tagline": "Creative ideas, presented with purpose.",
+        "servicesHeading": "Creative production support for local projects",
+        "services": [
+            ("Creative Projects", "A clear route for discussing the idea, audience, and project requirements."),
+            ("Visual Content", "Practical support for customers exploring content for a business or occasion."),
+            ("Event Content", "Useful contact options for discussing creative coverage around an event."),
+            ("Project Enquiries", "A direct way to check availability and talk through the next creative step."),
+        ],
+    },
+    {
+        "keywords": ("photo", "photography", "creative", "studio", "media"),
+        "industry": "Photography & Creative Services",
+        "tagline": "Real moments, thoughtfully captured.",
+        "servicesHeading": "Creative photography for people, brands, and occasions",
+        "services": [
+            ("Portrait Photography", "Personal, polished imagery created around the subject and the moment."),
+            ("Event Photography", "Visual coverage that preserves the atmosphere and important details of an occasion."),
+            ("Business Content", "Professional imagery that helps local businesses present themselves with confidence."),
+            ("Shoot Enquiries", "A direct way to discuss ideas, availability, locations, and the right creative approach."),
+        ],
+    },
+    {
+        "keywords": ("plumb", "water"),
+        "industry": "Plumbing",
+        "tagline": "Practical plumbing help when it matters.",
+        "servicesHeading": "Reliable plumbing support for local properties",
+        "services": [
+            ("Plumbing Repairs", "A direct contact route for customers dealing with everyday plumbing problems."),
+            ("Leak & Water Issues", "Practical support for identifying and addressing common water-related concerns."),
+            ("Fixture Support", "Help with plumbing fixtures, replacements, and general property requirements."),
+            ("Maintenance Enquiries", "Clear next steps for ongoing plumbing checks and planned maintenance."),
+        ],
+    },
+    {
+        "keywords": ("electric", "electrical"),
+        "industry": "Electrical Services",
+        "tagline": "Clear, dependable support for electrical needs.",
+        "servicesHeading": "Electrical support for homes and businesses",
+        "services": [
+            ("Electrical Repairs", "A straightforward contact route for discussing electrical faults and repair needs."),
+            ("Installation Enquiries", "Practical support for customers planning electrical additions or replacements."),
+            ("Fault-Finding Support", "Clear next steps for customers experiencing an electrical problem."),
+            ("Maintenance Planning", "Useful contact options for routine and planned electrical requirements."),
+        ],
+    },
+    {
+        "keywords": ("landscap", "garden"),
+        "industry": "Landscaping",
+        "tagline": "Outdoor spaces shaped with care.",
+        "servicesHeading": "Landscaping support for inviting outdoor spaces",
+        "services": [
+            ("Garden Care", "Practical support for keeping outdoor areas neat, healthy, and welcoming."),
+            ("Landscape Enquiries", "A simple way to discuss ideas and requirements for an outdoor space."),
+            ("Outdoor Maintenance", "Clear contact options for recurring and seasonal property care."),
+            ("Property Presentation", "Thoughtful outdoor support that helps a property make a stronger first impression."),
+        ],
+    },
+    {
+        "keywords": ("beauty", "salon", "hair", "nail", "spa", "cosmetic"),
+        "industry": "Beauty & Personal Care",
+        "tagline": "Feel polished, confident, and cared for.",
+        "servicesHeading": "Personal care designed around every client",
+        "services": [
+            ("Beauty Appointments", "A clear route for discussing treatments, availability, and individual preferences."),
+            ("Personal Care", "Customer-focused care designed to create a comfortable, polished experience."),
+            ("Style Consultations", "A useful first step for customers exploring a new look or service."),
+            ("Booking Enquiries", "Simple contact options for checking availability and planning a visit."),
+        ],
+    },
+    {
+        "keywords": ("fitness", "gym", "training"),
+        "industry": "Fitness & Training",
+        "tagline": "Build strength, momentum, and everyday confidence.",
+        "servicesHeading": "Fitness support for personal goals",
+        "services": [
+            ("Fitness Guidance", "A practical starting point for customers working towards their fitness goals."),
+            ("Training Support", "Clear information for customers exploring structured training and ongoing support."),
+            ("Wellness Focus", "An approachable experience centred on movement, consistency, and wellbeing."),
+            ("Membership Enquiries", "Direct contact options for schedules, availability, and getting started."),
+        ],
+    },
+    {
+        "keywords": ("courier", "transport", "delivery", "logistics"),
+        "industry": "Courier & Transport",
+        "tagline": "Local deliveries with a clear route from enquiry to arrival.",
+        "servicesHeading": "Straightforward courier and transport support",
+        "services": [
+            ("Delivery Enquiries", "A direct way to discuss collection points, destinations, and delivery requirements."),
+            ("Local Transport", "Clear contact information for customers arranging transport within the service area."),
+            ("Business Deliveries", "Practical support for businesses coordinating regular or once-off deliveries."),
+            ("Collection Planning", "Useful next steps for confirming timing, availability, and collection details."),
+        ],
+    },
+    {
+        "keywords": ("pest",),
+        "industry": "Pest Control",
+        "tagline": "Practical pest support for more comfortable spaces.",
+        "servicesHeading": "Pest-control support for local properties",
+        "services": [
+            ("Pest Enquiries", "A direct contact route for explaining the issue and discussing appropriate next steps."),
+            ("Residential Support", "Practical information for households dealing with common pest concerns."),
+            ("Commercial Support", "Clear contact options for businesses and managed properties seeking assistance."),
+            ("Prevention Guidance", "Useful next steps for customers looking to reduce recurring pest problems."),
+        ],
+    },
+    {
+        "keywords": ("cleaning", "cleaner"),
+        "industry": "Cleaning Services",
+        "tagline": "Fresh, cared-for spaces start with a simple conversation.",
+        "servicesHeading": "Cleaning support for homes and businesses",
+        "services": [
+            ("Home Cleaning", "A clear contact route for discussing household cleaning needs and availability."),
+            ("Business Cleaning", "Practical support for workplaces and customer-facing spaces."),
+            ("Once-Off Cleaning", "Useful next steps for customers planning a focused or seasonal clean."),
+            ("Regular Service Enquiries", "Direct contact options for discussing recurring cleaning requirements."),
+        ],
+    },
+    {
+        "keywords": ("auto", "mechanic", "vehicle", "motor"),
+        "industry": "Automotive Services",
+        "tagline": "Practical vehicle support to help keep you moving.",
+        "servicesHeading": "Automotive support for local drivers",
+        "services": [
+            ("Vehicle Repairs", "A clear first step for discussing a vehicle problem and repair requirements."),
+            ("Maintenance Enquiries", "Direct contact options for routine and planned vehicle care."),
+            ("Diagnostic Support", "A practical route for explaining symptoms and arranging the next step."),
+            ("Service Bookings", "Useful contact details for checking availability and planning a visit."),
+        ],
+    },
+    {
+        "keywords": ("hvac", "air condition", "heating", "refrigeration"),
+        "industry": "Heating & Cooling",
+        "tagline": "Comfort-focused support for every season.",
+        "servicesHeading": "Heating and cooling support for local properties",
+        "services": [
+            ("Cooling Support", "A direct route for discussing air-conditioning and cooling requirements."),
+            ("Heating Enquiries", "Clear contact options for customers exploring heating support."),
+            ("System Maintenance", "Practical next steps for planned heating and cooling maintenance."),
+            ("Repair Enquiries", "A straightforward way to explain an issue and check availability."),
+        ],
+    },
+    {
+        "keywords": ("roof", "roofing"),
+        "industry": "Roofing",
+        "tagline": "Roofing support built around clear, practical next steps.",
+        "servicesHeading": "Roofing support for local properties",
+        "services": [
+            ("Roofing Enquiries", "A clear first step for discussing the property and roofing requirement."),
+            ("Repair Support", "Direct contact options for customers concerned about a roofing issue."),
+            ("Maintenance Planning", "Useful next steps for planned roof care and property maintenance."),
+            ("Property Assessments", "A straightforward route for discussing the visible concern and arranging follow-up."),
+        ],
+    },
+    {
+        "keywords": ("locksmith", "lock "),
+        "industry": "Locksmith Services",
+        "tagline": "Clear, direct help for lock and access needs.",
+        "servicesHeading": "Locksmith support for homes and businesses",
+        "services": [
+            ("Lock Enquiries", "A direct route for explaining the lock or access issue."),
+            ("Key Support", "Clear contact options for customers with key-related requirements."),
+            ("Property Access", "Practical next steps for home, business, and managed-property enquiries."),
+            ("Security Hardware", "Useful contact details for discussing locks and related hardware."),
+        ],
+    },
+    {
+        "keywords": ("paint", "painter"),
+        "industry": "Painting Services",
+        "tagline": "A cleaner finish starts with a clear plan.",
+        "servicesHeading": "Painting support for local properties",
+        "services": [
+            ("Interior Painting", "A clear contact route for discussing indoor spaces and project requirements."),
+            ("Exterior Painting", "Practical next steps for customers planning exterior property work."),
+            ("Residential Enquiries", "Direct contact options for home painting and finishing needs."),
+            ("Commercial Enquiries", "Useful information for businesses planning a painting project."),
+        ],
+    },
 ]
 
 
@@ -205,6 +448,95 @@ def business_theme_for_context(context: Optional[Dict[str, Any]]) -> Dict[str, s
         "background": supplied_background or background or DEFAULT_BUSINESS_THEME["background"],
         "highlight": supplied_highlight or highlight or DEFAULT_BUSINESS_THEME["highlight"],
         "name": compact_text(supplied.get("name"), palette_name or DEFAULT_BUSINESS_THEME["name"]),
+    }
+
+
+def is_generic_industry_label(value: Any) -> bool:
+    return normalize_identity_text(compact_text(value)) in GENERIC_INDUSTRY_LABELS
+
+
+def personalized_business_profile(context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Build factual, deterministic copy that remains specific when AI is unavailable."""
+    context = context if isinstance(context, dict) else {}
+    business_name = compact_text(context.get("businessName"), "This business")
+    location = compact_text(context.get("location"), "the local area")
+    category = compact_text(context.get("category"))
+    industry = compact_text(context.get("industry"))
+    keywords = context.get("serviceKeywords") if isinstance(context.get("serviceKeywords"), list) else []
+    descriptor = normalize_identity_text(
+        " ".join(
+            compact_text(value)
+            for value in [business_name, category, industry, *keywords]
+            if compact_text(value)
+        )
+    )
+
+    matched_rule: Optional[Dict[str, Any]] = None
+    for rule in BUSINESS_PROFILE_RULES:
+        if any(keyword in descriptor for keyword in rule["keywords"]):
+            matched_rule = rule
+            break
+
+    supplied_label = next(
+        (
+            value
+            for value in (category, industry, *(compact_text(item) for item in keywords))
+            if value and not is_generic_industry_label(value)
+        ),
+        "",
+    )
+    resolved_industry = compact_text(
+        matched_rule.get("industry") if matched_rule else supplied_label,
+        supplied_label or "Local Business",
+    )
+
+    if matched_rule:
+        tagline = compact_text(matched_rule.get("tagline"))
+        services_heading = compact_text(matched_rule.get("servicesHeading"))
+        rule_services = matched_rule.get("services") or []
+    else:
+        tagline = f"Local service, clearly presented by {business_name}."
+        services_heading = f"How {business_name} can help local customers"
+        rule_services = [
+            (f"{resolved_industry} Enquiries", "A clear first step for discussing the service and what the customer needs."),
+            ("Customer Support", "An easy contact route for questions, availability, and practical next steps."),
+            ("Service Planning", "Useful information for customers considering a service and planning ahead."),
+            ("Local Contact", "Business and location details kept together so customers can connect quickly."),
+        ]
+
+    personalization_lines = [
+        f"Customers in {location} can contact {business_name} to discuss their needs and the right next step.",
+        f"{business_name} gives local customers a direct route for questions and availability.",
+        f"The service is presented around {business_name}'s public business details in {location}.",
+        f"Customers can reach {business_name} using the contact details provided on this page.",
+    ]
+    services: List[Dict[str, str]] = []
+    for index, service in enumerate(rule_services[:4]):
+        if isinstance(service, dict):
+            title = compact_text(service.get("title"), f"{resolved_industry} Service {index + 1}")
+            description = compact_text(service.get("description"))
+        else:
+            title = compact_text(service[0], f"{resolved_industry} Service {index + 1}")
+            description = compact_text(service[1] if len(service) > 1 else "")
+        services.append(
+            {
+                "title": title,
+                "description": f"{description} {personalization_lines[index]}".strip(),
+            }
+        )
+
+    hero_caption = f"{tagline} Connect with {business_name} in {location} using the contact route below."
+    return {
+        "industry": resolved_industry,
+        "tagline": tagline,
+        "heroCaption": hero_caption,
+        "servicesHeading": services_heading,
+        "servicesIntro": (
+            f"Explore the {resolved_industry.lower()} support associated with {business_name}, "
+            f"then get in touch directly for availability and details."
+        ),
+        "aboutHeading": f"Local {resolved_industry.lower()} support, made easier to understand.",
+        "services": services,
     }
 
 def redact_value(value: Any) -> Any:
@@ -4326,16 +4658,20 @@ def build_public_lead_context(
         "noWebsiteLead": not bool(normalize_url(website) or normalize_domain(lead.domain)),
     }
     context["brandTheme"] = business_theme_for_context(context)
+    context["businessProfile"] = personalized_business_profile(context)
     return context
 
 
 def compact_lead_with_groq(context: Dict[str, Any]) -> Dict[str, Any]:
+    business_profile = personalized_business_profile(context)
     prompt = (
         "Compact this public lead into a concise business brief for Gemini to build a landing page. "
         "Use as much of the lead as is useful, including raw listing fields, but remove repetition. "
         "Return strict JSON with keys: businessName, industry, location, address, email, phone, "
-        "summary, serviceKeywords, differentiators, proofPoints, sourceLabel, sourceUrl, mainImageUrl, brandTheme, noWebsiteLead, "
+        "summary, serviceKeywords, differentiators, proofPoints, sourceLabel, sourceUrl, mainImageUrl, brandTheme, businessProfile, noWebsiteLead, "
         "contactType, designHints, complianceNotes. Arrays must be arrays. Preserve the supplied mainImageUrl and brandTheme exactly. "
+        "Preserve the supplied businessProfile and use its distinct service titles and business-specific captions. "
+        "Never replace a specific category with the generic label Local service. "
         "Do not invent private facts, services, guarantees, prices, awards, or consent.\n\n"
         f"Lead context: {model_safe_json(context)}"
     )
@@ -4360,7 +4696,10 @@ def compact_lead_with_groq(context: Dict[str, Any]) -> Dict[str, Any]:
     contact_type = "email" if context.get("email") else "phone" if context.get("phone") else "unknown"
 
     brief.setdefault("businessName", context.get("businessName"))
-    brief.setdefault("industry", context.get("industry") or context.get("category"))
+    if is_generic_industry_label(brief.get("industry")):
+        brief["industry"] = business_profile["industry"]
+    else:
+        brief.setdefault("industry", business_profile["industry"])
     brief.setdefault("location", context.get("location"))
     brief.setdefault("address", context.get("address"))
     brief.setdefault("email", context.get("email"))
@@ -4372,6 +4711,7 @@ def compact_lead_with_groq(context: Dict[str, Any]) -> Dict[str, Any]:
     # A compaction model returning null or a generic palette must not discard them.
     brief["mainImageUrl"] = normalize_url(context.get("mainImageUrl")) or normalize_url(brief.get("mainImageUrl"))
     brief["brandTheme"] = business_theme_for_context(context)
+    brief["businessProfile"] = business_profile
     brief.setdefault("noWebsiteLead", True)
     brief.setdefault("designHints", [])
     brief.setdefault("complianceNotes", "Use public lead details only; outreach requires opt-in or agent consent handling.")
@@ -4543,6 +4883,29 @@ def generate_final_html_with_gemini(lead_brief: Dict[str, Any]) -> Dict[str, Any
     site_html = result.get("html") or result.get("siteHtml") or result.get("finalHtml")
     if not site_html:
         raise RuntimeError("Gemini did not return an html field.")
+    business_profile = personalized_business_profile(lead_brief)
+    rendered_text = normalize_identity_text(
+        html.unescape(re.sub(r"<[^>]+>", " ", str(site_html), flags=re.DOTALL))
+    )
+    tagline_present = normalize_identity_text(business_profile["tagline"]) in rendered_text
+    service_titles_present = sum(
+        normalize_identity_text(service["title"]) in rendered_text
+        for service in business_profile["services"]
+    )
+    if not tagline_present or service_titles_present < 4:
+        log_event(
+            "warning",
+            "provider.gemini_final_html.personalization_fallback",
+            "Gemini omitted the required business-specific copy; using the deterministic personalized renderer.",
+            businessName=lead_brief.get("businessName"),
+            taglinePresent=tagline_present,
+            serviceTitlesPresent=service_titles_present,
+        )
+        site_html = build_bootstrap_gsap_landing_html(lead_brief, dict(FREEFORM_SITE_SPEC))
+        result["qaNotes"] = (
+            "Gemini output omitted required personalized services or captions; "
+            "backend generated the validated business-specific fallback."
+        )
     final_html = ensure_required_site_features(
         ensure_generated_hero_and_working_links(str(site_html), lead_brief),
         lead_brief,
@@ -4593,8 +4956,9 @@ def generate_page_prompt_with_gemini(context: Dict[str, Any], template: Dict[str
     return result
 
 def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[str, Any]) -> str:
+    business_profile = personalized_business_profile(context)
     business_name_raw = compact_text(context.get("businessName"), "Local Business")
-    industry_raw = compact_text(context.get("industry"), "Local Service")
+    industry_raw = compact_text(business_profile.get("industry"), context.get("industry") or "Local Business")
     location_raw = compact_text(context.get("location"), "South Africa")
     address_raw = compact_text(context.get("address"))
     rating_raw = compact_text(context.get("rating"))
@@ -4605,16 +4969,23 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
     location = html.escape(location_raw)
     address = html.escape(address_raw)
     source = html.escape(source_raw)
-    summary_raw = compact_text(
-        context.get("summary"),
-        f"{business_name_raw} provides reliable {industry_raw.lower()} services for customers in {location_raw}."
-    )
+    supplied_summary = compact_text(context.get("summary"))
+    normalized_summary = normalize_identity_text(supplied_summary)
+    if not supplied_summary or "local local service" in normalized_summary or normalized_summary in GENERIC_INDUSTRY_LABELS:
+        summary_raw = compact_text(business_profile.get("heroCaption"))
+    else:
+        summary_raw = supplied_summary
     summary = html.escape(
         compact_text(
             summary_raw,
-            f"{business_name_raw} provides reliable {industry_raw.lower()} services for customers in {location_raw}."
+            business_profile.get("heroCaption") or f"Connect with {business_name_raw} in {location_raw}."
         )
     )
+    tagline = html.escape(compact_text(business_profile.get("tagline"), f"Discover {business_name_raw}."))
+    hero_caption = html.escape(compact_text(business_profile.get("heroCaption"), summary_raw))
+    services_heading = html.escape(compact_text(business_profile.get("servicesHeading"), f"How {business_name_raw} can help"))
+    services_intro = html.escape(compact_text(business_profile.get("servicesIntro"), summary_raw))
+    about_heading = html.escape(compact_text(business_profile.get("aboutHeading"), f"About {business_name_raw}"))
 
     email = compact_text(context.get("email"))
     phone = compact_text(context.get("phone"))
@@ -4623,20 +4994,6 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
 
     accent = compact_text(template.get("accent"), "#00AEEF")
     background = compact_text(template.get("background"), "#F7FAFC")
-
-    keywords = context.get("serviceKeywords")
-    if not isinstance(keywords, list) or not keywords:
-        keywords = [industry_raw]
-    clean_keywords = [compact_text(keyword, industry_raw) for keyword in keywords[:4]]
-    while len(clean_keywords) < 4:
-        clean_keywords.append(industry_raw)
-
-    differentiators = context.get("differentiators")
-    if not isinstance(differentiators, list):
-        differentiators = []
-    proof_points = context.get("proofPoints")
-    if not isinstance(proof_points, list):
-        proof_points = []
 
     detail_bits = [industry_raw]
     if address_raw:
@@ -4667,23 +5024,7 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
         contact_target = website
         contact_label = "Visit website"
 
-    service_descriptions = [
-        f"{business_name_raw} presents {clean_keywords[0].lower()} information clearly for customers in {location_raw}.",
-        f"Contact options are surfaced up front so visitors can reach {business_name_raw} without hunting through the page.",
-        f"The page uses public listing context from {source_raw} to keep the message grounded and factual.",
-        f"Customers can quickly review the business focus, location, and available contact route before taking action.",
-    ]
-    if differentiators:
-        service_descriptions[1] = compact_text(differentiators[0], service_descriptions[1])
-    if proof_points:
-        service_descriptions[2] = compact_text(proof_points[0], service_descriptions[2])
-
-    default_services = [
-        {"title": clean_keywords[0], "description": service_descriptions[0]},
-        {"title": clean_keywords[1], "description": service_descriptions[1]},
-        {"title": clean_keywords[2], "description": service_descriptions[2]},
-        {"title": clean_keywords[3], "description": service_descriptions[3]},
-    ]
+    default_services = business_profile["services"]
 
     services_html = ""
     for index, service in enumerate(default_services):
@@ -4715,7 +5056,7 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
         f"{industry_raw}",
         address_raw or location_raw,
         f"{rating_raw} rating" if rating_raw else source_raw,
-        f"{reviews_raw} reviews" if reviews_raw else "Public lead context",
+        f"{reviews_raw} reviews" if reviews_raw else "Direct contact details",
     ]
     proof_chips_html = "".join(
         f'<div class="floating-chip">{html.escape(compact_text(chip, "Business detail"))}</div>'
@@ -4815,6 +5156,15 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
       font-size: clamp(1.05rem, 2vw, 1.35rem);
       max-width: 760px;
       color: rgba(255,255,255,0.92);
+    }}
+
+    .hero-tagline {{
+      margin: -0.45rem 0 0.85rem;
+      max-width: 760px;
+      font-size: clamp(1.35rem, 2.4vw, 2rem);
+      font-weight: 850;
+      line-height: 1.2;
+      color: white;
     }}
 
     .hero-actions {{
@@ -4993,9 +5343,10 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
     <div class="container py-5">
       <div class="row align-items-center g-5">
         <div class="col-lg-7">
-          <span class="hero-badge hero-animate">Local {industry}</span>
+          <span class="hero-badge hero-animate">{industry} in {location}</span>
           <h1 class="hero-title hero-animate">{business_name}</h1>
-          <p class="hero-text hero-animate">{summary}</p>
+          <p class="hero-tagline hero-animate">{tagline}</p>
+          <p class="hero-text hero-animate">{hero_caption}</p>
           <div class="hero-actions hero-animate">
             <a href="{html.escape(contact_target)}" class="btn btn-light btn-lg rounded-pill px-4 shadow"{hero_cta_attrs}>{html.escape(contact_label)}</a>
             <a href="#services" class="btn btn-outline-light btn-lg rounded-pill px-4">View services</a>
@@ -5009,7 +5360,7 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
               <p class="fw-bold mb-3">Serving {location}</p>
               {proof_chips_html}
               <hr class="border-light opacity-25 my-4">
-              <p class="mb-0">Generated for {business_name} from {source} details so customers can quickly understand the business and use the right contact route.</p>
+              <p class="mb-0">{hero_caption}</p>
             </div>
           </div>
         </div>
@@ -5022,8 +5373,8 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
       <div class="container">
         <div class="text-center mb-5">
           <span class="section-kicker">What we offer</span>
-          <h2 class="section-title">Services designed for local customers</h2>
-          <p class="text-secondary mx-auto" style="max-width: 720px;">Clear, useful information about {business_name}, its {industry.lower()} focus, and its presence in {location}.</p>
+          <h2 class="section-title">{services_heading}</h2>
+          <p class="text-secondary mx-auto" style="max-width: 720px;">{services_intro}</p>
         </div>
 
         <div class="row g-4">
@@ -5039,7 +5390,7 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
             <div class="col-lg-5">
               <div class="about-gradient h-100">
                 <span class="section-kicker text-white">Why choose us</span>
-                <h2 class="section-title">Built around trust, clarity, and service.</h2>
+                <h2 class="section-title">{about_heading}</h2>
                 <div class="row g-3 mt-3">
                   <div class="col-6">
                     <div class="stat-card">
@@ -5076,7 +5427,7 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
         <div class="cta-band text-center">
           <span class="section-kicker text-white">Ready to connect?</span>
           <h2 class="section-title">Contact {business_name}</h2>
-          <p class="contact-text text-white-50 mx-auto" style="max-width: 680px;">Use the options below to get in touch, ask a question, or request more information.</p>
+          <p class="contact-text text-white-50 mx-auto" style="max-width: 680px;">{tagline} Use the options below to contact {business_name} directly.</p>
           <div class="hero-actions justify-content-center">
             {contact_buttons}
           </div>
@@ -10800,16 +11151,27 @@ def ensure_uploaded_campaign_lead(
     timestamp = now_iso()
     contact_name = compact_text(uploaded_row_value(lead.raw or {}, ["contactName", "contact_name", "ownerName", "owner_name"]))
     context = build_public_lead_context(lead, {}, canonical_key)
+    campaign_industry = compact_text(campaign["industry"])
+    lead_industry = compact_text(lead.category)
+    resolved_industry = (
+        lead_industry
+        if lead_industry and (is_generic_industry_label(campaign_industry) or not campaign_industry)
+        else campaign_industry or lead_industry
+    )
     context.update(
         {
             "campaignId": campaign["id"],
             "campaignName": campaign["name"],
             "batchId": None,
-            "industry": compact_text(campaign["industry"], lead.category),
+            "industry": resolved_industry,
+            "category": lead_industry or resolved_industry,
+            "serviceKeywords": [lead_industry or resolved_industry],
             "contactName": contact_name,
             "intakeDeferred": True,
         }
     )
+    context["brandTheme"] = business_theme_for_context(context)
+    context["businessProfile"] = personalized_business_profile(context)
     available: List[str] = []
     if normalize_email_identity(lead.email) and "email" in channels:
         available.append("email")
@@ -14389,7 +14751,7 @@ def refresh_deployed_business_media(
     if not repo:
         raise HTTPException(status_code=404, detail="The managed GitHub repository could not be found.")
     branch = compact_text(repo.get("default_branch"), "main")
-    existing_file = get_github_text_file(repo_full_name, "index.html", branch)
+    get_github_text_file(repo_full_name, "index.html", branch)
     context = safe_json_loads(row["context_json"], {})
     context.update(
         {
@@ -14401,8 +14763,9 @@ def refresh_deployed_business_media(
         }
     )
     context["brandTheme"] = business_theme_for_context(context)
+    context["businessProfile"] = personalized_business_profile(context)
     refreshed_html = ensure_required_site_features(
-        ensure_generated_hero_and_working_links(existing_file["content"], context),
+        build_bootstrap_gsap_landing_html(context, dict(FREEFORM_SITE_SPEC)),
         context,
     )
     if main_image_url not in refreshed_html and html.escape(main_image_url, quote=True) not in refreshed_html:
@@ -14415,7 +14778,7 @@ def refresh_deployed_business_media(
         branch,
         "index.html",
         refreshed_html,
-        "Restore business main image and aligned colour theme",
+        "Personalize business services, captions, image, and colour theme",
         github_headers(),
     )
     github_export = {
@@ -14442,7 +14805,7 @@ def refresh_deployed_business_media(
         approval_id=row["id"],
         approved_by="AI Site Factory media refresh",
         github_export=github_export,
-        git_error=RuntimeError("Refreshing a previously deployed site's business image and colour theme."),
+        git_error=RuntimeError("Refreshing a previously deployed site's personalized business content and visual identity."),
     )
     if compact_text(deployment.get("state")).lower() != "ready":
         raise HTTPException(status_code=502, detail="The refreshed Netlify deployment did not become ready.")
@@ -14476,8 +14839,8 @@ def refresh_deployed_business_media(
     update_zendesk_ticket_comment(
         ticket_id,
         (
-            "AI Site Factory refreshed the existing website with the business's main listing image "
-            "and an industry-aligned colour palette. The live URL is unchanged."
+            "AI Site Factory refreshed the existing website with business-specific services and captions, "
+            "the main listing image, and an industry-aligned colour palette. The live URL is unchanged."
         ),
         public=False,
         extra_ticket_fields=extra_fields,
@@ -14493,6 +14856,7 @@ def refresh_deployed_business_media(
         "businessName": business_name,
         "mainImageUrl": main_image_url,
         "brandTheme": context["brandTheme"],
+        "businessProfile": context["businessProfile"],
         "github": github_export,
         "deployment": deployment,
         "tags": final_tags,

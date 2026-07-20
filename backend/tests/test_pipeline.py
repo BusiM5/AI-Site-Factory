@@ -73,6 +73,29 @@ def test_gemini_rate_limit_uses_local_final_html_fallback(monkeypatch):
     assert "fallback" in result["qaNotes"].lower()
 
 
+def test_gemini_output_missing_business_profile_is_replaced_with_personalized_page(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "gemini_text_json",
+        lambda *args, **kwargs: {
+            "html": "<!doctype html><html><body><h1>Generic local service</h1></body></html>",
+            "qaNotes": "Generic",
+        },
+    )
+
+    result = main.generate_final_html_with_gemini(
+        {
+            "businessName": "G. Dimitriou Physiotherapy",
+            "industry": "Local service",
+            "location": "Gqeberha",
+        }
+    )
+
+    assert "Move with confidence. Recover with care." in result["html"]
+    assert "Physiotherapy Care" in result["html"]
+    assert "backend generated" in result["qaNotes"]
+
+
 def test_existing_theme_widget_is_upgraded_to_control_site_variables():
     legacy_html = """<!doctype html><html><head>
     <style id="ai-site-theme-widget-style">old</style>
@@ -188,6 +211,48 @@ def test_uploaded_google_main_image_is_preserved_as_the_site_hero():
     assert f'src="{main_image_url}"' in fallback
     assert "data-ai-business-main-image" in generated
     assert 'data-ai-default-highlight="#b45309"' in fallback
+
+
+def test_business_profile_replaces_generic_campaign_copy_with_personalized_services():
+    context = {
+        "businessName": "G. Dimitriou Physiotherapy",
+        "industry": "Local service",
+        "category": "Local service",
+        "location": "Gqeberha, South Africa",
+        "summary": "G. Dimitriou Physiotherapy is a local Local service business.",
+        "serviceKeywords": ["Local service"],
+    }
+
+    profile = main.personalized_business_profile(context)
+    fallback = main.build_bootstrap_gsap_landing_html(context, dict(main.FREEFORM_SITE_SPEC))
+
+    assert profile["industry"] == "Physiotherapy"
+    assert profile["tagline"] == "Move with confidence. Recover with care."
+    assert [service["title"] for service in profile["services"]] == [
+        "Physiotherapy Care",
+        "Mobility Support",
+        "Recovery-Focused Support",
+        "Movement Guidance",
+    ]
+    assert len({service["description"] for service in profile["services"]}) == 4
+    assert "Move with confidence. Recover with care." in fallback
+    assert "Physiotherapy support for movement and recovery" in fallback
+    assert "Services designed for local customers" not in fallback
+    assert ">Local Service<" not in fallback
+
+
+def test_unknown_business_still_receives_name_and_location_specific_copy():
+    profile = main.personalized_business_profile(
+        {
+            "businessName": "Mabaso Community Services",
+            "industry": "Local service",
+            "location": "Durban",
+        }
+    )
+
+    assert profile["servicesHeading"] == "How Mabaso Community Services can help local customers"
+    assert profile["services"][0]["title"] == "Local Business Enquiries"
+    assert all("Mabaso Community Services" in service["description"] for service in profile["services"])
 
 
 def test_compact_lead_cannot_discard_source_main_image_or_business_theme(monkeypatch):
@@ -378,8 +443,12 @@ def test_refresh_deployed_business_media_updates_existing_html_and_redeploys(mon
 
     assert response.status_code == 200
     assert response.json()["status"] == "REFRESHED"
+    assert response.json()["businessProfile"]["industry"] == "Physiotherapy"
     assert image_url in captured["html"]
     assert 'data-ai-default-highlight="#0f766e"' in captured["html"]
+    assert "Move with confidence. Recover with care." in captured["html"]
+    assert "Physiotherapy Care" in captured["html"]
+    assert "Services designed for local customers" not in captured["html"]
     with main.get_pipeline_db() as db:
         updated = db.execute("SELECT * FROM approval_records WHERE id = ?", (approval_id,)).fetchone()
     assert updated["status"] == "APPROVED"
