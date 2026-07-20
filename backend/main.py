@@ -6147,6 +6147,70 @@ def github_headers() -> Dict[str, str]:
     }
 
 
+GITHUB_RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
+
+
+def github_retry_attempts() -> int:
+    try:
+        configured = int(os.getenv("GITHUB_API_RETRY_ATTEMPTS", "5"))
+    except (TypeError, ValueError):
+        configured = 5
+    return max(1, min(configured, 8))
+
+
+def github_api_request(method: str, url: str, **kwargs: Any) -> requests.Response:
+    """Retry transient GitHub transport and 5xx failures without changing the request."""
+    attempts = github_retry_attempts()
+    try:
+        base_delay = float(os.getenv("GITHUB_API_RETRY_BASE_SECONDS", "1"))
+    except (TypeError, ValueError):
+        base_delay = 1.0
+    base_delay = max(0.0, min(base_delay, 10.0))
+    request_method = getattr(requests, method.lower())
+    last_error: Optional[Exception] = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            response = request_method(url, **kwargs)
+        except (requests.Timeout, requests.ConnectionError) as error:
+            last_error = error
+            if attempt >= attempts:
+                raise
+            status_code = None
+            retry_after = None
+        else:
+            if response.status_code not in GITHUB_RETRYABLE_STATUS_CODES or attempt >= attempts:
+                return response
+            status_code = response.status_code
+            retry_after = getattr(response, "headers", {}).get("Retry-After")
+
+        delay = base_delay * (2 ** (attempt - 1))
+        if retry_after:
+            try:
+                delay = max(delay, float(retry_after))
+            except (TypeError, ValueError):
+                pass
+        delay = min(delay, 30.0)
+        log_event(
+            "warning",
+            "provider.github.transient_retry",
+            "GitHub request failed transiently and will be retried.",
+            method=method.upper(),
+            path=urlparse(url).path,
+            statusCode=status_code,
+            attempt=attempt,
+            maxAttempts=attempts,
+            retryDelaySeconds=delay,
+            errorType=last_error.__class__.__name__ if last_error else None,
+        )
+        if delay:
+            time.sleep(delay)
+
+    if last_error:
+        raise last_error
+    raise RuntimeError("GitHub request retry loop ended without a response.")
+
+
 def github_repo_name(canonical_key: str, business_name: str) -> str:
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
     suffix = hashlib.sha1(canonical_key.encode("utf-8")).hexdigest()[:8]
@@ -6171,8 +6235,62 @@ def latest_github_repo_for_lead(canonical_key: str) -> Optional[sqlite3.Row]:
         ).fetchone()
 
 
+def latest_github_repo_record_for_lead(canonical_key: str) -> Optional[sqlite3.Row]:
+    with get_pipeline_db() as db:
+        return db.execute(
+            "SELECT * FROM github_site_repos WHERE canonical_lead_key = ? ORDER BY updated_at DESC LIMIT 1",
+            (canonical_key,),
+        ).fetchone()
+
+
+def get_remote_github_repo(repo_full_name: str, headers: Dict[str, str]) -> Optional[Dict[str, Any]]:
+    if "/" not in compact_text(repo_full_name):
+        return None
+    response = github_api_request(
+        "get",
+        f"https://api.github.com/repos/{repo_full_name}",
+        headers=headers,
+        timeout=30,
+    )
+    if response.status_code == 200:
+        return response.json()
+    if response.status_code != 404:
+        response.raise_for_status()
+    return None
+
+
+def find_partial_github_repo_for_lead(
+    canonical_key: str,
+    business_name: str,
+    headers: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    """Recover a repo created before a transient file-upload failure was persisted locally."""
+    owner = require_env("GITHUB_OWNER")
+    suffix = hashlib.sha1(canonical_key.encode("utf-8")).hexdigest()[:8]
+    prefix = f"ai-site-{slugify(business_name, 34)}-"
+    pattern = re.compile(rf"^{re.escape(prefix)}\d{{14}}-{re.escape(suffix)}(?:-[a-f0-9]{{4}})?$")
+    response = github_api_request(
+        "get",
+        "https://api.github.com/user/repos",
+        headers=headers,
+        params={"affiliation": "owner", "sort": "created", "direction": "desc", "per_page": 100},
+        timeout=30,
+    )
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    matches = [
+        repo
+        for repo in (response.json() or [])
+        if compact_text(repo.get("owner", {}).get("login"), owner).casefold() == owner.casefold()
+        and pattern.fullmatch(compact_text(repo.get("name")))
+    ]
+    return matches[0] if matches else None
+
+
 def get_github_content_sha(owner: str, repo: str, path: str, branch: str, headers: Dict[str, str]) -> Optional[str]:
-    response = requests.get(
+    response = github_api_request(
+        "get",
         f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
         headers=headers,
         params={"ref": branch},
@@ -6204,7 +6322,8 @@ def put_github_file(
     if existing_sha:
         payload["sha"] = existing_sha
 
-    update_response = requests.put(
+    update_response = github_api_request(
+        "put",
         f"https://api.github.com/repos/{owner}/{repo}/contents/{path}",
         headers=headers,
         json=payload,
@@ -6225,9 +6344,11 @@ def put_github_file(
 
 def create_github_repo(headers: Dict[str, str], repo_name: str, business_name: str) -> Dict[str, Any]:
     private_repo = os.getenv("GITHUB_REPO_PRIVATE", "false").lower() == "true"
+    owner = require_env("GITHUB_OWNER")
     for attempt in range(3):
         candidate = repo_name if attempt == 0 else f"{repo_name}-{str(uuid4())[:4]}"
-        response = requests.post(
+        response = github_api_request(
+            "post",
             "https://api.github.com/user/repos",
             headers={**headers, "Content-Type": "application/json"},
             json={
@@ -6241,8 +6362,12 @@ def create_github_repo(headers: Dict[str, str], repo_name: str, business_name: s
             },
             timeout=45,
         )
-        if response.status_code == 422 and attempt < 2:
-            continue
+        if response.status_code == 422:
+            recovered = get_remote_github_repo(f"{owner}/{candidate}", headers)
+            if recovered:
+                return recovered
+            if attempt < 2:
+                continue
         response.raise_for_status()
         return response.json()
     raise RuntimeError("GitHub repository creation failed after retries.")
@@ -6326,6 +6451,14 @@ def export_site_to_github(
     headers = github_headers()
     checksum = html_checksum(site_html)
     existing = latest_github_repo_for_lead(canonical_key)
+    recovered_repo: Optional[Dict[str, Any]] = None
+
+    if not existing:
+        partial = latest_github_repo_record_for_lead(canonical_key)
+        if partial and partial["repo_full_name"] and partial["repo_id"]:
+            recovered_repo = get_remote_github_repo(partial["repo_full_name"], headers)
+        if not recovered_repo:
+            recovered_repo = find_partial_github_repo_for_lead(canonical_key, business_name, headers)
 
     if existing:
         repo_name = existing["repo_name"]
@@ -6335,6 +6468,21 @@ def export_site_to_github(
         repo_id = existing["repo_id"]
         private_repo = bool(existing["private"])
         export_action = "UPDATED"
+    elif recovered_repo:
+        repo_name = recovered_repo.get("name")
+        repo_full_name = recovered_repo.get("full_name") or f"{owner}/{repo_name}"
+        repo_url = recovered_repo.get("html_url") or f"https://github.com/{repo_full_name}"
+        branch = recovered_repo.get("default_branch") or "main"
+        repo_id = recovered_repo.get("id")
+        private_repo = bool(recovered_repo.get("private"))
+        export_action = "RECOVERED"
+        log_event(
+            "info",
+            "provider.github.repo_recovered",
+            "Recovered a partially created generated-site repository.",
+            repository=repo_full_name,
+            businessName=business_name,
+        )
     else:
         repo_name = github_repo_name(canonical_key, business_name)
         log_event(
@@ -6354,35 +6502,7 @@ def export_site_to_github(
         export_action = "CREATED"
 
     repo_owner = repo_full_name.split("/", 1)[0] if "/" in repo_full_name else owner
-
-    log_event(
-        "info",
-        "provider.github.export_start",
-        "Exporting generated site files to GitHub repository.",
-        repository=repo_full_name,
-        branch=branch,
-    )
-
-    readme_result = put_github_file(
-        repo_owner,
-        repo_name,
-        branch,
-        "README.md",
-        github_readme(canonical_key, business_name, checksum),
-        f"Update generated site README for {business_name}",
-        headers,
-    )
-    index_result = put_github_file(
-        repo_owner,
-        repo_name,
-        branch,
-        "index.html",
-        site_html,
-        f"Publish generated landing page for {business_name}",
-        headers,
-    )
-
-    result = {
+    partial_export = {
         "exportAction": export_action,
         "repository": repo_full_name,
         "repoName": repo_name,
@@ -6392,14 +6512,51 @@ def export_site_to_github(
         "branch": branch,
         "path": "index.html",
         "htmlChecksum": checksum,
+        "pipelineId": pipeline_id,
+        "approvalId": approval_id,
+        "createdAt": existing["created_at"] if existing else compact_text((recovered_repo or {}).get("created_at")) or now_iso(),
+    }
+    if not existing:
+        save_github_export_record(canonical_key, dict(partial_export), "EXPORTING")
+
+    log_event(
+        "info",
+        "provider.github.export_start",
+        "Exporting generated site files to GitHub repository.",
+        repository=repo_full_name,
+        branch=branch,
+    )
+
+    try:
+        readme_result = put_github_file(
+            repo_owner,
+            repo_name,
+            branch,
+            "README.md",
+            github_readme(canonical_key, business_name, checksum),
+            f"Update generated site README for {business_name}",
+            headers,
+        )
+        index_result = put_github_file(
+            repo_owner,
+            repo_name,
+            branch,
+            "index.html",
+            site_html,
+            f"Publish generated landing page for {business_name}",
+            headers,
+        )
+    except Exception as error:
+        save_github_export_record(canonical_key, dict(partial_export), "EXPORT_FAILED", str(error))
+        raise
+
+    result = {
+        **partial_export,
         "indexContentSha": index_result.get("contentSha"),
         "readmeContentSha": readme_result.get("contentSha"),
         "commitSha": index_result.get("commitSha"),
         "htmlUrl": index_result.get("htmlUrl"),
         "readmeUrl": readme_result.get("htmlUrl"),
-        "pipelineId": pipeline_id,
-        "approvalId": approval_id,
-        "createdAt": existing["created_at"] if existing else now_iso(),
         "exportedAt": now_iso(),
     }
     save_github_export_record(canonical_key, result, "EXPORTED")
@@ -12023,7 +12180,8 @@ def deferred_lead_from_context(row: sqlite3.Row, context: Dict[str, Any]) -> Dis
 
 def prepare_deferred_approval(approval_id: str) -> sqlite3.Row:
     row = get_approval_or_404(approval_id)
-    if row["html"] and safe_json_loads(row["github_export_json"], None):
+    current_export = safe_json_loads(row["github_export_json"], {})
+    if row["html"] and current_export.get("commitSha"):
         return row
     context = safe_json_loads(row["context_json"], {})
     if not context.get("intakeDeferred"):
@@ -12084,22 +12242,47 @@ def prepare_deferred_approval(approval_id: str) -> sqlite3.Row:
         )
         return value
 
+    site_html = (row["html"] or "").strip()
+    generated_now = not bool(site_html)
+    cleaned_context = context
+    site_content = safe_json_loads(row["site_content_json"], {})
+
     try:
-        cleaned_context = build_public_lead_context(lead, {}, row["canonical_lead_key"])
-        cleaned_context.update(
-            {key: value for key, value in context.items() if key in {"campaignId", "campaignName", "batchId", "contactChannel", "contactName", "intakeDeferred"}}
-        )
-        brief = run_deferred_step("groq_compact_lead", "groq", lambda: compact_lead_with_groq(cleaned_context))
-        final_html_result = run_deferred_step("gemini_final_html", "gemini", lambda: generate_final_html_with_gemini(brief))
-        site_html = ensure_required_site_features(final_html_result["html"])
-        site_content = {
-            "deferredGeneration": True,
-            "generatedOnDeployRequest": True,
-            "groqBrief": brief,
-            "geminiQaNotes": final_html_result.get("qaNotes"),
-            "stylingLibraries": final_html_result.get("stylingLibraries"),
-            "finalHtmlChecksum": html_checksum(site_html),
-        }
+        if generated_now:
+            cleaned_context = build_public_lead_context(lead, {}, row["canonical_lead_key"])
+            cleaned_context.update(
+                {key: value for key, value in context.items() if key in {"campaignId", "campaignName", "batchId", "contactChannel", "contactName", "intakeDeferred"}}
+            )
+            brief = run_deferred_step("groq_compact_lead", "groq", lambda: compact_lead_with_groq(cleaned_context))
+            final_html_result = run_deferred_step("gemini_final_html", "gemini", lambda: generate_final_html_with_gemini(brief))
+            site_html = ensure_required_site_features(final_html_result["html"])
+            site_content = {
+                "deferredGeneration": True,
+                "generatedOnDeployRequest": True,
+                "groqBrief": brief,
+                "geminiQaNotes": final_html_result.get("qaNotes"),
+                "stylingLibraries": final_html_result.get("stylingLibraries"),
+                "finalHtmlChecksum": html_checksum(site_html),
+            }
+            # Persist the expensive AI artifact before GitHub I/O so a transient
+            # repository failure can retry export without calling the models again.
+            with get_pipeline_db() as db:
+                db.execute(
+                    """
+                    UPDATE approval_records
+                    SET html = ?, html_checksum = ?, context_json = ?, site_content_json = ?,
+                        publish_mode = 'github-netlify', updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        site_html,
+                        html_checksum(site_html),
+                        json.dumps(cleaned_context, default=str),
+                        json.dumps(site_content, default=str),
+                        now_iso(),
+                        approval_id,
+                    ),
+                )
         github_export = run_deferred_step(
             "github_export",
             "github",
@@ -12130,24 +12313,27 @@ def prepare_deferred_approval(approval_id: str) -> sqlite3.Row:
             approval_id,
             "ARTIFACT_READY",
             requested=True,
-            ai_generation_increment=1,
+            ai_generation_increment=1 if generated_now else 0,
             repo_created=compact_text(github_export.get("exportAction")).upper() == "CREATED",
             repo_url=github_export.get("repoUrl"),
         )
         return get_approval_or_404(approval_id)
     except Exception as error:
+        failure_step = "github_export" if site_html else "deferred_generation"
+        failure_status = "EXPORT_FAILED" if site_html else "GENERATION_FAILED"
         with get_pipeline_db() as db:
             db.execute(
                 "UPDATE approval_records SET status = ?, errors_json = ?, updated_at = ? WHERE id = ?",
                 (
-                    "GENERATION_FAILED",
-                    json.dumps([structured_pipeline_error("deferred_generation", error, retryable=True)], default=str),
+                    failure_status,
+                    json.dumps([structured_pipeline_error(failure_step, error, retryable=True)], default=str),
                     now_iso(),
                     approval_id,
                 ),
             )
-        update_campaign_workflow(approval_id, "GENERATION_FAILED", requested=True, error=str(error))
-        raise HTTPException(status_code=502, detail=f"Deferred site generation failed: {sanitize_message(error)}")
+        update_campaign_workflow(approval_id, failure_status, requested=True, error=str(error))
+        label = "site export" if failure_status == "EXPORT_FAILED" else "site generation"
+        raise HTTPException(status_code=502, detail=f"Deferred {label} failed: {sanitize_message(error)}")
 
 
 def reuse_existing_live_deployment(
@@ -13019,7 +13205,7 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
             if reused:
                 result.update(reused)
             else:
-                if row["status"] in {"AWAITING_DEPLOYMENT", "GENERATION_FAILED", "EXPORT_FAILED"} and not row["html"]:
+                if row["status"] in {"AWAITING_DEPLOYMENT", "GENERATION_FAILED", "EXPORT_FAILED"}:
                     row = prepare_deferred_approval(approval_id)
                     if not renew_deploy_webhook_claim(approval_id, deploy_claim_token):
                         raise HTTPException(status_code=409, detail="Deployment claim was lost after site generation.")

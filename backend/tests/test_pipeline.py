@@ -368,10 +368,11 @@ def test_startup_zendesk_bootstrap_can_be_explicitly_disabled(monkeypatch):
 
 
 class FakeResponse:
-    def __init__(self, status_code=200, payload=None):
+    def __init__(self, status_code=200, payload=None, headers=None):
         self.status_code = status_code
         self._payload = payload or {}
         self.text = str(self._payload)
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
@@ -1123,6 +1124,121 @@ def test_github_export_creates_unique_repo_and_commits_readme_then_index(monkeyp
     with main.get_pipeline_db() as db:
         rows = db.execute("SELECT * FROM github_site_repos WHERE export_status = 'EXPORTED'").fetchall()
     assert len(rows) == 2
+
+
+def test_github_export_retries_transient_repo_and_file_failures(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    monkeypatch.setenv("GITHUB_OWNER", "owner")
+    monkeypatch.setenv("GITHUB_API_RETRY_ATTEMPTS", "3")
+    monkeypatch.setenv("GITHUB_API_RETRY_BASE_SECONDS", "0")
+    repo_posts = []
+    file_puts = []
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        repo_posts.append(json["name"])
+        if len(repo_posts) == 1:
+            return FakeResponse(503, {"message": "Service unavailable"})
+        return FakeResponse(
+            201,
+            {
+                "id": 91,
+                "name": json["name"],
+                "full_name": f"owner/{json['name']}",
+                "html_url": f"https://github.com/owner/{json['name']}",
+                "default_branch": "main",
+                "private": False,
+            },
+        )
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        return FakeResponse(404, {})
+
+    def fake_put(url, headers=None, json=None, timeout=None):
+        path = url.rsplit("/", 1)[-1]
+        file_puts.append(path)
+        if path == "README.md" and file_puts.count("README.md") == 1:
+            return FakeResponse(503, {"message": "Service unavailable"})
+        return FakeResponse(
+            201,
+            {
+                "content": {"sha": f"{path}-sha", "html_url": f"https://github.test/{path}"},
+                "commit": {"sha": f"{path}-commit"},
+            },
+        )
+
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    monkeypatch.setattr(main.requests, "put", fake_put)
+
+    result = main.export_site_to_github(
+        "canonical-transient",
+        "Transient Plumbing",
+        "<html>transient</html>",
+        "pipeline-transient",
+        "approval-transient",
+    )
+
+    assert result["commitSha"] == "index.html-commit"
+    assert len(repo_posts) == 2
+    assert len(set(repo_posts)) == 1
+    assert file_puts == ["README.md", "README.md", "index.html"]
+
+
+def test_github_export_recovers_partial_remote_repo_without_duplicate(monkeypatch):
+    monkeypatch.setenv("GITHUB_TOKEN", "github-secret")
+    monkeypatch.setenv("GITHUB_OWNER", "owner")
+    canonical_key = "canonical-partial"
+    suffix = main.hashlib.sha1(canonical_key.encode("utf-8")).hexdigest()[:8]
+    repo_name = f"ai-site-partial-plumbing-20260720002015-{suffix}"
+    posts = []
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        if url == "https://api.github.com/user/repos":
+            return FakeResponse(
+                200,
+                [
+                    {
+                        "id": 92,
+                        "name": repo_name,
+                        "full_name": f"owner/{repo_name}",
+                        "html_url": f"https://github.com/owner/{repo_name}",
+                        "default_branch": "main",
+                        "private": False,
+                        "created_at": "2026-07-20T00:20:21Z",
+                        "owner": {"login": "owner"},
+                    }
+                ],
+            )
+        if "/contents/" in url:
+            return FakeResponse(404, {})
+        raise AssertionError(url)
+
+    def fake_put(url, headers=None, json=None, timeout=None):
+        path = url.rsplit("/", 1)[-1]
+        return FakeResponse(
+            201,
+            {
+                "content": {"sha": f"{path}-sha", "html_url": f"https://github.test/{path}"},
+                "commit": {"sha": f"{path}-commit"},
+            },
+        )
+
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    monkeypatch.setattr(main.requests, "put", fake_put)
+    monkeypatch.setattr(main.requests, "post", lambda *args, **kwargs: posts.append(args) or (_ for _ in ()).throw(AssertionError("duplicate repo")))
+
+    result = main.export_site_to_github(
+        canonical_key,
+        "Partial Plumbing",
+        "<html>partial</html>",
+        "pipeline-partial",
+        "approval-partial",
+    )
+
+    assert result["exportAction"] == "RECOVERED"
+    assert result["repository"] == f"owner/{repo_name}"
+    assert result["commitSha"] == "index.html-commit"
+    assert posts == []
 
 
 def test_netlify_github_installation_resolution_is_scoped_and_overridable(monkeypatch):
@@ -3712,6 +3828,54 @@ def create_deferred_webhook_approval(approval_id: str = "approval-concurrent-dep
         status="AWAITING_DEPLOYMENT",
         approval_id=approval_id,
     )
+
+
+def test_deferred_github_retry_reuses_persisted_html_without_model_calls(monkeypatch):
+    approval_id = create_deferred_webhook_approval("approval-deferred-export-retry")
+    model_calls = []
+    export_calls = []
+
+    def compact(context):
+        model_calls.append("groq")
+        return {
+            "businessName": context["businessName"],
+            "industry": "Plumbing",
+            "location": "Durban",
+            "summary": "Local plumbing services.",
+            "serviceKeywords": ["Plumbing"],
+        }
+
+    def generate(brief):
+        model_calls.append("gemini")
+        return {
+            "html": "<!doctype html><html><head></head><body>Saved artifact</body></html>",
+            "qaNotes": "ok",
+            "stylingLibraries": ["Bootstrap"],
+        }
+
+    def export(canonical_key, business_name, site_html, pipeline_id=None, approval_id=None):
+        export_calls.append(site_html)
+        if len(export_calls) == 1:
+            raise RuntimeError("temporary github 503")
+        return fake_github_export(canonical_key, business_name, site_html, pipeline_id, approval_id)
+
+    monkeypatch.setattr(main, "compact_lead_with_groq", compact)
+    monkeypatch.setattr(main, "generate_final_html_with_gemini", generate)
+    monkeypatch.setattr(main, "export_site_to_github", export)
+
+    with pytest.raises(main.HTTPException, match="Deferred site export failed"):
+        main.prepare_deferred_approval(approval_id)
+
+    failed = main.get_approval_or_404(approval_id)
+    assert failed["status"] == "EXPORT_FAILED"
+    assert "Saved artifact" in failed["html"]
+
+    retried = main.prepare_deferred_approval(approval_id)
+
+    assert retried["status"] == "PENDING"
+    assert main.safe_json_loads(retried["github_export_json"], {})["commitSha"]
+    assert model_calls == ["groq", "gemini"]
+    assert len(export_calls) == 2
 
 
 def test_deploy_webhook_claim_is_atomic_for_concurrent_deliveries():
