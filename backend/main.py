@@ -11813,22 +11813,40 @@ def update_zendesk_deployment_lifecycle(
         "DEPLOY_FAILED": ["asf_deploy_failed", "asf_stage_failed"],
         "FAILED": ["asf_deploy_failed", "asf_stage_failed"],
     }.get(normalized, ["asf_deploy_requested"])
-    tags = update_zendesk_ticket_tags(
-        int(ticket_id),
-        remove=ZENDESK_LIFECYCLE_TAGS,
-        add=stage_tags + ["asf_managed", f"asf_channel_{channel}"],
-    )
-    lead_status = "FAILED" if normalized in {"FAILED", "GENERATION_FAILED", "DEPLOY_FAILED"} else "GENERATING"
+    failed = normalized in {"FAILED", "GENERATION_FAILED", "DEPLOY_FAILED"}
+    lead_status = "FAILED" if failed else "GENERATING"
+    deploy_requested = not failed
     custom_fields = zendesk_custom_fields(
-        {"deployRequested": True, "leadStatus": lead_status, "contactChannel": channel}
+        {"deployRequested": deploy_requested, "leadStatus": lead_status, "contactChannel": channel}
     )
     extra_fields: Dict[str, Any] = {"status": "open"}
     if custom_fields:
         extra_fields["custom_fields"] = custom_fields
-    ticket = update_zendesk_ticket_comment(int(ticket_id), message, public=False, extra_ticket_fields=extra_fields)
+    removal_tags = set(ZENDESK_LIFECYCLE_TAGS)
+    if failed:
+        removal_tags.update({"asf_deploy_email_fired", "asf_deploy_phone_fired"})
+        # Uncheck first. Removing the deploy trigger's fired tag while the field is
+        # still checked would immediately start a second deployment attempt.
+        ticket = update_zendesk_ticket_comment(
+            int(ticket_id), message, public=False, extra_ticket_fields=extra_fields
+        )
+        tags = update_zendesk_ticket_tags(
+            int(ticket_id),
+            remove=removal_tags,
+            add=stage_tags + ["asf_managed", f"asf_channel_{channel}"],
+        )
+    else:
+        tags = update_zendesk_ticket_tags(
+            int(ticket_id),
+            remove=removal_tags,
+            add=stage_tags + ["asf_managed", f"asf_channel_{channel}"],
+        )
+        ticket = update_zendesk_ticket_comment(
+            int(ticket_id), message, public=False, extra_ticket_fields=extra_fields
+        )
     payload = {
         **((link or {}).get("payload") or {}),
-        "deployRequested": True,
+        "deployRequested": deploy_requested,
         "deploymentStage": normalized,
         "deploymentStageUpdatedAt": now_iso(),
     }

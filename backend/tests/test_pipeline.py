@@ -3252,6 +3252,50 @@ def test_deployment_update_writes_and_verifies_live_url_on_exact_route(monkeypat
     assert "admin_owned" in link["tags"]
 
 
+def test_failed_deployment_lifecycle_unchecks_field_without_retriggering(monkeypatch):
+    field_ids = configure_managed_zendesk_contract()
+    approval_id = create_pending_approval_for_webhook()
+    main.save_zendesk_ticket_link(
+        approval_id,
+        "canonical-webhook",
+        "pipeline-webhook",
+        "email",
+        "intake",
+        5883,
+        "https://zendesk.test/5883",
+        "open",
+        ["asf_managed", "asf_deploy_email_fired", "asf_stage_generating"],
+        {"deployRequested": True},
+    )
+    row = main.get_approval_or_404(approval_id)
+    captured = {}
+
+    def fake_tags(ticket_id, *, add=None, remove=None):
+        captured["removed"] = list(remove or [])
+        captured["added"] = list(add or [])
+        return ["asf_managed", *(add or [])]
+
+    def fake_comment(ticket_id, body, public, extra_ticket_fields=None):
+        captured["fields"] = extra_ticket_fields
+        return {"id": ticket_id, "status": "open"}
+
+    monkeypatch.setattr(main, "update_zendesk_ticket_tags", fake_tags)
+    monkeypatch.setattr(main, "update_zendesk_ticket_comment", fake_comment)
+
+    result = main.update_zendesk_deployment_lifecycle(
+        row,
+        5883,
+        "GENERATION_FAILED",
+        "Temporary GitHub failure.",
+    )
+
+    values = {str(item["id"]): item["value"] for item in captured["fields"]["custom_fields"]}
+    assert values[field_ids["deployRequested"]] is False
+    assert "asf_deploy_email_fired" in captured["removed"]
+    assert {"asf_generation_failed", "asf_stage_failed"}.issubset(captured["added"])
+    assert result["payload"]["deployRequested"] is False
+
+
 def test_deployment_update_refuses_unlinked_ticket_override(monkeypatch):
     monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
     monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
