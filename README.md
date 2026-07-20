@@ -49,7 +49,7 @@ For the live proof-of-concept deployment checklist, strict GitHub -> Netlify art
 ## Campaign workflow
 
 1. Connect Zendesk, select an existing brand, and provision the managed fields and two forms. Campaign creation, lead queues, and deployments remain locked until this is ready.
-2. Name a campaign, choose email leads, call leads, or both, then either run Apify discovery or upload lead data.
+2. Every campaign requires a mixed contact set with at least one email lead and one phone lead. Run Apify discovery or upload lead data; the optional metadata generator derives a campaign name and stored industry from the resulting businesses.
 3. Zendesk receives separate, tagged email and call tickets. No AI, GitHub, or Netlify work runs yet.
 4. An agent ticks the deploy field. The `deploy_site` webhook generates and persists the HTML, exports the repository, deploys Netlify, and writes the live URL back to the same ticket. Transient GitHub 429/5xx and connection failures are retried with backoff; a repository created before a failed file upload is recovered on the next attempt instead of duplicated, and the saved HTML is reused without another model call.
 5. A second channel for the same canonical lead reuses the existing artifact or live deployment.
@@ -68,7 +68,21 @@ Ticket lifecycle tags are stable automation contracts. Intake uses `asf_managed`
 On backend startup, `backfill_legacy_campaign_data()` imports pre-campaign discovery batches, pipeline runs, approvals, Zendesk tickets, GitHub exports, and deployment history into these tables. Deterministic legacy IDs and `INSERT OR IGNORE` make the migration safe to run repeatedly. `POST /api/campaigns/backfill` can trigger the same idempotent import manually.
 
 ## Environment
-Configure provider credentials in `backend/.env`. The example env file is intentionally not included because this project uses real provider tokens locally; keep secrets out of source control and rotate any credential that was shared outside a secret manager.
+Configure provider credentials in `backend/.env` for local development and in Render environment variables for production. Use `backend/.env.example` as the variable-name reference; it contains no usable secrets.
+
+### Administrator login
+
+The dashboard remains available while administrator authentication is unconfigured. Once the following backend variables are present, all dashboard API routes require the secure login session. Zendesk's authenticated webhook and the protected maintenance endpoint keep their existing independent authentication.
+
+1. Run `python scripts/hash_admin_password.py` from the repository root.
+2. Enter and confirm a password containing at least 12 characters. The script prints a PBKDF2 hash and never writes the password to disk.
+3. Set `ADMIN_USERNAME` to the chosen username, such as `admin`.
+4. Set `ADMIN_PASSWORD_HASH` to the complete generated value beginning with `pbkdf2_sha256$`.
+5. Set `ADMIN_SESSION_SECRET` to a separate random value containing at least 32 characters.
+6. Optionally set `ADMIN_SESSION_MAX_AGE_SECONDS`; the default is eight hours (`28800`).
+7. Restart the backend. The frontend detects the protected backend automatically and displays the login screen.
+
+Do not add the plain password to source code, Vercel variables, browser storage, or any `VITE_` variable. `ADMIN_PASSWORD` is supported only as a temporary server-side fallback; `ADMIN_PASSWORD_HASH` is the recommended production setting.
 
 ## Vercel frontend deployment
 

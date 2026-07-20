@@ -3,32 +3,42 @@ import { BrowserRouter, NavLink, Navigate, Route, Routes, useLocation, useNaviga
 import axios from "axios";
 import {
   AlertTriangle,
+  Accessibility,
   BarChart3,
   BriefcaseBusiness,
   Check,
+  CheckCircle2,
   ChevronRight,
   CircleUserRound,
   CloudCog,
   Database,
   ExternalLink,
   Eye,
+  EyeOff,
   GitBranch,
   LayoutDashboard,
   Lock,
+  LogOut,
   Mail,
   MapPin,
+  Monitor,
+  Moon,
   Phone,
   Plus,
   RefreshCw,
   Rocket,
   Settings2,
+  Shield,
   ShieldCheck,
+  SlidersHorizontal,
+  Sun,
   TicketCheck,
   Unplug,
   Upload,
   UsersRound,
   Webhook,
   WandSparkles,
+  XCircle,
   Zap,
 } from "lucide-react";
 import "./App.css";
@@ -37,6 +47,7 @@ const DEFAULT_API_BASE = import.meta.env.PROD
   ? "https://ai-site-factory-backend-c4w6.onrender.com"
   : "http://127.0.0.1:8000";
 const API_BASE = (import.meta.env.VITE_API_BASE || DEFAULT_API_BASE).replace(/\/$/, "");
+axios.defaults.withCredentials = true;
 const BACKEND_UNREACHABLE_NOTICE = {
   code: "BACKEND_UNREACHABLE",
   tone: "danger",
@@ -58,7 +69,16 @@ const NAV_ITEMS = [
   { to: "/leads", label: "Lead workspace", icon: UsersRound, requiresSetup: true },
   { to: "/deployments", label: "Deployments", icon: Rocket, requiresSetup: true },
   { to: "/zendesk", label: "Zendesk setup", icon: Settings2 },
+  { to: "/settings", label: "Settings", icon: SlidersHorizontal },
 ];
+
+const DEFAULT_PREFERENCES = {
+  theme: "system",
+  textScale: 1,
+  highContrast: false,
+  reducedMotion: false,
+  enhancedFocus: true,
+};
 
 const FIELD_LABELS = {
   campaignId: "Campaign ID",
@@ -106,6 +126,110 @@ function StatusBadge({ status }) {
   return <span className={`status-badge ${statusTone(status)}`}>{String(status || "Pending").replaceAll("_", " ")}</span>;
 }
 
+function FactoryMark({ compact = false }) {
+  return (
+    <div className={`factory-mark ${compact ? "compact" : ""}`} aria-hidden="true">
+      <span className="factory-orbit orbit-one" />
+      <span className="factory-orbit orbit-two" />
+      <Zap size={compact ? 18 : 24} strokeWidth={2.6} />
+      <i className="factory-node node-one" /><i className="factory-node node-two" /><i className="factory-node node-three" />
+    </div>
+  );
+}
+
+function Brand({ login = false }) {
+  return (
+    <div className={`brand ${login ? "login-brand" : ""}`}>
+      <FactoryMark compact={!login} />
+      <span><strong>AI Site Factory</strong><small>Lead-to-site campaign intelligence</small></span>
+    </div>
+  );
+}
+
+function usePreferences() {
+  const [preferences, setPreferences] = useState(() => {
+    try { return { ...DEFAULT_PREFERENCES, ...JSON.parse(localStorage.getItem("asf_preferences") || "{}") }; }
+    catch { return DEFAULT_PREFERENCES; }
+  });
+  const [systemDark, setSystemDark] = useState(() => window.matchMedia?.("(prefers-color-scheme: dark)").matches || false);
+
+  useEffect(() => {
+    const query = window.matchMedia?.("(prefers-color-scheme: dark)");
+    if (!query) return undefined;
+    const update = (event) => setSystemDark(event.matches);
+    query.addEventListener?.("change", update);
+    return () => query.removeEventListener?.("change", update);
+  }, []);
+
+  const resolvedTheme = preferences.theme === "system" ? (systemDark ? "dark" : "light") : preferences.theme;
+  const systemReducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches || false;
+  const effectiveReducedMotion = preferences.reducedMotion || systemReducedMotion;
+
+  useEffect(() => {
+    const root = document.documentElement;
+    root.dataset.theme = resolvedTheme;
+    root.dataset.highContrast = preferences.highContrast ? "true" : "false";
+    root.dataset.reducedMotion = effectiveReducedMotion ? "true" : "false";
+    root.dataset.enhancedFocus = preferences.enhancedFocus ? "true" : "false";
+    root.style.setProperty("--text-scale", String(preferences.textScale));
+    localStorage.setItem("asf_preferences", JSON.stringify(preferences));
+  }, [preferences, resolvedTheme, effectiveReducedMotion]);
+
+  const updatePreferences = (patch) => setPreferences((current) => ({ ...current, ...patch }));
+  const resetPreferences = () => setPreferences(DEFAULT_PREFERENCES);
+  return { preferences, updatePreferences, resetPreferences, resolvedTheme, effectiveReducedMotion };
+}
+
+function AnimatedNumber({ value, reducedMotion = false }) {
+  const target = Number(value || 0);
+  const [display, setDisplay] = useState(reducedMotion ? target : 0);
+  useEffect(() => {
+    if (reducedMotion) { setDisplay(target); return undefined; }
+    let frame;
+    const started = performance.now();
+    const duration = 750;
+    const tick = (now) => {
+      const progress = Math.min(1, (now - started) / duration);
+      setDisplay(Math.round(target * (1 - Math.pow(1 - progress, 3))));
+      if (progress < 1) frame = requestAnimationFrame(tick);
+    };
+    frame = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(frame);
+  }, [target, reducedMotion]);
+  return Number(display).toLocaleString();
+}
+
+function LoginPage({ onAuthenticated }) {
+  const [form, setForm] = useState({ username: "admin", password: "" });
+  const [showPassword, setShowPassword] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const submit = async (event) => {
+    event.preventDefault(); setBusy(true); setError("");
+    try {
+      const { data } = await axios.post(`${API_BASE}/api/auth/login`, form, { timeout: 30000 });
+      onAuthenticated({ authRequired: true, ...data });
+    } catch (requestError) { setError(errorMessage(requestError)); }
+    finally { setBusy(false); }
+  };
+  return (
+    <main className="login-page">
+      <div className="login-tech" aria-hidden="true"><i /><i /><i /><span /><span /><span /></div>
+      <section className="login-panel" aria-labelledby="login-title">
+        <Brand login />
+        <div className="login-copy"><span className="eyebrow">Administrator access</span><h1 id="login-title">Welcome back.</h1><p>Sign in to manage campaigns, deployments, integrations, and API safety.</p></div>
+        <form onSubmit={submit}>
+          <label>Username<input autoComplete="username" required value={form.username} onChange={(event) => setForm((current) => ({ ...current, username: event.target.value }))} /></label>
+          <label>Password<div className="password-input"><input type={showPassword ? "text" : "password"} autoComplete="current-password" required value={form.password} onChange={(event) => setForm((current) => ({ ...current, password: event.target.value }))} /><button type="button" aria-label={showPassword ? "Hide password" : "Show password"} onClick={() => setShowPassword((value) => !value)}>{showPassword ? <EyeOff size={18} /> : <Eye size={18} />}</button></div></label>
+          {error && <div className="inline-alert danger" role="alert">{error}</div>}
+          <button className="primary-button login-submit" type="submit" disabled={busy}>{busy ? <><RefreshCw className="spin" size={18} />Signing in…</> : <><ShieldCheck size={18} />Sign in securely</>}</button>
+        </form>
+        <div className="login-safety"><Lock size={16} /><span>Your password is verified by the backend and never stored in this browser.</span></div>
+      </section>
+    </main>
+  );
+}
+
 function PageSection({ title, eyebrow, description, action, children, className = "" }) {
   return (
     <section className={`surface ${className}`}>
@@ -151,11 +275,11 @@ function SetupGuard({ connection, children }) {
   return connection.workspaceReady ? children : <WorkspaceLocked connection={connection} />;
 }
 
-function MetricCard({ icon: Icon, label, value, note, tone = "blue" }) {
+function MetricCard({ icon: Icon, label, value, note, tone = "blue", reducedMotion = false }) {
   return (
     <article className={`metric-card ${tone}`}>
       <div className="metric-icon"><Icon size={20} /></div>
-      <div><span>{label}</span><strong>{Number(value || 0).toLocaleString()}</strong><small>{note}</small></div>
+      <div><span>{label}</span><strong><AnimatedNumber value={value} reducedMotion={reducedMotion} /></strong><small>{note}</small></div>
     </article>
   );
 }
@@ -237,7 +361,7 @@ function CampaignPicker({ campaigns, selectedId, onChange }) {
   );
 }
 
-function OverviewPage({ campaigns, totals, onSelectCampaign }) {
+function OverviewPage({ campaigns, totals, onSelectCampaign, reducedMotion = false }) {
   const populatedCampaigns = campaigns.filter((campaign) => campaign.metrics.channelLeads > 0);
   const visibleCampaigns = populatedCampaigns.length ? populatedCampaigns : campaigns;
   const aggregate = useMemo(() => campaigns.reduce((acc, campaign) => {
@@ -248,8 +372,13 @@ function OverviewPage({ campaigns, totals, onSelectCampaign }) {
     .map((label) => ({ label, value: aggregate[label] || 0 }));
   const failed = campaigns.reduce((sum, item) => sum + (item.metrics.failed || 0), 0);
   return (
-    <div className="page-stack">
+    <div className={`page-stack overview-page ${reducedMotion ? "motion-paused" : "motion-ready"}`}>
       <section className="hero-banner">
+        <div className="tech-field" aria-hidden="true">
+          <span className="tech-line line-one" /><span className="tech-line line-two" /><span className="tech-line line-three" />
+          <i className="tech-node tech-node-one" /><i className="tech-node tech-node-two" /><i className="tech-node tech-node-three" /><i className="tech-node tech-node-four" />
+          <b className="tech-orbit orbit-a" /><b className="tech-orbit orbit-b" />
+        </div>
         <div>
           <span className="eyebrow">Campaign command centre</span>
           <h1>Turn qualified leads into deployed sites, only when an agent says go.</h1>
@@ -261,12 +390,12 @@ function OverviewPage({ campaigns, totals, onSelectCampaign }) {
       </section>
 
       <div className="metric-grid">
-        <MetricCard icon={BriefcaseBusiness} label="Campaigns" value={totals.campaigns} note="Named lead searches" tone="violet" />
-        <MetricCard icon={UsersRound} label="Lead records" value={totals.leads} note="Email + call queues" tone="blue" />
-        <MetricCard icon={Rocket} label="Live deployments" value={totals.deployments} note="Netlify sites ready" tone="green" />
-        <MetricCard icon={Zap} label="AI generations" value={totals.aiGenerations} note="Existing + deploy-triggered" tone="orange" />
-        <MetricCard icon={GitBranch} label="Repos created" value={totals.reposCreated} note="One artifact per lead" tone="cyan" />
-        <MetricCard icon={CloudCog} label="Pending" value={totals.pending} note="Waiting for agent action" tone="amber" />
+        <MetricCard icon={BriefcaseBusiness} label="Campaigns" value={totals.campaigns} note="Named lead searches" tone="violet" reducedMotion={reducedMotion} />
+        <MetricCard icon={UsersRound} label="Lead records" value={totals.leads} note="Email + call queues" tone="blue" reducedMotion={reducedMotion} />
+        <MetricCard icon={Rocket} label="Live deployments" value={totals.deployments} note="Netlify sites ready" tone="green" reducedMotion={reducedMotion} />
+        <MetricCard icon={Zap} label="AI generations" value={totals.aiGenerations} note="Existing + deploy-triggered" tone="orange" reducedMotion={reducedMotion} />
+        <MetricCard icon={GitBranch} label="Repos created" value={totals.reposCreated} note="One artifact per lead" tone="cyan" reducedMotion={reducedMotion} />
+        <MetricCard icon={CloudCog} label="Pending" value={totals.pending} note="Waiting for agent action" tone="amber" reducedMotion={reducedMotion} />
       </div>
 
       <div className="dashboard-grid">
@@ -304,9 +433,8 @@ function CampaignForm({ presets, connection, onCreated }) {
     location: "Durban, South Africa",
     query: "",
     limit: 10,
-    email: true,
-    phone: true,
     forceRefresh: true,
+    autoGenerateMetadata: true,
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -315,10 +443,6 @@ function CampaignForm({ presets, connection, onCreated }) {
   const submit = async (event) => {
     event.preventDefault();
     setError("");
-    if (!form.email && !form.phone) {
-      setError("Select at least one lead channel.");
-      return;
-    }
     if (form.presetId === "custom" && (!form.industry.trim() || !form.query.trim())) {
       setError("Enter both an industry and search intent for a custom campaign.");
       return;
@@ -332,9 +456,10 @@ function CampaignForm({ presets, connection, onCreated }) {
         location: form.location,
         query: form.query || null,
         limit: Number(form.limit),
-        channels: [form.email && "email", form.phone && "phone"].filter(Boolean),
+        channels: ["email", "phone"],
         forceRefresh: form.forceRefresh,
         syncZendesk: true,
+        autoGenerateMetadata: form.autoGenerateMetadata,
       }, { timeout: 900000 });
       onCreated(data);
       setForm((current) => ({ ...current, campaignName: "", forceRefresh: true }));
@@ -348,7 +473,7 @@ function CampaignForm({ presets, connection, onCreated }) {
   return (
     <form className="campaign-form" onSubmit={submit}>
       <div className="form-grid two">
-        <label>Campaign name<input required value={form.campaignName} onChange={(event) => update({ campaignName: event.target.value })} placeholder="e.g. Durban Plumbers - July" /></label>
+        <label>Campaign name<input required={!form.autoGenerateMetadata} disabled={form.autoGenerateMetadata} value={form.campaignName} onChange={(event) => update({ campaignName: event.target.value })} placeholder={form.autoGenerateMetadata ? "Generated from discovered leads" : "e.g. Durban Plumbers - July"} /><small>{form.autoGenerateMetadata ? "Created from the detected industries, location, and channel mix." : "Enter a descriptive campaign name."}</small></label>
         <label>Location<input required value={form.location} onChange={(event) => update({ location: event.target.value })} placeholder="City, province, or country" /></label>
       </div>
       <div className="preset-heading"><strong>Choose a starting point</strong><span>Select a preset or define your own industry and search intent.</span></div>
@@ -365,16 +490,18 @@ function CampaignForm({ presets, connection, onCreated }) {
       <div className="form-grid three">
         <label>Industry<input required value={form.industry} onChange={(event) => update({ industry: event.target.value, presetId: "custom" })} placeholder="e.g. Solar energy" /></label>
         <label>Search intent<input required={form.presetId === "custom"} value={form.query} onChange={(event) => update({ query: event.target.value })} placeholder="e.g. commercial solar installers" /><small>{form.presetId === "custom" ? "Required for custom campaigns." : "Optional: refine the selected preset."}</small></label>
-        <label>Lead target<input type="number" min="1" value={form.limit} onChange={(event) => update({ limit: Math.max(1, Number(event.target.value) || 1) })} /></label>
+        <label>Lead target<input type="number" min="2" value={form.limit} onChange={(event) => update({ limit: Math.max(2, Number(event.target.value) || 2) })} /><small>The result must contain both email and phone contacts.</small></label>
       </div>
       <div className="channel-choice">
-        <label className={form.email ? "checked" : ""}><input type="checkbox" checked={form.email} onChange={(event) => update({ email: event.target.checked })} /><Mail size={20} /><span><strong>Email leads</strong><small>Email form + email send checkbox</small></span></label>
-        <label className={form.phone ? "checked" : ""}><input type="checkbox" checked={form.phone} onChange={(event) => update({ phone: event.target.checked })} /><Phone size={20} /><span><strong>Call leads</strong><small>Phone form + call status field</small></span></label>
+        <label className="checked channel-required"><input type="checkbox" checked readOnly /><Mail size={20} /><span><strong>Email leads required</strong><small>Every campaign includes an email queue</small></span></label>
+        <label className="checked channel-required"><input type="checkbox" checked readOnly /><Phone size={20} /><span><strong>Call leads required</strong><small>Every campaign includes a phone queue</small></span></label>
       </div>
       <div className="form-options">
         <label><input type="checkbox" checked readOnly />Create Zendesk intake tickets (required)</label>
+        <label><input type="checkbox" checked={form.autoGenerateMetadata} onChange={(event) => update({ autoGenerateMetadata: event.target.checked })} />Generate campaign name and stored industry from results</label>
         <label><input type="checkbox" checked={form.forceRefresh} onChange={(event) => update({ forceRefresh: event.target.checked })} />Force a fresh Apify run</label>
       </div>
+      <div className="mixed-channel-note"><ShieldCheck size={20} /><div><strong>Mixed-channel guarantee</strong><p>The campaign is created only when the search returns at least one valid email lead and one valid phone lead. No contact information is invented.</p></div></div>
       <div className="deferred-note"><Zap size={22} /><div><strong>Cost-safe by design</strong><p>This step finds and tags leads only. Gemini, GitHub, and Netlify are not called until an agent requests deployment.</p></div></div>
       {error && <div className="inline-alert danger">{error}</div>}
       <div className="form-submit"><button className="primary-button" type="submit" disabled={busy || !connection.workspaceReady}>{busy ? <><RefreshCw className="spin" size={18} />Finding leads…</> : <><Rocket size={18} />Launch campaign</>}</button><span>Lead target is dynamic; Zendesk tickets are created before the workspace opens.</span></div>
@@ -383,7 +510,7 @@ function CampaignForm({ presets, connection, onCreated }) {
 }
 
 function UploadCampaignForm({ connection, onCreated }) {
-  const [form, setForm] = useState({ campaignName: "", industry: "Local service", location: "South Africa", email: true, phone: true, chunkSize: 5 });
+  const [form, setForm] = useState({ campaignName: "", industry: "Local service", location: "South Africa", chunkSize: 5, autoGenerateMetadata: true });
   const [file, setFile] = useState(null);
   const [job, setJob] = useState(null);
   const [busy, setBusy] = useState(false);
@@ -423,7 +550,6 @@ function UploadCampaignForm({ connection, onCreated }) {
   const submit = async (event) => {
     event.preventDefault(); setError("");
     if (!file) { setError("Choose a CSV, JSON, or JSONL lead file."); return; }
-    if (!form.email && !form.phone) { setError("Select at least one lead channel."); return; }
     setBusy(true);
     try {
       const payload = new FormData();
@@ -431,8 +557,9 @@ function UploadCampaignForm({ connection, onCreated }) {
       payload.append("campaignName", form.campaignName);
       payload.append("industry", form.industry);
       payload.append("location", form.location);
-      payload.append("channels", [form.email && "email", form.phone && "phone"].filter(Boolean).join(","));
+      payload.append("channels", "email,phone");
       payload.append("chunkSize", String(form.chunkSize));
+      payload.append("autoGenerateMetadata", String(form.autoGenerateMetadata));
       const { data } = await axios.post(`${API_BASE}/api/campaigns/import`, payload, { timeout: 120000 });
       setJob(data); setBusy(false);
       await drainJob(data.jobId);
@@ -453,8 +580,8 @@ function UploadCampaignForm({ connection, onCreated }) {
   return (
     <form className="campaign-form upload-campaign" onSubmit={submit}>
       <div className="form-grid two">
-        <label>Campaign name<input required value={form.campaignName} onChange={(event) => update({ campaignName: event.target.value })} placeholder="e.g. Uploaded Durban Leads" /></label>
-        <label>Default industry<input required value={form.industry} onChange={(event) => update({ industry: event.target.value })} /></label>
+        <label>Campaign name<input required={!form.autoGenerateMetadata} disabled={form.autoGenerateMetadata} value={form.campaignName} onChange={(event) => update({ campaignName: event.target.value })} placeholder={form.autoGenerateMetadata ? "Generated after file analysis" : "e.g. Uploaded Durban Leads"} /></label>
+        <label>Fallback industry<input required value={form.industry} onChange={(event) => update({ industry: event.target.value })} /><small>Used only when rows do not include an industry.</small></label>
       </div>
       <div className="form-grid two">
         <label>Default location<input required value={form.location} onChange={(event) => update({ location: event.target.value })} /></label>
@@ -462,9 +589,11 @@ function UploadCampaignForm({ connection, onCreated }) {
       </div>
       <label className={`upload-dropzone ${file ? "selected" : ""}`}><Upload size={25} /><span><strong>{file?.name || "Choose lead data"}</strong><small>CSV, JSON, or JSONL · flexible Apify/Amplifier-style field names</small></span><input type="file" accept=".csv,.json,.jsonl,application/json,text/csv" onChange={(event) => setFile(event.target.files?.[0] || null)} /></label>
       <div className="channel-choice">
-        <label className={form.email ? "checked" : ""}><input type="checkbox" checked={form.email} onChange={(event) => update({ email: event.target.checked })} /><Mail size={20} /><span><strong>Email leads</strong><small>Requires an email value</small></span></label>
-        <label className={form.phone ? "checked" : ""}><input type="checkbox" checked={form.phone} onChange={(event) => update({ phone: event.target.checked })} /><Phone size={20} /><span><strong>Call leads</strong><small>Requires a phone value</small></span></label>
+        <label className="checked channel-required"><input type="checkbox" checked readOnly /><Mail size={20} /><span><strong>Email leads required</strong><small>The file must include at least one valid email</small></span></label>
+        <label className="checked channel-required"><input type="checkbox" checked readOnly /><Phone size={20} /><span><strong>Call leads required</strong><small>The file must include at least one valid phone number</small></span></label>
       </div>
+      <div className="form-options"><label><input type="checkbox" checked={form.autoGenerateMetadata} onChange={(event) => update({ autoGenerateMetadata: event.target.checked })} />Generate campaign name and industry from uploaded rows</label></div>
+      <div className="mixed-channel-note"><ShieldCheck size={20} /><div><strong>Mixed-file validation</strong><p>The upload is checked before any tickets are created. Files containing only email or only phone contacts are stopped with a clear explanation.</p></div></div>
       {job && <div className="import-progress"><div><strong>{job.fileName}</strong><StatusBadge status={job.status} /></div><div className="progress-track"><i style={{ width: `${job.progressPercent || 0}%` }} /></div><p>{Number(job.processedRows || 0).toLocaleString()} of {Number(job.totalRows || 0).toLocaleString()} rows processed · {job.succeededRows || 0} created · {job.skippedRows || 0} duplicates · {job.failedRows || 0} failed</p>{job.fileRetained && <small>The original file is retained until this job completes.</small>}</div>}
       {error && <div className="inline-alert danger">{error}</div>}
       <div className="form-submit">
@@ -740,7 +869,70 @@ function ZendeskPage({ connection, setConnection }) {
   );
 }
 
-function AppShell() {
+function SettingsPage({ session, preferenceState }) {
+  const { preferences, updatePreferences, resetPreferences, resolvedTheme, effectiveReducedMotion } = preferenceState;
+  const [safety, setSafety] = useState(null);
+  const [busyProvider, setBusyProvider] = useState("");
+  const [error, setError] = useState("");
+
+  const loadSafety = useCallback(() => {
+    setError("");
+    axios.get(`${API_BASE}/api/settings/api-safety`, { timeout: 30000 })
+      .then(({ data }) => setSafety(data))
+      .catch((requestError) => setError(errorMessage(requestError)));
+  }, []);
+  useEffect(() => { loadSafety(); }, [loadSafety]);
+
+  const probe = async (provider) => {
+    setBusyProvider(provider); setError("");
+    try {
+      const { data } = await axios.post(`${API_BASE}/api/settings/api-safety/probe`, { provider }, { timeout: 90000 });
+      setSafety(data.safety);
+    } catch (requestError) { setError(errorMessage(requestError)); }
+    finally { setBusyProvider(""); }
+  };
+
+  const providerLabel = (value) => ({ apify: "Apify", gemini: "Gemini", groq: "Groq", github: "GitHub", netlify: "Netlify", zendesk: "Zendesk" }[value] || value);
+  return (
+    <div className="page-stack settings-page">
+      <PageSection title="Administrator account" eyebrow="Access control" description="The dashboard uses one server-verified administrator account.">
+        <div className="settings-account-grid">
+          <article className={session.authRequired ? "setting-status ready" : "setting-status warning"}><div>{session.authRequired ? <ShieldCheck size={24} /> : <AlertTriangle size={24} />}</div><span>{session.authRequired ? "Protection active" : "Setup required"}</span><strong>{session.username || session.configuredUsername || "admin"}</strong><p>{session.authRequired ? "Dashboard and API requests require an authenticated session." : "Add the administrator environment variables in Render to activate the login screen."}</p></article>
+          <article className="session-details"><div><span>Authentication</span><strong>{session.configurationSource === "password-hash" ? "PBKDF2 password hash" : session.authRequired ? "Environment password" : "Not configured"}</strong></div><div><span>Session expiry</span><strong>{session.sessionExpiresAt ? new Date(session.sessionExpiresAt * 1000).toLocaleString() : "Starts after login"}</strong></div><div><span>Cookie protection</span><strong>HTTP-only · Secure · SameSite</strong></div><div><span>Failed login protection</span><strong>5 attempts · 15-minute cooldown</strong></div></article>
+        </div>
+        {!session.authRequired && <div className="inline-alert warning">Login is intentionally inactive until ADMIN_USERNAME and ADMIN_PASSWORD_HASH are configured. The deployment remains usable during setup.</div>}
+      </PageSection>
+
+      <div className="settings-two-column">
+        <PageSection title="Appearance" eyebrow="Theme" description="Choose how the workspace looks on this device.">
+          <div className="theme-options" role="radiogroup" aria-label="Color theme">
+            {[{ id: "light", label: "Light", icon: Sun }, { id: "dark", label: "Dark", icon: Moon }, { id: "system", label: "System", icon: Monitor }].map(({ id, label, icon: Icon }) => <button type="button" role="radio" aria-checked={preferences.theme === id} className={preferences.theme === id ? "selected" : ""} key={id} onClick={() => updatePreferences({ theme: id })}><Icon size={21} /><strong>{label}</strong><small>{id === "system" ? `Currently ${resolvedTheme}` : `${label} workspace`}</small></button>)}
+          </div>
+        </PageSection>
+
+        <PageSection title="Accessibility" eyebrow="Personal controls" description="These preferences persist locally and affect every page.">
+          <div className="accessibility-settings">
+            <label><span><strong>Text size</strong><small>{Math.round(preferences.textScale * 100)}%</small></span><input aria-label="Text size" type="range" min="1" max="1.3" step="0.05" value={preferences.textScale} onChange={(event) => updatePreferences({ textScale: Number(event.target.value) })} /></label>
+            <label className="setting-toggle"><span><strong>High contrast</strong><small>Strengthen boundaries and text contrast.</small></span><input type="checkbox" checked={preferences.highContrast} onChange={(event) => updatePreferences({ highContrast: event.target.checked })} /></label>
+            <label className="setting-toggle"><span><strong>Reduce motion</strong><small>Stops decorative movement and chart animations.</small></span><input type="checkbox" checked={preferences.reducedMotion} onChange={(event) => updatePreferences({ reducedMotion: event.target.checked })} /></label>
+            <label className="setting-toggle"><span><strong>Enhanced keyboard focus</strong><small>Makes the active keyboard control easier to see.</small></span><input type="checkbox" checked={preferences.enhancedFocus} onChange={(event) => updatePreferences({ enhancedFocus: event.target.checked })} /></label>
+          </div>
+          <div className="accessibility-footer"><span><Accessibility size={17} />Motion is currently {effectiveReducedMotion ? "reduced" : "enabled"}.</span><button className="ghost-button" type="button" onClick={resetPreferences}>Reset accessibility</button></div>
+        </PageSection>
+      </div>
+
+      <PageSection title="API Safety Center" eyebrow="Server-side integrations" description="Check provider readiness without exposing API keys or tokens to the browser." action={<button className="ghost-button" type="button" onClick={loadSafety}><RefreshCw size={16} />Refresh status</button>}>
+        {error && <div className="inline-alert danger" role="alert">{error}</div>}
+        {safety ? <>
+          <div className="safety-summary"><Shield size={22} /><div><strong>{safety.configuredCount} of {safety.totalCount} providers configured</strong><p>{safety.message}</p></div><span className={safety.configuredCount === safety.totalCount ? "ready" : "warning"}>{safety.configuredCount === safety.totalCount ? "Ready" : "Review needed"}</span></div>
+          <div className="provider-grid">{safety.providers.map((provider) => <article className={`provider-card ${provider.configured ? "configured" : "missing"}`} key={provider.provider}><div className="provider-heading"><span>{provider.configured ? <CheckCircle2 size={20} /> : <XCircle size={20} />}</span><div><strong>{providerLabel(provider.provider)}</strong><small>{provider.configured ? "Environment ready" : "Configuration missing"}</small></div></div><div className="variable-list">{provider.variables.map((variable) => <code key={variable.name}>{variable.name}<i className={variable.configured ? "ready" : "missing"}>{variable.configured ? "set" : variable.issue || "missing"}</i></code>)}</div>{provider.lastCheck && <p className={`probe-result ${provider.lastCheck.status.toLowerCase()}`}>{provider.lastCheck.message} · {provider.lastCheck.durationMs} ms</p>}<button className="ghost-button" type="button" disabled={!provider.configured || Boolean(busyProvider)} onClick={() => probe(provider.provider)}>{busyProvider === provider.provider ? <><RefreshCw className="spin" size={15} />Testing…</> : <><ShieldCheck size={15} />Test connection</>}</button></article>)}</div>
+        </> : <div className="loading-state compact"><RefreshCw className="spin" /><strong>Loading API safety status…</strong></div>}
+      </PageSection>
+    </div>
+  );
+}
+
+function AppShell({ session, onSessionChange, preferenceState }) {
   const location = useLocation();
   const navigate = useNavigate();
   const [presets, setPresets] = useState(FALLBACK_PRESETS);
@@ -846,23 +1038,28 @@ function AppShell() {
     try { const { data } = await axios.post(`${API_BASE}/api/campaigns/${selectedCampaignId}/sync-zendesk`, {}, { timeout: 300000 }); setDetail(data); setNotice({ tone: "success", text: `Synced ${data.sync?.synced || 0} lead tickets to Zendesk.` }); refresh(true); }
     catch (error) { setNotice({ tone: "danger", text: errorMessage(error) }); } finally { setSyncing(false); }
   };
+  const logout = async () => {
+    try { await axios.post(`${API_BASE}/api/auth/logout`, {}, { timeout: 15000 }); }
+    finally { onSessionChange({ authRequired: true, authenticated: false, configurationSource: session.configurationSource }); }
+  };
   const pageName = NAV_ITEMS.find((item) => location.pathname.startsWith(item.to))?.label || "Overview";
 
   return (
     <div className="app-shell">
       <aside className="sidebar">
-        <div className="brand"><div><Zap size={20} /></div><span><strong>AI Site Factory</strong><small>Lead-to-site campaigns</small></span></div>
+        <Brand />
         <nav>{NAV_ITEMS.map(({ to, label, icon: Icon, requiresSetup }) => requiresSetup && !connection.workspaceReady ? <button aria-label={`${label} locked`} className="nav-locked" key={to} type="button" onClick={() => navigate("/zendesk")}><Icon size={18} /><span>{label}</span><Lock size={12} /></button> : <NavLink aria-label={label} key={to} to={to}><Icon size={18} /><span>{label}</span></NavLink>)}</nav>
         <div className={`sidebar-connection ${connection.workspaceReady ? "connected" : ""}`}><i /> <div><span>{connection.workspaceReady ? "Zendesk workspace ready" : connection.connected ? "Zendesk setup incomplete" : "Zendesk required"}</span><small>{connection.connected ? connection.subdomain : "Campaigns locked"}</small></div></div>
       </aside>
       <main>
-        <header className="topbar"><div><span>Workspace</span><h1>{pageName}</h1></div><div className="topbar-actions">{notice && <div className={`notice ${notice.tone}`}>{notice.text}<button type="button" onClick={() => setNotice(null)}>×</button></div>}<button className="refresh-button" type="button" onClick={() => refresh(false)} disabled={refreshing}><RefreshCw size={17} className={refreshing ? "spin" : ""} />Refresh</button></div></header>
+        <header className="topbar"><div><span>Workspace</span><h1>{pageName}</h1></div><div className="topbar-actions">{notice && <div className={`notice ${notice.tone}`}>{notice.text}<button type="button" aria-label="Dismiss notification" onClick={() => setNotice(null)}>×</button></div>}<button className="icon-button" type="button" aria-label={`Switch to ${preferenceState.resolvedTheme === "dark" ? "light" : "dark"} theme`} onClick={() => preferenceState.updatePreferences({ theme: preferenceState.resolvedTheme === "dark" ? "light" : "dark" })}>{preferenceState.resolvedTheme === "dark" ? <Sun size={17} /> : <Moon size={17} />}</button><button className="refresh-button" type="button" onClick={() => refresh(false)} disabled={refreshing}><RefreshCw size={17} className={refreshing ? "spin" : ""} />Refresh</button>{session.authRequired && <button className="account-button" type="button" onClick={logout}><CircleUserRound size={17} /><span>{session.username || "admin"}</span><LogOut size={15} /></button>}</div></header>
         <div className="page-content">{loading ? <div className="loading-state"><RefreshCw className="spin" /><strong>Loading campaign workspace…</strong></div> : <Routes>
-          <Route path="/overview" element={<OverviewPage campaigns={campaigns} totals={totals} onSelectCampaign={selectAndOpen} />} />
+          <Route path="/overview" element={<OverviewPage campaigns={campaigns} totals={totals} onSelectCampaign={selectAndOpen} reducedMotion={preferenceState.effectiveReducedMotion} />} />
           <Route path="/campaigns" element={<SetupGuard connection={connection}><CampaignsPage presets={presets} connection={connection} onCreated={created} /></SetupGuard>} />
           <Route path="/leads" element={<SetupGuard connection={connection}><LeadWorkspacePage campaigns={campaigns} selectedCampaignId={selectedCampaignId} setSelectedCampaignId={setSelectedCampaignId} detail={detail} connection={connection} onSync={syncCampaign} syncing={syncing} /></SetupGuard>} />
           <Route path="/deployments" element={<SetupGuard connection={connection}><DeploymentsPage campaigns={campaigns} selectedCampaignId={selectedCampaignId} setSelectedCampaignId={setSelectedCampaignId} detail={detail} history={history} /></SetupGuard>} />
           <Route path="/zendesk" element={<ZendeskPage connection={connection} setConnection={setConnection} />} />
+          <Route path="/settings" element={<SettingsPage session={session} preferenceState={preferenceState} />} />
           <Route path="*" element={<Navigate to="/overview" replace />} />
         </Routes>}</div>
       </main>
@@ -871,5 +1068,32 @@ function AppShell() {
 }
 
 export default function App() {
-  return <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}><AppShell /></BrowserRouter>;
+  const preferenceState = usePreferences();
+  const [session, setSession] = useState(null);
+  const [sessionLoading, setSessionLoading] = useState(true);
+
+  const loadSession = useCallback(() => {
+    setSessionLoading(true);
+    axios.get(`${API_BASE}/api/auth/session`, { timeout: 30000 })
+      .then(({ data }) => setSession(data))
+      .catch(() => setSession({ authRequired: false, authenticated: false, configurationSource: "unavailable" }))
+      .finally(() => setSessionLoading(false));
+  }, []);
+  useEffect(() => { loadSession(); }, [loadSession]);
+  useEffect(() => {
+    const expired = () => setSession((current) => current?.authRequired ? { ...current, authenticated: false } : current);
+    window.addEventListener("asf-auth-expired", expired);
+    const interceptor = axios.interceptors.response.use(
+      (response) => response,
+      (error) => {
+        if (error?.response?.status === 401 && error?.response?.data?.code === "ADMIN_AUTH_REQUIRED") window.dispatchEvent(new Event("asf-auth-expired"));
+        return Promise.reject(error);
+      },
+    );
+    return () => { window.removeEventListener("asf-auth-expired", expired); axios.interceptors.response.eject(interceptor); };
+  }, []);
+
+  if (sessionLoading) return <div className="auth-loading"><FactoryMark /><strong>Securing AI Site Factory…</strong></div>;
+  if (session?.authRequired && !session.authenticated) return <LoginPage onAuthenticated={setSession} />;
+  return <BrowserRouter future={{ v7_startTransition: true, v7_relativeSplatPath: true }}><AppShell session={session || { authRequired: false }} onSessionChange={setSession} preferenceState={preferenceState} /></BrowserRouter>;
 }

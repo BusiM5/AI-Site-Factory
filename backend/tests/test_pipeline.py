@@ -3885,6 +3885,125 @@ def test_debug_logs_redact_sensitive_details():
     assert details["authorization"] != "Bearer raw-token-value"
 
 
+def test_single_admin_login_protects_api_and_uses_http_only_session(monkeypatch):
+    client.cookies.clear()
+    original_password_hash = main.hash_admin_password("Correct-Horse-Battery-2026")
+    monkeypatch.setenv("ADMIN_USERNAME", "admin")
+    monkeypatch.setenv("ADMIN_PASSWORD_HASH", original_password_hash)
+    monkeypatch.setenv("ADMIN_SESSION_SECRET", "test-session-secret-that-is-long-and-random")
+    monkeypatch.delenv("ADMIN_PASSWORD", raising=False)
+    monkeypatch.delenv("RENDER", raising=False)
+    monkeypatch.delenv("RENDER_EXTERNAL_URL", raising=False)
+    monkeypatch.delenv("PUBLIC_BACKEND_URL", raising=False)
+
+    try:
+        session = client.get("/api/auth/session")
+        blocked = client.get(
+            "/api/presets",
+            headers={"Origin": "https://ai-site-factory-sable.vercel.app"},
+        )
+        rejected = client.post("/api/auth/login", json={"username": "admin", "password": "wrong-password"})
+        accepted = client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "Correct-Horse-Battery-2026"},
+        )
+        allowed = client.get("/api/presets")
+        safety = client.get("/api/settings/api-safety")
+
+        assert session.status_code == 200
+        assert session.json()["authRequired"] is True
+        assert session.json()["authenticated"] is False
+        assert blocked.status_code == 401
+        assert blocked.headers["access-control-allow-origin"] == "https://ai-site-factory-sable.vercel.app"
+        assert rejected.status_code == 401
+        assert accepted.status_code == 200
+        assert "HttpOnly" in accepted.headers["set-cookie"]
+        assert allowed.status_code == 200
+        assert safety.status_code == 200
+        assert safety.json()["secretsExposed"] is False
+        assert all("maskedValue" not in variable for provider in safety.json()["providers"] for variable in provider["variables"])
+
+        monkeypatch.setenv("ADMIN_PASSWORD_HASH", main.hash_admin_password("A-Different-Password-2026"))
+        assert client.get("/api/presets").status_code == 401
+        monkeypatch.setenv("ADMIN_PASSWORD_HASH", original_password_hash)
+
+        logged_out = client.post("/api/auth/logout")
+        assert logged_out.status_code == 200
+        assert client.get("/api/presets").status_code == 401
+    finally:
+        client.cookies.clear()
+
+
+def test_campaign_rejects_single_channel_search_before_zendesk_creation(monkeypatch):
+    phone_only = apify_item(298, province="KwaZulu-Natal")
+    phone_only.pop("email", None)
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda *args, **kwargs: [phone_only])
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
+    monkeypatch.setattr(
+        main,
+        "create_zendesk_intake_tickets",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("Zendesk must not be called for a single-channel result")),
+    )
+
+    response = client.post(
+        "/api/campaigns/intake",
+        json={
+            "campaignName": "Must stay mixed",
+            "presetId": "plumbers",
+            "location": "Durban, South Africa",
+            "limit": 2,
+            "channels": ["phone"],
+            "syncZendesk": True,
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "MIXED_LEADS_REQUIRED"
+    assert response.json()["detail"]["emailLeads"] == 0
+
+
+def test_campaign_auto_generates_name_and_industry_from_mixed_results(monkeypatch):
+    email_lead = apify_item(299, province="KwaZulu-Natal")
+    email_lead["email"] = "mixed-email@example.com"
+    email_lead["phone"] = None
+    email_lead["categoryName"] = "Plumbing"
+    phone_lead = apify_item(300, province="KwaZulu-Natal")
+    phone_lead.pop("email", None)
+    phone_lead["categoryName"] = "Electrical"
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda *args, **kwargs: [email_lead, phone_lead])
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
+    monkeypatch.setattr(main, "zendesk_connection_snapshot", lambda: {"connected": True, "workspaceReady": True})
+    ticket_ids = iter([8801, 8802])
+    monkeypatch.setattr(main, "create_zendesk_intake_tickets", lambda **kwargs: [{"ticketId": next(ticket_ids)}])
+
+    response = client.post(
+        "/api/campaigns/intake",
+        json={
+            "campaignName": "",
+            "presetId": "custom",
+            "industry": "Local service",
+            "query": "mixed local services",
+            "location": "Durban, South Africa",
+            "limit": 2,
+            "channels": ["email"],
+            "autoGenerateMetadata": True,
+            "syncZendesk": True,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert "Durban" in payload["campaignName"]
+    assert "Mixed Leads" in payload["campaignName"]
+    assert payload["industry"] == "Mixed industries"
+    assert payload["mixedChannelCounts"]["emailLeads"] >= 1
+    assert payload["mixedChannelCounts"]["phoneLeads"] >= 1
+    assert payload["metrics"]["emailLeads"] == 1
+    assert payload["metrics"]["callLeads"] == 1
+
+
 def test_campaign_intake_splits_email_and_call_records_without_generation(monkeypatch):
     item = apify_item(301, province="KwaZulu-Natal")
     item["email"] = "campaign@example.com"
@@ -3980,15 +4099,15 @@ def test_campaign_replay_resumes_partial_zendesk_intake_without_duplicates(monke
 def test_campaign_final_state_uses_saved_ticket_facts_not_stale_worker_error(monkeypatch):
     item = apify_item(402, province="KwaZulu-Natal")
     item["email"] = "race@example.com"
-    item["phone"] = None
     monkeypatch.setattr(main, "run_apify_google_maps", lambda *args, **kwargs: [item])
     monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
     monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
 
     def stale_worker(**kwargs):
+        table = "campaign_email_leads" if kwargs["requested_channels"][0] == "email" else "campaign_call_leads"
         with main.get_pipeline_db() as db:
             db.execute(
-                "UPDATE campaign_email_leads SET ticket_id = 9301, status = 'TICKET_READY' WHERE approval_id = ?",
+                f"UPDATE {table} SET ticket_id = 9301, status = 'TICKET_READY' WHERE approval_id = ?",
                 (kwargs["approval_id"],),
             )
         raise RuntimeError("stale worker timeout after another retry succeeded")
@@ -4001,7 +4120,7 @@ def test_campaign_final_state_uses_saved_ticket_facts_not_stale_worker_error(mon
             "presetId": "plumbers",
             "location": "Durban, South Africa",
             "limit": 1,
-            "channels": ["email"],
+                "channels": ["email", "phone"],
             "syncZendesk": True,
         },
     )
@@ -4094,6 +4213,48 @@ def test_uploaded_campaign_processes_durable_chunks_without_generating_sites(mon
     assert completed["campaign"]["metrics"]["aiGenerations"] == 0
 
 
+def test_uploaded_campaign_can_generate_metadata_and_requires_mixed_contacts(monkeypatch):
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
+    mixed_csv = (
+        "businessName,email,phone,industry,location\n"
+        "Northside Plumbing,hello@northside.example,,Plumbing,Durban\n"
+        "Bright Spark Electrical,,+27 31 555 0134,Electrical,Durban\n"
+    )
+
+    queued = client.post(
+        "/api/campaigns/import",
+        data={
+            "campaignName": "",
+            "industry": "Local service",
+            "location": "Durban",
+            "channels": "email",
+            "autoGenerateMetadata": "true",
+        },
+        files={"file": ("mixed.csv", mixed_csv, "text/csv")},
+    )
+
+    assert queued.status_code == 200, queued.text
+    payload = queued.json()
+    assert payload["metadataSuggestion"]["industry"] == "Mixed industries"
+    assert payload["campaign"]["campaignName"].startswith("Durban")
+    assert payload["campaign"]["channels"] == ["email", "phone"]
+    assert payload["mixedChannelCounts"] == {
+        "emailLeads": 1,
+        "phoneLeads": 1,
+        "emailAndPhoneLeads": 0,
+    }
+
+    email_only_csv = "businessName,email,industry,location\nEmail Only,only@example.com,Plumbing,Durban\n"
+    rejected = client.post(
+        "/api/campaigns/import",
+        data={"campaignName": "Email only", "industry": "Plumbing", "location": "Durban"},
+        files={"file": ("email-only.csv", email_only_csv, "text/csv")},
+    )
+    assert rejected.status_code == 422
+    assert rejected.json()["detail"]["code"] == "MIXED_LEADS_REQUIRED"
+
+
 def test_uploaded_generic_row_ids_do_not_create_distinct_lead_identities():
     first = main.normalize_uploaded_lead(
         {"id": "row-1", "businessName": "Alpha Plumbing", "email": "alpha@example.com", "location": "Durban"},
@@ -4124,14 +4285,14 @@ def test_uploaded_identity_is_skipped_across_campaigns(monkeypatch):
     monkeypatch.setattr(main, "create_zendesk_intake_tickets", intake)
 
     def queue(name, business):
-        csv_data = f"businessName,email,industry,location\n{business},same@example.com,Plumbing,Durban\n"
+        csv_data = f"businessName,email,phone,industry,location\n{business},same@example.com,+27 31 555 0199,Plumbing,Durban\n"
         response = client.post(
             "/api/campaigns/import",
             data={
                 "campaignName": name,
                 "industry": "Plumbing",
                 "location": "Durban",
-                "channels": "email",
+                    "channels": "email,phone",
                 "chunkSize": "5",
             },
             files={"file": ("leads.csv", csv_data, "text/csv")},
@@ -4151,9 +4312,11 @@ def test_uploaded_identity_is_skipped_across_campaigns(monkeypatch):
     assert second_result.json()["succeededRows"] == 0
     assert second_result.json()["skippedRows"] == 1
     assert second_result.json()["campaign"]["metrics"]["emailLeads"] == 0
-    assert len(ticket_calls) == 1
+    assert second_result.json()["campaign"]["metrics"]["callLeads"] == 0
+    assert len(ticket_calls) == 2
     with main.get_pipeline_db() as db:
         assert db.execute("SELECT COUNT(*) FROM campaign_email_leads").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM campaign_call_leads").fetchone()[0] == 1
         item = db.execute(
             "SELECT * FROM campaign_import_items WHERE job_id = ?", (second_job["jobId"],)
         ).fetchone()
@@ -4255,7 +4418,7 @@ def test_campaign_deploy_webhook_generates_once_then_deploys(monkeypatch):
     assert detail["metrics"]["aiGenerations"] == 1
     assert detail["metrics"]["reposCreated"] == 1
     assert detail["metrics"]["deployed"] == 1
-    assert detail["deployments"][0]["liveUrl"] == "https://alpha.netlify.app"
+    assert any(item["liveUrl"] == "https://alpha.netlify.app" for item in detail["deployments"])
     assert model_calls == ["groq_compact", "gemini_final"]
     assert len(export_calls) == 1
 

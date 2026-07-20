@@ -6,6 +6,7 @@ import binascii
 from collections import deque
 import csv
 import hashlib
+import hmac
 import html
 import io
 import json
@@ -22,6 +23,7 @@ import requests
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, EmailStr, Field
 
 
@@ -38,23 +40,6 @@ def load_environment() -> None:
 
 
 load_environment()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:8000",
-        "http://127.0.0.1:8000",
-        "https://ai-site-factory-frontend.vercel.app",
-        "https://ai-site-factory-sable.vercel.app",
-        "https://ai-site-factory-git-main-ai-site-factory.vercel.app",
-    ],
-    allow_origin_regex=r"^(http://(localhost|127\.0\.0\.1):\d+|https://[a-z0-9-]+\.vercel\.app)$",
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
 LOG_DIR = os.path.join(os.path.dirname(__file__), "logs")
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -77,6 +62,130 @@ SENSITIVE_KEY_PATTERN = re.compile(r"(token|key|secret|password|authorization|au
 MODEL_CHUNK_CHARS = int(os.getenv("MODEL_CHUNK_CHARS", "1800"))
 MODEL_MAX_CHUNKS = int(os.getenv("MODEL_MAX_CHUNKS", "4"))
 RUNTIME_INTEGRATION_OVERRIDES: Dict[str, str] = {}
+API_SAFETY_CHECK_RESULTS: Dict[str, Dict[str, Any]] = {}
+ADMIN_SESSION_COOKIE = "asf_admin_session"
+ADMIN_LOGIN_ATTEMPTS: Dict[str, List[float]] = {}
+ADMIN_SESSION_MAX_AGE_SECONDS = int(os.getenv("ADMIN_SESSION_MAX_AGE_SECONDS", str(8 * 60 * 60)))
+
+
+def admin_auth_settings() -> Dict[str, Any]:
+    username = compact_text(os.getenv("ADMIN_USERNAME"), "admin")
+    password_hash = compact_text(os.getenv("ADMIN_PASSWORD_HASH"))
+    password = os.getenv("ADMIN_PASSWORD") or ""
+    return {
+        "configured": bool(username and (password_hash or password)),
+        "username": username,
+        "passwordHash": password_hash,
+        "password": password,
+        "source": "password-hash" if password_hash else "password" if password else "not-configured",
+    }
+
+
+def hash_admin_password(password: str, iterations: int = 600_000, salt: Optional[bytes] = None) -> str:
+    if len(password or "") < 12:
+        raise ValueError("The administrator password must contain at least 12 characters.")
+    salt_value = salt or os.urandom(16)
+    derived = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt_value, iterations)
+    return "pbkdf2_sha256${}${}${}".format(
+        iterations,
+        base64.urlsafe_b64encode(salt_value).decode("ascii").rstrip("="),
+        base64.urlsafe_b64encode(derived).decode("ascii").rstrip("="),
+    )
+
+
+def verify_admin_password(password: str, settings: Optional[Dict[str, Any]] = None) -> bool:
+    settings = settings or admin_auth_settings()
+    stored_hash = compact_text(settings.get("passwordHash"))
+    if stored_hash:
+        try:
+            algorithm, iterations_text, salt_text, digest_text = stored_hash.split("$", 3)
+            if algorithm != "pbkdf2_sha256":
+                return False
+            padded_salt = salt_text + "=" * (-len(salt_text) % 4)
+            padded_digest = digest_text + "=" * (-len(digest_text) % 4)
+            salt = base64.urlsafe_b64decode(padded_salt.encode("ascii"))
+            expected = base64.urlsafe_b64decode(padded_digest.encode("ascii"))
+            actual = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, int(iterations_text))
+            return hmac.compare_digest(actual, expected)
+        except (ValueError, TypeError, binascii.Error):
+            return False
+    return bool(settings.get("password")) and hmac.compare_digest(password, str(settings["password"]))
+
+
+def admin_session_secret(settings: Optional[Dict[str, Any]] = None) -> bytes:
+    settings = settings or admin_auth_settings()
+    supplied = os.getenv("ADMIN_SESSION_SECRET") or ""
+    if supplied:
+        return supplied.encode("utf-8")
+    password_material = settings.get("passwordHash") or settings.get("password") or "unconfigured"
+    return hashlib.sha256(f"ai-site-factory-session:{password_material}".encode("utf-8")).digest()
+
+
+def admin_credential_version(settings: Optional[Dict[str, Any]] = None) -> str:
+    settings = settings or admin_auth_settings()
+    password_material = settings.get("passwordHash") or settings.get("password") or "unconfigured"
+    return hashlib.sha256(str(password_material).encode("utf-8")).hexdigest()[:16]
+
+
+def issue_admin_session(username: str, settings: Optional[Dict[str, Any]] = None) -> str:
+    settings = settings or admin_auth_settings()
+    expires_at = int(time.time()) + ADMIN_SESSION_MAX_AGE_SECONDS
+    payload = json.dumps(
+        {
+            "username": username,
+            "expiresAt": expires_at,
+            "credentialVersion": admin_credential_version(settings),
+            "nonce": os.urandom(8).hex(),
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload_text = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+    signature = hmac.new(admin_session_secret(settings), payload_text.encode("ascii"), hashlib.sha256).digest()
+    signature_text = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+    return f"{payload_text}.{signature_text}"
+
+
+def read_admin_session(token: Optional[str], settings: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    if not token:
+        return None
+    settings = settings or admin_auth_settings()
+    try:
+        payload_text, signature_text = token.split(".", 1)
+        expected = hmac.new(admin_session_secret(settings), payload_text.encode("ascii"), hashlib.sha256).digest()
+        supplied = base64.urlsafe_b64decode((signature_text + "=" * (-len(signature_text) % 4)).encode("ascii"))
+        if not hmac.compare_digest(expected, supplied):
+            return None
+        payload = json.loads(
+            base64.urlsafe_b64decode((payload_text + "=" * (-len(payload_text) % 4)).encode("ascii"))
+        )
+        if int(payload.get("expiresAt") or 0) <= int(time.time()):
+            return None
+        if compact_text(payload.get("username")) != settings["username"]:
+            return None
+        if not hmac.compare_digest(
+            compact_text(payload.get("credentialVersion")),
+            admin_credential_version(settings),
+        ):
+            return None
+        return payload
+    except (ValueError, TypeError, KeyError, json.JSONDecodeError, binascii.Error):
+        return None
+
+
+def admin_cookie_secure() -> bool:
+    return bool(os.getenv("RENDER") or os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_BACKEND_URL"))
+
+
+AUTH_PUBLIC_PATHS = {
+    "/",
+    "/favicon.ico",
+    "/api/health",
+    "/api/auth/session",
+    "/api/auth/login",
+    "/api/auth/logout",
+    "/api/zendesk/webhook",
+    "/api/deployments/refresh-business-media",
+}
 
 
 class GeminiRateLimitError(RuntimeError):
@@ -160,6 +269,8 @@ GENERIC_INDUSTRY_LABELS = {
     "local business",
     "local service",
     "local services",
+    "mixed industry",
+    "mixed industries",
     "service",
     "services",
     "unknown",
@@ -711,6 +822,46 @@ async def request_logger(request: Request, call_next):
     return response
 
 
+@app.middleware("http")
+async def require_admin_session(request: Request, call_next):
+    settings = admin_auth_settings()
+    if (
+        request.method.upper() == "OPTIONS"
+        or not settings["configured"]
+        or request.url.path in AUTH_PUBLIC_PATHS
+    ):
+        return await call_next(request)
+
+    session = read_admin_session(request.cookies.get(ADMIN_SESSION_COOKIE), settings)
+    if not session:
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Administrator login required.", "code": "ADMIN_AUTH_REQUIRED"},
+        )
+    request.state.admin_username = session["username"]
+    return await call_next(request)
+
+
+# Keep CORS outside the authentication middleware so cross-origin clients can
+# read login-expiry 401 responses and route back to the sign-in screen.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:8000",
+        "http://127.0.0.1:8000",
+        "https://ai-site-factory-frontend.vercel.app",
+        "https://ai-site-factory-sable.vercel.app",
+        "https://ai-site-factory-git-main-ai-site-factory.vercel.app",
+    ],
+    allow_origin_regex=r"^(http://(localhost|127\.0\.0\.1):\d+|https://[a-z0-9-]+\.vercel\.app)$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 LEADS_DB: Dict[str, dict] = {}
 CONTENT_DB: Dict[str, dict] = {}
 PREVIEW_DB: Dict[str, dict] = {}
@@ -1158,7 +1309,7 @@ class DiscoverLeadsRequest(BaseModel):
 
 
 class CampaignIntakeRequest(BaseModel):
-    campaignName: str
+    campaignName: str = ""
     presetId: str
     industry: Optional[str] = None
     location: str = "South Africa"
@@ -1168,6 +1319,7 @@ class CampaignIntakeRequest(BaseModel):
     forceRefresh: bool = True
     syncZendesk: bool = True
     idempotencyKey: Optional[str] = None
+    autoGenerateMetadata: bool = False
 
 
 class DiscoveredLead(BaseModel):
@@ -1282,6 +1434,15 @@ class ApprovalActionResponse(BaseModel):
 class ApiProbeRequest(BaseModel):
     includeExternal: bool = False
     checks: List[str] = Field(default_factory=list)
+
+
+class AdminLoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class ApiSafetyProbeRequest(BaseModel):
+    provider: str
 
 
 class ApiProbeCheck(BaseModel):
@@ -2645,6 +2806,76 @@ def select_mixed_contact_leads(leads: List[DiscoveredLead], limit: int) -> List[
         take("phone")
 
     return selected
+
+
+def mixed_channel_counts(leads: List[DiscoveredLead]) -> Dict[str, int]:
+    return {
+        "emailLeads": sum(1 for lead in leads if normalize_email_identity(lead.email)),
+        "phoneLeads": sum(1 for lead in leads if compact_text(lead.phone)),
+        "emailAndPhoneLeads": sum(
+            1 for lead in leads if normalize_email_identity(lead.email) and compact_text(lead.phone)
+        ),
+    }
+
+
+def require_mixed_contact_channels(leads: List[DiscoveredLead], source_label: str) -> Dict[str, int]:
+    counts = mixed_channel_counts(leads)
+    if counts["emailLeads"] < 1 or counts["phoneLeads"] < 1:
+        missing = "email" if counts["emailLeads"] < 1 else "phone"
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "MIXED_LEADS_REQUIRED",
+                "message": (
+                    f"{source_label} does not contain a mixed contact set. Add at least one valid {missing} lead "
+                    "so the campaign can create both Email and Call channel records."
+                ),
+                **counts,
+            },
+        )
+    return counts
+
+
+def suggest_campaign_metadata(
+    leads: List[DiscoveredLead],
+    location: str,
+    fallback_industry: str = "Mixed industries",
+) -> Dict[str, Any]:
+    industry_counts: Dict[str, int] = {}
+    for lead in leads:
+        category = compact_text(lead.category)
+        if category and not is_generic_industry_label(category):
+            industry_counts[category] = industry_counts.get(category, 0) + 1
+    ranked = sorted(industry_counts.items(), key=lambda item: (-item[1], item[0].casefold()))
+    total_classified = sum(industry_counts.values())
+    if len(ranked) == 1 or (ranked and ranked[0][1] / max(1, total_classified) >= 0.65):
+        industry = ranked[0][0]
+    elif ranked:
+        industry = "Mixed industries"
+    else:
+        industry = compact_text(fallback_industry, "Mixed industries")
+        if is_generic_industry_label(industry):
+            industry = "Mixed industries"
+
+    top_industries = [name for name, _count in ranked[:3]]
+    if not top_industries:
+        descriptor = "Mixed Business"
+    elif len(top_industries) == 1:
+        descriptor = top_industries[0]
+    elif len(top_industries) == 2:
+        descriptor = f"{top_industries[0]} & {top_industries[1]}"
+    else:
+        descriptor = f"{top_industries[0]}, {top_industries[1]} & {top_industries[2]}"
+    location_label = compact_text(location, "South Africa").split(",", 1)[0]
+    campaign_name = f"{location_label} {descriptor} Mixed Leads — {datetime.now().strftime('%b %Y')}"
+    return {
+        "campaignName": campaign_name,
+        "industry": industry,
+        "topIndustries": top_industries,
+        "industryCounts": industry_counts,
+        "location": compact_text(location, "South Africa"),
+        "channelCounts": mixed_channel_counts(leads),
+    }
 
 
 def upsert_lead_registry(lead: DiscoveredLead) -> None:
@@ -9033,6 +9264,139 @@ def probe_zendesk() -> Dict[str, Any]:
     return {"id": user.get("id"), "role": user.get("role"), "email": user.get("email")}
 
 
+def api_safety_snapshot() -> Dict[str, Any]:
+    provider_statuses = provider_env_status()
+    providers = []
+    for provider, status in provider_statuses.items():
+        last_result = API_SAFETY_CHECK_RESULTS.get(provider)
+        providers.append(
+            {
+                "provider": provider,
+                "configured": status["configured"],
+                "variables": [
+                    {
+                        "name": check["name"],
+                        "configured": check["configured"],
+                        "issue": check["issue"],
+                    }
+                    for check in status["checks"]
+                ],
+                "lastCheck": last_result,
+            }
+        )
+    return {
+        "providers": providers,
+        "configuredCount": sum(1 for item in providers if item["configured"]),
+        "totalCount": len(providers),
+        "secretsExposed": False,
+        "message": "Secret values remain server-side and are never returned to the browser.",
+    }
+
+
+@app.get("/api/auth/session")
+def get_admin_auth_session(request: Request):
+    settings = admin_auth_settings()
+    session = read_admin_session(request.cookies.get(ADMIN_SESSION_COOKIE), settings) if settings["configured"] else None
+    return {
+        "authRequired": settings["configured"],
+        "authenticated": bool(session),
+        "username": session.get("username") if session else None,
+        "configuredUsername": settings["username"] if settings["configured"] else None,
+        "configurationSource": settings["source"],
+        "sessionExpiresAt": session.get("expiresAt") if session else None,
+    }
+
+
+@app.post("/api/auth/login")
+def admin_login(request: AdminLoginRequest, http_request: Request):
+    settings = admin_auth_settings()
+    if not settings["configured"]:
+        raise HTTPException(
+            status_code=503,
+            detail="Administrator login is not configured. Add ADMIN_USERNAME and ADMIN_PASSWORD_HASH on the backend host.",
+        )
+
+    forwarded = compact_text(http_request.headers.get("x-forwarded-for")).split(",", 1)[0]
+    client_ip = forwarded or compact_text(http_request.client.host if http_request.client else "unknown")
+    login_key = f"{client_ip}:{compact_text(request.username).lower()}"
+    window_started = time.time() - (15 * 60)
+    attempts = [attempt for attempt in ADMIN_LOGIN_ATTEMPTS.get(login_key, []) if attempt >= window_started]
+    if len(attempts) >= 5:
+        raise HTTPException(status_code=429, detail="Too many failed login attempts. Try again in 15 minutes.")
+
+    valid_username = hmac.compare_digest(compact_text(request.username), settings["username"])
+    valid_password = verify_admin_password(request.password, settings)
+    if not (valid_username and valid_password):
+        attempts.append(time.time())
+        ADMIN_LOGIN_ATTEMPTS[login_key] = attempts
+        time.sleep(0.2)
+        raise HTTPException(status_code=401, detail="The administrator username or password is incorrect.")
+
+    ADMIN_LOGIN_ATTEMPTS.pop(login_key, None)
+    token = issue_admin_session(settings["username"], settings)
+    session = read_admin_session(token, settings) or {}
+    response = JSONResponse(
+        {
+            "authenticated": True,
+            "username": settings["username"],
+            "sessionExpiresAt": session.get("expiresAt"),
+        }
+    )
+    secure = admin_cookie_secure()
+    response.set_cookie(
+        key=ADMIN_SESSION_COOKIE,
+        value=token,
+        max_age=ADMIN_SESSION_MAX_AGE_SECONDS,
+        httponly=True,
+        secure=secure,
+        samesite="none" if secure else "lax",
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/auth/logout")
+def admin_logout():
+    response = JSONResponse({"authenticated": False, "message": "Administrator session ended."})
+    secure = admin_cookie_secure()
+    response.delete_cookie(
+        key=ADMIN_SESSION_COOKIE,
+        path="/",
+        secure=secure,
+        samesite="none" if secure else "lax",
+    )
+    return response
+
+
+@app.get("/api/settings/api-safety")
+def get_api_safety_center():
+    return api_safety_snapshot()
+
+
+@app.post("/api/settings/api-safety/probe")
+def probe_api_safety_provider(request: ApiSafetyProbeRequest):
+    provider = compact_text(request.provider).lower()
+    callbacks = {
+        "apify": probe_apify,
+        "gemini": probe_gemini,
+        "groq": probe_groq,
+        "github": probe_github,
+        "netlify": probe_netlify,
+        "zendesk": probe_zendesk,
+    }
+    if provider not in callbacks:
+        raise HTTPException(status_code=400, detail="Choose a supported API provider.")
+    check = run_probe_check(provider, callbacks[provider])
+    result = {
+        "status": check.status,
+        "message": check.message,
+        "durationMs": check.durationMs,
+        "checkedAt": now_iso(),
+    }
+    API_SAFETY_CHECK_RESULTS[provider] = result
+    return {"provider": provider, "result": result, "safety": api_safety_snapshot()}
+
+
 @app.get("/api/debug/status")
 def get_debug_status():
     providers = provider_env_status()
@@ -10664,6 +11028,7 @@ def campaign_request_idempotency_key(request: CampaignIntakeRequest, channels: L
                 "query": compact_text(request.query).lower(),
                 "limit": int(request.limit),
                 "channels": sorted(channels),
+                "autoGenerateMetadata": bool(request.autoGenerateMetadata),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -11408,22 +11773,18 @@ def get_campaign_import(job_id: str):
 @app.post("/api/campaigns/import")
 async def create_campaign_import(
     file: UploadFile = File(...),
-    campaignName: str = Form(...),
+    campaignName: str = Form(""),
     industry: str = Form("Local service"),
     location: str = Form("South Africa"),
     channels: str = Form("email,phone"),
     chunkSize: int = Form(5),
+    autoGenerateMetadata: bool = Form(False),
 ):
     require_zendesk_workspace_ready()
     campaign_name = compact_text(campaignName)
-    if not campaign_name:
+    if not campaign_name and not autoGenerateMetadata:
         raise HTTPException(status_code=400, detail="Campaign name is required.")
-    selected_channels = [
-        value for value in dict.fromkeys(re.split(r"[,\s]+", compact_text(channels).lower()))
-        if value in {"email", "phone"}
-    ]
-    if not selected_channels:
-        raise HTTPException(status_code=400, detail="Select email leads, phone leads, or both.")
+    selected_channels = ["email", "phone"]
     verify_zendesk_ticket_contracts(selected_channels)
     safe_chunk_size = max(1, min(int(chunkSize or 5), 25))
     content = await file.read()
@@ -11434,6 +11795,28 @@ async def create_campaign_import(
         raise HTTPException(status_code=413, detail=f"The lead file exceeds the {max_bytes // (1024 * 1024)} MB upload limit.")
     safe_file_name = os.path.basename(file.filename or "leads.csv")
     file_type, rows = parse_uploaded_lead_file(content, safe_file_name)
+    preview_leads: List[DiscoveredLead] = []
+    for row_number, raw_row in enumerate(rows, start=1):
+        try:
+            preview_leads.append(
+                normalize_uploaded_lead(
+                    raw_row,
+                    row_number,
+                    compact_text(industry, "Local service"),
+                    compact_text(location, "South Africa"),
+                )
+            )
+        except ValueError:
+            continue
+    mixed_counts = require_mixed_contact_channels(preview_leads, "The uploaded lead file")
+    metadata_suggestion = suggest_campaign_metadata(
+        preview_leads,
+        compact_text(location, "South Africa"),
+        compact_text(industry, "Mixed industries"),
+    )
+    if autoGenerateMetadata:
+        campaign_name = metadata_suggestion["campaignName"]
+        industry = metadata_suggestion["industry"]
     idempotency_key = uploaded_campaign_idempotency_key(
         content, campaign_name, industry, location, selected_channels
     )
@@ -11525,6 +11908,8 @@ async def create_campaign_import(
     log_event("info", "campaign.import.queued", "Uploaded campaign queued.", jobId=job_id, campaignId=campaign_id, rows=len(rows))
     result = campaign_import_job_summary(get_campaign_import_job_or_404(job_id))
     result["idempotentReplay"] = False
+    result["metadataSuggestion"] = metadata_suggestion
+    result["mixedChannelCounts"] = mixed_counts
     return result
 
 
@@ -11635,7 +12020,7 @@ def campaign_discovery_plan(campaign: sqlite3.Row) -> Tuple[List[DiscoveredLead]
     leads = [DiscoveredLead(**value) for value in safe_json_loads(batch["leads_json"], [])]
     snapshot = {
         "batchId": batch_id,
-        "preset": get_preset_or_404(campaign["preset_id"]),
+        "preset": resolve_lead_preset(campaign["preset_id"], campaign["industry"], campaign["query"]),
         "location": batch["location"],
         "query": batch["query"],
         "leads": [lead.model_dump() for lead in leads],
@@ -11910,12 +12295,9 @@ def reconcile_discovered_campaign_intake(campaign_id: str, *, idempotent_replay:
 def create_campaign_intake(request: CampaignIntakeRequest):
     require_zendesk_workspace_ready()
     campaign_name = compact_text(request.campaignName)
-    if not campaign_name:
+    if not campaign_name and not request.autoGenerateMetadata:
         raise HTTPException(status_code=400, detail="Campaign name is required.")
-    channels = list(dict.fromkeys(compact_text(value).lower() for value in request.channels))
-    channels = [channel for channel in channels if channel in {"email", "phone"}]
-    if not channels:
-        raise HTTPException(status_code=400, detail="Select email leads, phone leads, or both.")
+    channels = ["email", "phone"]
     if not request.syncZendesk:
         raise HTTPException(
             status_code=400,
@@ -11941,9 +12323,21 @@ def create_campaign_intake(request: CampaignIntakeRequest):
             forceRefresh=request.forceRefresh,
         )
     )
+    mixed_counts = require_mixed_contact_channels(discovery.leads, "The Apify search result")
+    metadata_suggestion = suggest_campaign_metadata(
+        discovery.leads,
+        discovery.location,
+        compact_text(request.industry, discovery.preset.get("industry", "Mixed industries")),
+    )
+    if request.autoGenerateMetadata:
+        campaign_name = metadata_suggestion["campaignName"]
     campaign_id = str(uuid5(NAMESPACE_URL, idempotency_key))
     timestamp = now_iso()
-    industry = compact_text(request.industry, discovery.preset.get("industry", "Local service"))
+    industry = (
+        metadata_suggestion["industry"]
+        if request.autoGenerateMetadata
+        else compact_text(request.industry, discovery.preset.get("industry", "Local service"))
+    )
     raced_campaign_id: Optional[str] = None
     with get_pipeline_db() as db:
         insert = db.execute(
@@ -11967,7 +12361,10 @@ def create_campaign_intake(request: CampaignIntakeRequest):
                 raced_campaign_id = existing_campaign["id"]
     if raced_campaign_id:
         return reconcile_discovered_campaign_intake(raced_campaign_id, idempotent_replay=True)
-    return reconcile_discovered_campaign_intake(campaign_id, idempotent_replay=False)
+    result = reconcile_discovered_campaign_intake(campaign_id, idempotent_replay=False)
+    result["metadataSuggestion"] = metadata_suggestion
+    result["mixedChannelCounts"] = mixed_counts
+    return result
 
 
 @app.post("/api/campaigns/{campaign_id}/sync-zendesk")
@@ -12263,6 +12660,15 @@ def apply_zendesk_macro_to_ticket(ticket_id: int, macro_title: str) -> Dict[str,
         "tags": tags,
         "public": public,
         "status": ticket.get("status") or status,
+    }
+
+
+@app.get("/api/health")
+def get_public_health():
+    return {
+        "status": "READY",
+        "startedAt": STARTED_AT.isoformat(),
+        "uptimeSeconds": int((datetime.now() - STARTED_AT).total_seconds()),
     }
 
 
