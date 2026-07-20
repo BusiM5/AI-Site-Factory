@@ -6672,6 +6672,13 @@ def enable_netlify_site(site_id: str, headers: Dict[str, str]) -> None:
         response.raise_for_status()
 
 
+def netlify_site_is_disabled(site: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(site, dict):
+        return False
+    state = compact_text(site.get("state")).lower()
+    return bool(site.get("disabled")) or state in {"disabled", "inactive"}
+
+
 def netlify_site_matches_live_url(site: Dict[str, Any], live_url: str) -> bool:
     target_host = urlparse(compact_text(live_url)).netloc.lower().split(":", 1)[0]
     if not target_host:
@@ -7264,7 +7271,13 @@ def deploy_direct_netlify_fallback_for_lead(
         )
         if verify_response.status_code == 200:
             verified_existing_site = verify_response.json()
-            if compact_text(existing_site["last_deploy_state"]).lower() in {"cancelled", "disabled"}:
+            # Render can restart with a restored/partial SQLite registry while the
+            # Netlify project remains disabled. Trust Netlify's current state as
+            # well as our local state before publishing another deploy.
+            if (
+                compact_text(existing_site["last_deploy_state"]).lower() in {"cancelled", "disabled"}
+                or netlify_site_is_disabled(verified_existing_site)
+            ):
                 enable_netlify_site(existing_site["site_id"], headers)
         elif verify_response.status_code in {403, 404}:
             account_migration = True
@@ -7355,6 +7368,8 @@ def deploy_direct_netlify_fallback_for_lead(
                 deploy_action = "DIRECT_FALLBACK_REDEPLOYED"
             site_id = site.get("id") or site.get("name")
             site_name = site.get("name") or site_name
+            if site_reused and netlify_site_is_disabled(site):
+                enable_netlify_site(site_id, headers)
         else:
             create_response.raise_for_status()
             site = create_response.json()
@@ -7397,6 +7412,10 @@ def deploy_direct_netlify_fallback_for_lead(
 
     if state == "error":
         raise RuntimeError(deploy.get("error_message") or "Netlify direct fallback deploy failed.")
+    if state != "ready":
+        raise RuntimeError(
+            f"Netlify direct fallback deploy did not become ready before the polling timeout (state: {state})."
+        )
 
     site_url = (
         deploy.get("ssl_url")

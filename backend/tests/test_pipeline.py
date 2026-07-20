@@ -1579,6 +1579,141 @@ def test_netlify_git_deploy_relinks_fallback_registry_instead_of_reusing_it(monk
         assert registry["last_build_id"] == "new-build"
 
 
+def test_direct_netlify_recovery_enables_disabled_duplicate_site_before_upload(monkeypatch):
+    monkeypatch.setenv("NETLIFY_AUTH_TOKEN", "netlify-secret")
+    calls = []
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        calls.append(("get", url))
+        if url.endswith("/api/v1/sites"):
+            return FakeResponse(
+                200,
+                [
+                    {
+                        "id": "site-disabled",
+                        "name": "ai-site-disabled-business-canonica",
+                        "state": "disabled",
+                        "ssl_url": "https://ai-site-disabled-business-canonica.netlify.app",
+                    }
+                ],
+            )
+        raise AssertionError(url)
+
+    def fake_put(url, headers=None, params=None, timeout=None):
+        calls.append(("put", url))
+        assert url.endswith("/sites/site-disabled/enable")
+        return FakeResponse(204, {})
+
+    def fake_post(url, headers=None, json=None, data=None, timeout=None):
+        calls.append(("post", url))
+        if url.endswith("/api/v1/sites"):
+            return FakeResponse(422, {"errors": {"subdomain": ["must be unique"]}})
+        if url.endswith("/sites/site-disabled/deploys"):
+            return FakeResponse(
+                201,
+                {
+                    "id": "deploy-recovered",
+                    "state": "ready",
+                    "ssl_url": "https://ai-site-disabled-business-canonica.netlify.app",
+                },
+            )
+        raise AssertionError(url)
+
+    monkeypatch.setattr(main.requests, "get", fake_get)
+    monkeypatch.setattr(main.requests, "put", fake_put)
+    monkeypatch.setattr(main.requests, "post", fake_post)
+
+    result = main.deploy_direct_netlify_fallback_for_lead(
+        canonical_key="canonical-disabled",
+        business_name="Disabled Business",
+        site_html="<!doctype html><html><body>Recovered</body></html>",
+        pipeline_id="pipeline-disabled",
+        approval_id="approval-disabled",
+        approved_by="Ops",
+        github_export=fake_github_export(
+            "canonical-disabled", "Disabled Business", "<html>Recovered</html>"
+        ),
+        git_error=RuntimeError("Git-linked site name already exists."),
+    )
+
+    assert result["state"] == "ready"
+    assert result["siteId"] == "site-disabled"
+    assert result["deployAction"] == "DIRECT_FALLBACK_REDEPLOYED"
+    assert calls.index(("put", "https://api.netlify.com/api/v1/sites/site-disabled/enable")) < calls.index(
+        ("post", "https://api.netlify.com/api/v1/sites/site-disabled/deploys")
+    )
+
+
+def test_direct_netlify_redeploy_uses_remote_disabled_state_after_registry_restore(monkeypatch):
+    monkeypatch.setenv("NETLIFY_AUTH_TOKEN", "netlify-secret")
+    timestamp = main.now_iso()
+    with main.get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT INTO site_registry (
+                canonical_lead_key, site_id, site_name, url, created_at, updated_at,
+                last_deploy_state, deployment_count, publish_mode
+            ) VALUES (?, ?, ?, ?, ?, ?, 'uploaded', 1, 'direct-netlify-fallback')
+            """,
+            (
+                "canonical-restored",
+                "site-restored",
+                "restored-site",
+                "https://restored-site.netlify.app",
+                timestamp,
+                timestamp,
+            ),
+        )
+    enabled = []
+
+    monkeypatch.setattr(
+        main.requests,
+        "get",
+        lambda url, **kwargs: FakeResponse(
+            200,
+            {
+                "id": "site-restored",
+                "name": "restored-site",
+                "state": "disabled",
+                "ssl_url": "https://restored-site.netlify.app",
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        main.requests,
+        "put",
+        lambda url, **kwargs: enabled.append(url) or FakeResponse(204, {}),
+    )
+    monkeypatch.setattr(
+        main.requests,
+        "post",
+        lambda url, **kwargs: FakeResponse(
+            201,
+            {
+                "id": "deploy-restored",
+                "state": "ready",
+                "ssl_url": "https://restored-site.netlify.app",
+            },
+        ),
+    )
+
+    result = main.deploy_direct_netlify_fallback_for_lead(
+        canonical_key="canonical-restored",
+        business_name="Restored Business",
+        site_html="<!doctype html><html><body>Restored</body></html>",
+        pipeline_id="pipeline-restored",
+        approval_id="approval-restored",
+        approved_by="Ops",
+        github_export=fake_github_export(
+            "canonical-restored", "Restored Business", "<html>Restored</html>"
+        ),
+        git_error=RuntimeError("Git linkage unavailable."),
+    )
+
+    assert result["state"] == "ready"
+    assert enabled == ["https://api.netlify.com/api/v1/sites/site-restored/enable"]
+
+
 def test_direct_netlify_deploy_migrates_stale_site_to_current_account(monkeypatch):
     monkeypatch.setenv("NETLIFY_AUTH_TOKEN", "new-account-token")
     now = main.now_iso()
