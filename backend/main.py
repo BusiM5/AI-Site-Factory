@@ -120,10 +120,92 @@ Rules:
 - Include a visible dynamic color/theme widget that lets visitors change site colors and persists selections with localStorage.
 - Include accessible semantic sections, mobile-first responsive layout, clear contact options, and grounded calls to action.
 - When mainImageUrl is supplied, use that exact public business-listing image as the prominent hero/banner image. Otherwise, include a generated hero image personalised to the business name, industry, location, and public lead context; prefer an inline SVG or data URI and do not rely on unrelated stock-photo URLs.
+- Use the supplied brandTheme as the default page palette. Keep the colours appropriate to the business industry and maintain accessible text contrast; the colour widget may let visitors override those defaults.
 - Personalise the copy with concrete supplied details such as business name, category/industry, city/location, address, rating/review count, source listing, phone, email, service keywords, differentiators, and proof points when they are present. Avoid generic filler when a supplied detail is available.
 - CTA buttons must have working destinations: use mailto: for email leads, tel: for phone leads, the supplied website URL if present, or valid in-page anchors such as #services and #contact. Do not use empty hrefs, href="#", javascript:void(0), or non-functional buttons.
 - Do not include external tracking pixels, forms that submit data, or claims of consent.
 """.strip()
+
+DEFAULT_BUSINESS_THEME = {
+    "text": "#102033",
+    "background": "#f8fbff",
+    "highlight": "#0f9f96",
+    "name": "local-service",
+}
+
+BUSINESS_THEME_RULES = [
+    (("physio", "health", "medical", "clinic", "dental", "dentist", "dentistry", "wellness", "therapy"), "#0f766e", "#f0fdfa", "healthcare"),
+    (("restaurant", "food", "cafe", "bakery", "catering", "takeaway"), "#b45309", "#fff7ed", "hospitality"),
+    (("plumb", "water", "hvac", "air condition", "electric", "repair", "locksmith"), "#0369a1", "#f0f9ff", "trade-services"),
+    (("beauty", "salon", "hair", "nail", "spa", "cosmetic"), "#be185d", "#fff1f2", "beauty"),
+    (("fitness", "gym", "sport", "training"), "#c2410c", "#fff7ed", "fitness"),
+    (("landscap", "garden", "pest", "cleaning", "environment"), "#15803d", "#f0fdf4", "home-and-garden"),
+    (("account", "legal", "finance", "consult", "insurance", "property"), "#1d4ed8", "#eff6ff", "professional-services"),
+    (("photo", "creative", "design", "studio", "event", "media"), "#7c3aed", "#f5f3ff", "creative"),
+    (("auto", "vehicle", "mechanic", "transport", "courier"), "#b91c1c", "#fef2f2", "automotive"),
+]
+
+BUSINESS_THEME_FALLBACKS = [
+    ("#0f766e", "#f0fdfa", "teal"),
+    ("#0369a1", "#f0f9ff", "blue"),
+    ("#7c3aed", "#f5f3ff", "violet"),
+    ("#b45309", "#fff7ed", "amber"),
+    ("#15803d", "#f0fdf4", "green"),
+]
+
+
+def normalized_hex_color(value: Any) -> Optional[str]:
+    candidate = compact_text(value).lower()
+    if re.fullmatch(r"#[0-9a-f]{6}", candidate):
+        return candidate
+    return None
+
+
+def mix_hex_color(source: str, target: str, amount: float) -> str:
+    source_value = normalized_hex_color(source) or DEFAULT_BUSINESS_THEME["highlight"]
+    target_value = normalized_hex_color(target) or "#000000"
+    source_channels = [int(source_value[index:index + 2], 16) for index in (1, 3, 5)]
+    target_channels = [int(target_value[index:index + 2], 16) for index in (1, 3, 5)]
+    mixed = [
+        round(channel + (target_channels[index] - channel) * amount)
+        for index, channel in enumerate(source_channels)
+    ]
+    return "#" + "".join(f"{channel:02x}" for channel in mixed)
+
+
+def business_theme_for_context(context: Optional[Dict[str, Any]]) -> Dict[str, str]:
+    context = context if isinstance(context, dict) else {}
+    supplied = context.get("brandTheme") if isinstance(context.get("brandTheme"), dict) else {}
+    raw = context.get("rawLead") if isinstance(context.get("rawLead"), dict) else {}
+    supplied_highlight = normalized_hex_color(
+        supplied.get("highlight")
+        or uploaded_row_value(raw, ["brandColor", "brandColour", "primaryColor", "primaryColour", "accentColor"])
+    )
+    supplied_background = normalized_hex_color(supplied.get("background"))
+    supplied_text = normalized_hex_color(supplied.get("text"))
+
+    descriptor_parts = [
+        context.get("industry"),
+        context.get("category"),
+        context.get("businessName"),
+        *(context.get("serviceKeywords") if isinstance(context.get("serviceKeywords"), list) else []),
+    ]
+    descriptor = normalize_identity_text(" ".join(compact_text(item) for item in descriptor_parts if compact_text(item)))
+    highlight = background = palette_name = None
+    for keywords, candidate_highlight, candidate_background, candidate_name in BUSINESS_THEME_RULES:
+        if any(keyword in descriptor for keyword in keywords):
+            highlight, background, palette_name = candidate_highlight, candidate_background, candidate_name
+            break
+    if not highlight and descriptor:
+        index = int(hashlib.sha256(descriptor.encode("utf-8")).hexdigest()[:8], 16) % len(BUSINESS_THEME_FALLBACKS)
+        highlight, background, palette_name = BUSINESS_THEME_FALLBACKS[index]
+
+    return {
+        "text": supplied_text or DEFAULT_BUSINESS_THEME["text"],
+        "background": supplied_background or background or DEFAULT_BUSINESS_THEME["background"],
+        "highlight": supplied_highlight or highlight or DEFAULT_BUSINESS_THEME["highlight"],
+        "name": compact_text(supplied.get("name"), palette_name or DEFAULT_BUSINESS_THEME["name"]),
+    }
 
 def redact_value(value: Any) -> Any:
     if isinstance(value, dict):
@@ -3145,7 +3227,7 @@ def approval_row_to_dict(row: sqlite3.Row, include_html: bool = False) -> Dict[s
         "errors": safe_json_loads(row["errors_json"], []),
     }
     if include_html:
-        approval["pendingPreviewHtml"] = ensure_required_site_features(row["html"]) if row["html"] else None
+        approval["pendingPreviewHtml"] = ensure_required_site_features(row["html"], context) if row["html"] else None
     return approval
 
 
@@ -4209,7 +4291,7 @@ def build_public_lead_context(
             first_image = images[0]
             main_image_url = first_image.get("url") if isinstance(first_image, dict) else first_image
     main_image_url = normalize_url(main_image_url)
-    return {
+    context = {
         "canonicalLeadKey": canonical_key,
         "leadKey": lead.leadKey,
         "businessName": lead.businessName,
@@ -4237,6 +4319,8 @@ def build_public_lead_context(
         "rawLead": raw_lead,
         "noWebsiteLead": not bool(normalize_url(website) or normalize_domain(lead.domain)),
     }
+    context["brandTheme"] = business_theme_for_context(context)
+    return context
 
 
 def compact_lead_with_groq(context: Dict[str, Any]) -> Dict[str, Any]:
@@ -4244,8 +4328,8 @@ def compact_lead_with_groq(context: Dict[str, Any]) -> Dict[str, Any]:
         "Compact this public lead into a concise business brief for Gemini to build a landing page. "
         "Use as much of the lead as is useful, including raw listing fields, but remove repetition. "
         "Return strict JSON with keys: businessName, industry, location, address, email, phone, "
-        "summary, serviceKeywords, differentiators, proofPoints, sourceLabel, sourceUrl, mainImageUrl, noWebsiteLead, "
-        "contactType, designHints, complianceNotes. Arrays must be arrays. "
+        "summary, serviceKeywords, differentiators, proofPoints, sourceLabel, sourceUrl, mainImageUrl, brandTheme, noWebsiteLead, "
+        "contactType, designHints, complianceNotes. Arrays must be arrays. Preserve the supplied mainImageUrl and brandTheme exactly. "
         "Do not invent private facts, services, guarantees, prices, awards, or consent.\n\n"
         f"Lead context: {model_safe_json(context)}"
     )
@@ -4278,7 +4362,10 @@ def compact_lead_with_groq(context: Dict[str, Any]) -> Dict[str, Any]:
     brief.setdefault("summary", context.get("summary"))
     brief.setdefault("sourceLabel", context.get("source") or "public business listing")
     brief.setdefault("sourceUrl", context.get("sourceUrl"))
-    brief.setdefault("mainImageUrl", context.get("mainImageUrl"))
+    # Dataset/listing media and the deterministic business palette are authoritative.
+    # A compaction model returning null or a generic palette must not discard them.
+    brief["mainImageUrl"] = normalize_url(context.get("mainImageUrl")) or normalize_url(brief.get("mainImageUrl"))
+    brief["brandTheme"] = business_theme_for_context(context)
     brief.setdefault("noWebsiteLead", True)
     brief.setdefault("designHints", [])
     brief.setdefault("complianceNotes", "Use public lead details only; outreach requires opt-in or agent consent handling.")
@@ -4308,35 +4395,58 @@ def ensure_generated_hero_and_working_links(site_html: str, context: Dict[str, A
     lower_html = html_value.lower()
     contact_href, contact_label = contact_cta_for_context(context)
     main_image_url = normalize_url(context.get("mainImageUrl"))
+    business_theme = business_theme_for_context(context)
 
     if main_image_url and main_image_url not in html_value:
-        image_pattern = r'(<img\b[^>]*?\bsrc=)(["\'])(.*?)(\2)'
-        if re.search(image_pattern, html_value, flags=re.IGNORECASE | re.DOTALL):
-            html_value = re.sub(
-                image_pattern,
+        image_tags = list(re.finditer(r"<img\b[^>]*>", html_value, flags=re.IGNORECASE | re.DOTALL))
+        preferred_image = next(
+            (
+                match
+                for match in image_tags
+                if "logo" not in match.group(0).lower()
+                and (
+                    re.search(r"hero|banner|cover|main[\s_-]*image", match.group(0), flags=re.IGNORECASE)
+                    or re.search(
+                        r"(?:class|id)=[\"'][^\"']*(?:hero|banner)[^\"']*[\"']",
+                        html_value[max(0, match.start() - 1400):match.start()],
+                        flags=re.IGNORECASE,
+                    )
+                )
+            ),
+            None,
+        )
+        if preferred_image:
+            image_tag = preferred_image.group(0)
+            replacement = re.sub(
+                r'(\bsrc=)(["\'])(.*?)(\2)',
                 lambda match: f'{match.group(1)}{match.group(2)}{html.escape(main_image_url, quote=True)}{match.group(4)}',
-                html_value,
+                image_tag,
                 count=1,
                 flags=re.IGNORECASE | re.DOTALL,
             )
+            if "data-ai-business-main-image" not in replacement.lower():
+                replacement = replacement[:-1] + ' data-ai-business-main-image fetchpriority="high" loading="eager">'
+            html_value = html_value[:preferred_image.start()] + replacement + html_value[preferred_image.end():]
             lower_html = html_value.lower()
 
-    if "<img" not in lower_html and (main_image_url or "<svg" not in lower_html):
+    if (main_image_url and main_image_url not in html_value) or (
+        "<img" not in lower_html and (main_image_url or "<svg" not in lower_html)
+    ):
         business_name = compact_text(context.get("businessName"), "Local Business")
         industry = compact_text(context.get("industry"), "Local Service")
         location = compact_text(context.get("location"), "South Africa")
         hero_image = main_image_url or fallback_image_data_uri(
-            business_name, "#0f9f96", f"{industry} in {location}",
+            business_name, business_theme["highlight"], f"{industry} in {location}",
             compact_text(context.get("address") or context.get("sourceLabel") or context.get("source"), "Generated for this business"),
         )
         hero_markup = f"""
-<section class="ai-generated-hero-image" aria-label="Generated business banner">
+<section class="ai-generated-hero-image" aria-label="Business banner" data-ai-business-main-image-container>
   <div>
     <span>{html.escape(industry)} in {html.escape(location)}</span>
     <h2>{html.escape(business_name)}</h2>
     <p>Generated visual based on the supplied public business details.</p>
   </div>
-  <img src="{html.escape(hero_image, quote=True)}" alt="Main image for {html.escape(business_name)}">
+  <img src="{html.escape(hero_image, quote=True)}" alt="Main image for {html.escape(business_name)}" data-ai-business-main-image fetchpriority="high" loading="eager">
 </section>
 """
         hero_css = """
@@ -4426,7 +4536,10 @@ def generate_final_html_with_gemini(lead_brief: Dict[str, Any]) -> Dict[str, Any
     site_html = result.get("html") or result.get("siteHtml") or result.get("finalHtml")
     if not site_html:
         raise RuntimeError("Gemini did not return an html field.")
-    final_html = ensure_required_site_features(ensure_generated_hero_and_working_links(str(site_html), lead_brief))
+    final_html = ensure_required_site_features(
+        ensure_generated_hero_and_working_links(str(site_html), lead_brief),
+        lead_brief,
+    )
     return {
         "html": final_html,
         "qaNotes": result.get("qaNotes") or "Gemini generated final HTML; backend enforced required assets and color widget.",
@@ -4884,7 +4997,7 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
 
         <div class="col-lg-5">
           <div class="hero-card hero-visual">
-            <img src="{hero_image}" alt="Generated banner image for {business_name}">
+            <img src="{hero_image}" alt="Main image for {business_name}" data-ai-business-main-image fetchpriority="high" loading="eager">
             <div class="hero-card-body">
               <p class="fw-bold mb-3">Serving {location}</p>
               {proof_chips_html}
@@ -5021,7 +5134,7 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
   </script>
 </body>
 </html>"""
-    return ensure_required_site_features(site_html)
+    return ensure_required_site_features(site_html, context)
 
 def generate_draft_html_with_groq(
     context: Dict[str, Any],
@@ -5124,9 +5237,46 @@ def upgrade_legacy_fallback_image_data_uris(site_html: str) -> str:
     return data_uri_pattern.sub(upgrade, site_html)
 
 
-def ensure_required_site_features(site_html: str) -> str:
+def existing_site_business_theme(site_html: str) -> Optional[Dict[str, str]]:
+    widget_match = re.search(
+        r"<aside\b[^>]*data-ai-site-theme-widget[^>]*>",
+        site_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not widget_match:
+        return None
+    widget = widget_match.group(0)
+
+    def attribute(name: str) -> Optional[str]:
+        match = re.search(rf'\b{name}=["\']([^"\']+)["\']', widget, flags=re.IGNORECASE)
+        return html.unescape(match.group(1)) if match else None
+
+    text = normalized_hex_color(attribute("data-ai-default-text"))
+    background = normalized_hex_color(attribute("data-ai-default-background"))
+    highlight = normalized_hex_color(attribute("data-ai-default-highlight"))
+    if not all((text, background, highlight)):
+        return None
+    return {
+        "text": text,
+        "background": background,
+        "highlight": highlight,
+        "name": compact_text(attribute("data-ai-theme-name"), DEFAULT_BUSINESS_THEME["name"]),
+    }
+
+
+def ensure_required_site_features(
+    site_html: str,
+    theme_context: Optional[Dict[str, Any]] = None,
+) -> str:
     html_value = upgrade_legacy_fallback_image_data_uris(site_html)
     lower_html = html_value.lower()
+    business_theme = (
+        business_theme_for_context(theme_context)
+        if isinstance(theme_context, dict)
+        else existing_site_business_theme(html_value) or dict(DEFAULT_BUSINESS_THEME)
+    )
+    business_theme_deep = mix_hex_color(business_theme["highlight"], "#000000", 0.28)
+    business_theme_soft = mix_hex_color(business_theme["highlight"], "#ffffff", 0.24)
 
     bootstrap_css = (
         '<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" '
@@ -5141,11 +5291,11 @@ def ensure_required_site_features(site_html: str) -> str:
     gsap_js = '<script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js"></script>'
     widget_css = """<style id="ai-site-theme-widget-style" data-ai-site-theme-version="3">
   :root {
-    --ai-text: #102033;
-    --ai-background: #f8fbff;
-    --ai-highlight: #0f9f96;
-    --ai-highlight-deep: #0b746e;
-    --ai-highlight-soft: #39aaa2;
+    --ai-text: __AI_TEXT__;
+    --ai-background: __AI_BACKGROUND__;
+    --ai-highlight: __AI_HIGHLIGHT__;
+    --ai-highlight-deep: __AI_HIGHLIGHT_DEEP__;
+    --ai-highlight-soft: __AI_HIGHLIGHT_SOFT__;
     --ai-on-highlight: #ffffff;
   }
   body {
@@ -5276,19 +5426,25 @@ def ensure_required_site_features(site_html: str) -> str:
     min-height: 34px;
   }
 </style>"""
-    widget_html = """<aside class="ai-site-theme-widget" data-ai-site-theme-widget aria-label="Site color controls">
+    widget_html = """<aside class="ai-site-theme-widget" data-ai-site-theme-widget data-ai-default-text="__AI_TEXT__" data-ai-default-background="__AI_BACKGROUND__" data-ai-default-highlight="__AI_HIGHLIGHT__" data-ai-theme-name="__AI_THEME_NAME__" aria-label="Site color controls">
   <strong>Site colors</strong>
   <div class="ai-site-theme-controls">
-    <label>Text<input type="color" data-theme-color="text" value="#102033"></label>
-    <label>Background<input type="color" data-theme-color="background" value="#f8fbff"></label>
-    <label>Highlights<input type="color" data-theme-color="highlight" value="#0f9f96"></label>
+    <label>Text<input type="color" data-theme-color="text" value="__AI_TEXT__"></label>
+    <label>Background<input type="color" data-theme-color="background" value="__AI_BACKGROUND__"></label>
+    <label>Highlights<input type="color" data-theme-color="highlight" value="__AI_HIGHLIGHT__"></label>
   </div>
   <button class="ai-site-theme-reset" type="button" data-theme-reset>Reset colors</button>
 </aside>"""
     widget_js = """<script id="ai-site-theme-widget-script" data-ai-site-theme-version="3">
   window.addEventListener("DOMContentLoaded", function () {
-    var storageKey = "ai-site-factory-theme-v2";
-    var defaults = { text: "#102033", background: "#f8fbff", highlight: "#0f9f96" };
+    var widget = document.querySelector("[data-ai-site-theme-widget]");
+    var themeName = widget && widget.dataset.aiThemeName ? widget.dataset.aiThemeName : "local-service";
+    var storageKey = "ai-site-factory-theme-v3-" + themeName;
+    var defaults = {
+      text: widget && widget.dataset.aiDefaultText ? widget.dataset.aiDefaultText : "__AI_TEXT__",
+      background: widget && widget.dataset.aiDefaultBackground ? widget.dataset.aiDefaultBackground : "__AI_BACKGROUND__",
+      highlight: widget && widget.dataset.aiDefaultHighlight ? widget.dataset.aiDefaultHighlight : "__AI_HIGHLIGHT__"
+    };
     var root = document.documentElement;
     function normalizeHex(value, fallback) {
       return /^#[0-9a-f]{6}$/i.test(value || "") ? value : fallback;
@@ -5411,6 +5567,18 @@ def ensure_required_site_features(site_html: str) -> str:
     }
   });
 </script>"""
+    theme_tokens = {
+        "__AI_TEXT__": business_theme["text"],
+        "__AI_BACKGROUND__": business_theme["background"],
+        "__AI_HIGHLIGHT__": business_theme["highlight"],
+        "__AI_HIGHLIGHT_DEEP__": business_theme_deep,
+        "__AI_HIGHLIGHT_SOFT__": business_theme_soft,
+        "__AI_THEME_NAME__": html.escape(business_theme["name"], quote=True),
+    }
+    for token, value in theme_tokens.items():
+        widget_css = widget_css.replace(token, value)
+        widget_html = widget_html.replace(token, value)
+        widget_js = widget_js.replace(token, value)
     animation_js = """
 <script>
   window.addEventListener("DOMContentLoaded", function () {
@@ -5485,8 +5653,11 @@ def ensure_required_site_features(site_html: str) -> str:
     return html_value
 
 
-def ensure_bootstrap_gsap_assets(site_html: str) -> str:
-    return ensure_required_site_features(site_html)
+def ensure_bootstrap_gsap_assets(
+    site_html: str,
+    theme_context: Optional[Dict[str, Any]] = None,
+) -> str:
+    return ensure_required_site_features(site_html, theme_context)
 
 
 def generate_outreach_with_groq(context: Dict[str, Any], site_url: str) -> Dict[str, Any]:
@@ -5753,6 +5924,9 @@ def render_site_html(
     source_url = normalize_url(context.get("sourceUrl"))
     if not images:
         images = [fallback_image_data_uri(compact_text(context.get("businessName"), "Local Business"), accent, f"{industry} in {location}", "Generated hero visual")]
+    main_image_url = normalize_url(context.get("mainImageUrl"))
+    if main_image_url:
+        images = [main_image_url, *[image for image in images if image != main_image_url]]
 
     services_html = []
     services = site_content.get("services") or []
@@ -6063,7 +6237,7 @@ def render_site_html(
         </div>
         <div class="col-lg-6">
           <div class="hero-image">
-            <img src="{images[0]}" alt="{business_name}">
+            <img src="{images[0]}" alt="Main image for {business_name}" data-ai-business-main-image fetchpriority="high" loading="eager">
           </div>
         </div>
       </div>
@@ -6134,7 +6308,7 @@ def render_site_html(
   </script>
 </body>
 </html>"""
-    return ensure_required_site_features(site_html)
+    return ensure_required_site_features(site_html, context)
 
 
 def github_headers() -> Dict[str, str]:
@@ -8982,7 +9156,7 @@ def run_pipeline(request: PipelineRunRequest):
                 lambda: generate_final_html_with_gemini(groq_brief),
                 retryable=True,
             )
-            pending_html = ensure_required_site_features(final_html_result["html"])
+            pending_html = ensure_required_site_features(final_html_result["html"], groq_brief)
             site_content = {
                 "promptHeader": LANDING_PAGE_PROMPT_HEADER,
                 "groqBrief": groq_brief,
@@ -12299,7 +12473,7 @@ def prepare_deferred_approval(approval_id: str) -> sqlite3.Row:
             )
             brief = run_deferred_step("groq_compact_lead", "groq", lambda: compact_lead_with_groq(cleaned_context))
             final_html_result = run_deferred_step("gemini_final_html", "gemini", lambda: generate_final_html_with_gemini(brief))
-            site_html = ensure_required_site_features(final_html_result["html"])
+            site_html = ensure_required_site_features(final_html_result["html"], brief)
             site_content = {
                 "deferredGeneration": True,
                 "generatedOnDeployRequest": True,
@@ -13621,7 +13795,7 @@ def approve_generated_site(approval_id: str, request: ApprovalActionRequest):
     context = safe_json_loads(row["context_json"], {})
     for key in ["ownerName", "ownerEmail", "ownerStatus"]:
         context.pop(key, None)
-    site_html = ensure_required_site_features(row["html"]) if row["html"] else None
+    site_html = ensure_required_site_features(row["html"], context) if row["html"] else None
     approved_by = compact_text(request.approvedBy, "Dashboard Operator")
     errors: List[Dict[str, Any]] = []
     deployment: Optional[Dict[str, Any]] = None
@@ -13970,7 +14144,7 @@ def regenerate_generated_site(approval_id: str, request: ApprovalActionRequest):
             "gemini",
             lambda: generate_final_html_with_gemini(groq_brief),
         )
-        final_html = ensure_required_site_features(final_html_result["html"])
+        final_html = ensure_required_site_features(final_html_result["html"], groq_brief)
         site_content = {
             "promptHeader": LANDING_PAGE_PROMPT_HEADER,
             "groqBrief": groq_brief,

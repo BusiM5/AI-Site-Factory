@@ -182,8 +182,83 @@ def test_uploaded_google_main_image_is_preserved_as_the_site_hero():
     fallback = main.build_bootstrap_gsap_landing_html(context, dict(main.FREEFORM_SITE_SPEC))
 
     assert context["mainImageUrl"] == main_image_url
+    assert context["brandTheme"]["name"] == "hospitality"
+    assert context["brandTheme"]["highlight"] == "#b45309"
     assert f'src="{main_image_url}"' in generated
     assert f'src="{main_image_url}"' in fallback
+    assert "data-ai-business-main-image" in generated
+    assert 'data-ai-default-highlight="#b45309"' in fallback
+
+
+def test_compact_lead_cannot_discard_source_main_image_or_business_theme(monkeypatch):
+    main_image_url = "https://lh3.googleusercontent.com/source-business-photo=w1200-h800"
+    context = {
+        "businessName": "Harbour Physiotherapy",
+        "industry": "Physiotherapy",
+        "location": "Gqeberha",
+        "mainImageUrl": main_image_url,
+        "brandTheme": main.business_theme_for_context(
+            {"businessName": "Harbour Physiotherapy", "industry": "Physiotherapy"}
+        ),
+    }
+    monkeypatch.setattr(
+        main,
+        "groq_chat_json",
+        lambda *args, **kwargs: {
+            "businessName": "Harbour Physiotherapy",
+            "industry": "Physiotherapy",
+            "mainImageUrl": None,
+            "brandTheme": {"highlight": "#ff00ff"},
+            "serviceKeywords": ["Physiotherapy"],
+        },
+    )
+
+    brief = main.compact_lead_with_groq(context)
+
+    assert brief["mainImageUrl"] == main_image_url
+    assert brief["brandTheme"]["name"] == "healthcare"
+    assert brief["brandTheme"]["highlight"] == "#0f766e"
+
+
+def test_business_theme_defaults_are_industry_aligned_and_persist_on_upgrade():
+    context = {
+        "businessName": "Harbour Physiotherapy",
+        "industry": "Physiotherapy",
+        "location": "Gqeberha",
+    }
+    themed = main.ensure_required_site_features(
+        "<!doctype html><html><head></head><body><main>Health</main></body></html>",
+        context,
+    )
+
+    assert 'data-ai-theme-name="healthcare"' in themed
+    assert 'data-ai-default-highlight="#0f766e"' in themed
+    assert 'data-ai-default-background="#f0fdfa"' in themed
+    assert 'var storageKey = "ai-site-factory-theme-v3-" + themeName' in themed
+
+    upgraded = main.ensure_required_site_features(themed)
+    assert 'data-ai-theme-name="healthcare"' in upgraded
+    assert 'data-ai-default-highlight="#0f766e"' in upgraded
+    assert 'data-ai-default-background="#f0fdfa"' in upgraded
+
+
+def test_main_business_image_is_injected_without_replacing_a_logo():
+    main_image_url = "https://lh3.googleusercontent.com/main-business-photo=w1200-h800"
+    source = '<!doctype html><html><head></head><body><img class="logo" src="logo.svg" alt="Logo"><main>Content</main></body></html>'
+
+    generated = main.ensure_generated_hero_and_working_links(
+        source,
+        {
+            "businessName": "Green Garden Care",
+            "industry": "Landscaping",
+            "location": "Durban",
+            "mainImageUrl": main_image_url,
+        },
+    )
+
+    assert 'class="logo" src="logo.svg"' in generated
+    assert f'src="{main_image_url}"' in generated
+    assert "data-ai-business-main-image-container" in generated
 
 
 @pytest.fixture(autouse=True)
