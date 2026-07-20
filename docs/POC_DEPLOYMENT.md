@@ -203,7 +203,7 @@ The deploy trigger is valid for both `email` and `phone` channel tickets. Config
 }
 ```
 
-Create separate email and phone cancellation triggers. Each should run when the ticket is below solved, is on the corresponding managed form, has `AI Site Factory - Deploy site` set to false, includes `asf_deployed`, and does not include its channel's cancellation fired tag. Send:
+Create separate email and phone cancellation triggers. Each should run when the ticket is below solved, is on the corresponding managed form, has `AI Site Factory - Deploy site` set to false, includes `asf_deployed`, and does not include its channel's cancellation fired tag. The backend writes the checked field and live URL before it adds `asf_deployed`, so the trigger cannot observe the old unchecked field during initial deployment. Send:
 
 ```json
 {
@@ -217,6 +217,8 @@ Create separate email and phone cancellation triggers. Each should run when the 
 ```
 
 Cancellation disables the existing Netlify site, clears the live URL on the ticket and local deployment state, and leaves the GitHub repository intact. After a stateless Render restart, the handler can recover the exact site from the managed Zendesk live URL before disabling it. Rechecking the deploy field can re-enable and redeploy it.
+
+For delayed cancellation, the deployed-notification macro must set the ticket to pending and add `asf_customer_notified_deployed` plus `asf_10_day_clock_started`. Zendesk automations run after 240 pending hours and add `asf_10_day_cancellation_due` while unchecking the deploy field. The email automation leaves the public message to the backend: after Netlify is disabled, the backend renders and persists the existing `AI Site Factory::Email::10-day cancellation - notify customer` macro. The phone automation adds a private note, reopens the ticket, and directs the agent to call the customer with `AI Site Factory::Phone::10-day cancellation - call script`.
 
 Stable form/view tags include `asf_managed`, `asf_form_email_lead`, `asf_form_call_lead`, `asf_channel_email`, `asf_channel_phone`, `asf_source_apify_google_maps`, `asf_source_upload`, `asf_deploy_pending`, `asf_deploy_requested`, `asf_stage_generating`, `asf_artifact_ready`, `asf_repo_ready`, `asf_stage_deploying`, `asf_can_deploy`, `asf_email_send_pending`, `asf_call_pending`, `asf_deployed`, `asf_stage_live`, `asf_deployment_cancelled`, `asf_stage_cancelled`, `asf_cancel_email_fired`, `asf_cancel_phone_fired`, `asf_generation_failed`, `asf_deploy_failed`, and `asf_stage_failed`.
 

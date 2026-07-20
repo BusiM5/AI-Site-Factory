@@ -2770,6 +2770,73 @@ def test_zendesk_tag_mutation_preserves_remote_fired_and_admin_tags(monkeypatch)
     assert "asf_deploy_phone_fired" in tags
 
 
+def test_apply_email_cancellation_macro_renders_and_persists_existing_macro(monkeypatch):
+    macro_id = 28965347718172
+    monkeypatch.setattr(
+        main,
+        "zendesk_list_all",
+        lambda path, key: [
+            {
+                "id": macro_id,
+                "title": main.EMAIL_CANCELLATION_MACRO_TITLE,
+                "active": True,
+                "actions": [
+                    {"field": "comment_mode_is_public", "value": "true"},
+                    {"field": "custom_fields_28939474364188", "value": "false"},
+                    {"field": "remove_tags", "value": "asf_10_day_clock_started"},
+                    {"field": "current_tags", "value": "asf_10_day_cancellation_sent"},
+                    {"field": "status", "value": "solved"},
+                ],
+            }
+        ],
+    )
+    captured = {}
+
+    def fake_api(method, path, *, payload=None, params=None):
+        if method == "get":
+            assert path == f"/tickets/5871/macros/{macro_id}/apply.json"
+            assert params == {"normalize_comment": "true"}
+            return {
+                "result": {
+                    "ticket": {
+                        "status": "solved",
+                        "comment": {
+                            "html_body": "<p>Your site has been cancelled and undeployed.</p>",
+                            "public": True,
+                        },
+                    }
+                }
+            }
+        if method == "put":
+            captured["path"] = path
+            captured["payload"] = payload
+            return {"ticket": {"id": 5871, "status": "solved"}}
+        raise AssertionError((method, path))
+
+    monkeypatch.setattr(main, "zendesk_api_request", fake_api)
+    monkeypatch.setattr(
+        main,
+        "update_zendesk_ticket_tags",
+        lambda ticket_id, *, add=None, remove=None: captured.update(
+            {"ticketId": ticket_id, "add": list(add or []), "remove": list(remove or [])}
+        ) or ["asf_10_day_cancellation_sent"],
+    )
+
+    result = main.apply_zendesk_macro_to_ticket(5871, main.EMAIL_CANCELLATION_MACRO_TITLE)
+
+    assert result["macroId"] == macro_id
+    assert result["public"] is True
+    assert result["status"] == "solved"
+    assert "asf_10_day_cancellation_due" in captured["remove"]
+    assert "asf_10_day_clock_started" in captured["remove"]
+    assert captured["add"] == ["asf_10_day_cancellation_sent"]
+    assert captured["path"] == "/tickets/5871.json"
+    ticket = captured["payload"]["ticket"]
+    assert ticket["comment"]["public"] is True
+    assert ticket["comment"]["html_body"] == "<p>Your site has been cancelled and undeployed.</p>"
+    assert ticket["custom_fields"] == [{"id": 28939474364188, "value": "false"}]
+
+
 def test_zendesk_webhook_deploy_triggers_existing_approval_path(monkeypatch):
     approval_id = create_pending_approval_for_webhook()
     main.save_zendesk_ticket_link(approval_id, "canonical-webhook", "pipeline-webhook", "email", "intake", 777, "https://zendesk.test/777", "new", ["ai_site_email_lead"], {})
@@ -2817,6 +2884,11 @@ def test_zendesk_webhook_cancellation_resets_ticket_and_deploy_claim(monkeypatch
     monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "secret")
     monkeypatch.setattr(
         main,
+        "zendesk_api_request",
+        lambda method, path, **kwargs: {"ticket": {"id": 778, "tags": ["asf_deployed"]}},
+    )
+    monkeypatch.setattr(
+        main,
         "cancel_netlify_site_for_lead",
         lambda canonical_key, live_url=None: {
             "status": "CANCELLED",
@@ -2854,6 +2926,7 @@ def test_zendesk_webhook_cancellation_resets_ticket_and_deploy_claim(monkeypatch
 
     assert response.status_code == 200, response.text
     assert response.json()["result"]["cancellation"]["status"] == "CANCELLED"
+    assert response.json()["result"]["cancellation"]["scheduled"] is False
     assert captured["ticketId"] == 778
     assert captured["public"] is False
     assert "Netlify site has been disabled" in captured["body"]
@@ -2869,6 +2942,67 @@ def test_zendesk_webhook_cancellation_resets_ticket_and_deploy_claim(monkeypatch
     link = main.get_zendesk_ticket_link(approval_id, "email", "intake", 778)
     assert link["payload"]["deployRequested"] is False
     assert link["payload"]["liveUrl"] is None
+
+
+def test_cancellation_webhook_marks_due_tag_as_scheduled(monkeypatch):
+    approval_id = create_pending_approval_for_webhook()
+    main.save_zendesk_ticket_link(
+        approval_id,
+        "canonical-webhook",
+        "pipeline-webhook",
+        "email",
+        "intake",
+        5871,
+        "https://zendesk.test/5871",
+        "open",
+        ["asf_managed", "asf_deployed"],
+        {"deployRequested": True, "liveUrl": "https://scheduled.example"},
+    )
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "secret")
+    monkeypatch.setattr(
+        main,
+        "zendesk_api_request",
+        lambda method, path, **kwargs: {
+            "ticket": {
+                "id": 5871,
+                "tags": ["asf_deployed", "asf_10_day_cancellation_due"],
+            }
+        },
+    )
+    captured = {}
+
+    def fake_cancel(row, ticket_id, channel, *, scheduled=False):
+        captured.update(
+            {
+                "approvalId": row["id"],
+                "ticketId": ticket_id,
+                "channel": channel,
+                "scheduled": scheduled,
+            }
+        )
+        return {"status": "CANCELLED", "scheduled": scheduled}
+
+    monkeypatch.setattr(main, "cancel_approval_deployment", fake_cancel)
+
+    response = client.post(
+        "/api/zendesk/webhook",
+        json={
+            "action": "cancel_deployment",
+            "approvalId": approval_id,
+            "canonicalLeadKey": "canonical-webhook",
+            "channel": "email",
+            "zendeskTicketId": 5871,
+        },
+        headers={"x-ai-site-factory-secret": "secret"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured == {
+        "approvalId": approval_id,
+        "ticketId": 5871,
+        "channel": "email",
+        "scheduled": True,
+    }
 
 
 def test_webhook_carries_invoking_ticket_into_approval(monkeypatch):
@@ -2966,22 +3100,21 @@ def test_deployment_update_writes_and_verifies_live_url_on_exact_route(monkeypat
         {},
     )
     row = main.get_approval_or_404(approval_id)
-    captured = {}
+    captured = {"events": []}
 
     def fake_update(ticket_id, body, public, extra_ticket_fields=None):
+        captured["events"].append("ticket_fields")
         captured["ticketId"] = ticket_id
         captured["body"] = body
         captured["fields"] = extra_ticket_fields
         return {"id": ticket_id, "status": "open", **extra_ticket_fields}
 
     monkeypatch.setattr(main, "update_zendesk_ticket_comment", fake_update)
-    monkeypatch.setattr(
-        main,
-        "update_zendesk_ticket_tags",
-        lambda ticket_id, *, add=None, remove=None: [
-            "asf_managed", "asf_deploy_email_fired", "admin_owned", *(add or [])
-        ],
-    )
+    def fake_tags(ticket_id, *, add=None, remove=None):
+        captured["events"].append("deployed_tags")
+        return ["asf_managed", "asf_deploy_email_fired", "admin_owned", *(add or [])]
+
+    monkeypatch.setattr(main, "update_zendesk_ticket_tags", fake_tags)
 
     result = main.update_existing_intake_ticket(
         row,
@@ -2991,6 +3124,7 @@ def test_deployment_update_writes_and_verifies_live_url_on_exact_route(monkeypat
     )
 
     assert result["liveLink"] == "https://alpha.netlify.app"
+    assert captured["events"] == ["ticket_fields", "deployed_tags"]
     assert captured["ticketId"] == 5806
     assert captured["fields"]["brand_id"] == 88
     assert captured["fields"]["ticket_form_id"] == 5001

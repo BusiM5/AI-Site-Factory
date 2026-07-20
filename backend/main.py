@@ -668,6 +668,12 @@ ZENDESK_SETUP_TAGS = [
     "asf_stage_cancelled",
     "asf_cancel_email_fired",
     "asf_cancel_phone_fired",
+    "asf_customer_notified_deployed",
+    "asf_10_day_clock_started",
+    "asf_10_day_cancellation_due",
+    "asf_10_day_cancellation_sent",
+    "asf_phone_cancellation_due",
+    "asf_deployment_approval_withdrawn",
     "asf_generation_failed",
     "asf_deploy_failed",
     "asf_stage_failed",
@@ -11428,6 +11434,91 @@ def update_zendesk_ticket_tags(
     return list(dict.fromkeys(compact_text(tag) for tag in tags if compact_text(tag)))
 
 
+EMAIL_CANCELLATION_MACRO_TITLE = "AI Site Factory::Email::10-day cancellation - notify customer"
+
+
+def apply_zendesk_macro_to_ticket(ticket_id: int, macro_title: str) -> Dict[str, Any]:
+    """Render an existing Zendesk macro against a ticket and persist only its actions."""
+    macros = zendesk_list_all("/macros.json", "macros")
+    macro = next(
+        (
+            item
+            for item in macros
+            if bool(item.get("active", True))
+            and compact_text(item.get("title")).casefold() == compact_text(macro_title).casefold()
+        ),
+        None,
+    )
+    if not macro:
+        raise RuntimeError(f"Zendesk macro '{macro_title}' is missing or inactive.")
+
+    preview = zendesk_api_request(
+        "get",
+        f"/tickets/{int(ticket_id)}/macros/{macro['id']}/apply.json",
+        params={"normalize_comment": "true"},
+    )
+    preview_ticket = ((preview.get("result") or {}).get("ticket") or {})
+    preview_comment = preview_ticket.get("comment") or {}
+    actions = macro.get("actions") or []
+
+    add_tags: List[str] = []
+    remove_tags: List[str] = ["asf_10_day_cancellation_due"]
+    custom_fields: List[Dict[str, Any]] = []
+    status = compact_text(preview_ticket.get("status"))
+    public = str(preview_comment.get("public", "false")).lower() == "true"
+    for action in actions:
+        field = compact_text(action.get("field"))
+        value = action.get("value")
+        if field == "current_tags":
+            add_tags.extend(compact_text(value).split())
+        elif field == "remove_tags":
+            remove_tags.extend(compact_text(value).split())
+        elif field == "status":
+            status = compact_text(value)
+        elif field == "comment_mode_is_public":
+            public = str(value).lower() == "true"
+        elif field.startswith("custom_fields_"):
+            field_id = field.removeprefix("custom_fields_")
+            custom_fields.append(
+                {
+                    "id": int(field_id) if field_id.isdigit() else field_id,
+                    "value": value,
+                }
+            )
+
+    tags = update_zendesk_ticket_tags(
+        int(ticket_id),
+        remove=remove_tags,
+        add=add_tags,
+    )
+    html_body = compact_text(preview_comment.get("html_body") or preview_comment.get("body"))
+    if not html_body:
+        raise RuntimeError(f"Zendesk macro '{macro_title}' did not render a ticket comment.")
+    ticket_payload: Dict[str, Any] = {
+        "comment": {"html_body": html_body, "public": public},
+    }
+    if status:
+        ticket_payload["status"] = status
+    if custom_fields:
+        ticket_payload["custom_fields"] = custom_fields
+    ticket = (
+        zendesk_api_request(
+            "put",
+            f"/tickets/{int(ticket_id)}.json",
+            payload={"ticket": ticket_payload},
+        ).get("ticket")
+        or {}
+    )
+    return {
+        "macroId": int(macro["id"]),
+        "macroTitle": macro.get("title"),
+        "ticket": ticket,
+        "tags": tags,
+        "public": public,
+        "status": ticket.get("status") or status,
+    }
+
+
 def update_campaign_workflow(
     approval_id: str,
     status: str,
@@ -11536,6 +11627,7 @@ ZENDESK_LIFECYCLE_TAGS = {
     "asf_stage_cancelled",
     "asf_cancel_email_fired",
     "asf_cancel_phone_fired",
+    "asf_10_day_cancellation_due",
     "asf_generation_failed",
     "asf_deploy_failed",
     "asf_stage_failed",
@@ -11612,6 +11704,8 @@ def cancel_approval_deployment(
     row: sqlite3.Row,
     ticket_id: Optional[int],
     channel: str,
+    *,
+    scheduled: bool = False,
 ) -> Dict[str, Any]:
     link = get_zendesk_ticket_link(row["id"], channel, "intake", ticket_id) if ticket_id else None
     link_payload = (link or {}).get("payload") or {}
@@ -11661,6 +11755,7 @@ def cancel_approval_deployment(
     cancel_campaign_workflow(row["id"])
 
     ticket_result: Optional[Dict[str, Any]] = None
+    cancellation_macro: Optional[Dict[str, Any]] = None
     if ticket_id:
         tags = update_zendesk_ticket_tags(
             int(ticket_id),
@@ -11704,6 +11799,13 @@ def cancel_approval_deployment(
             public=False,
             extra_ticket_fields=extra_fields,
         )
+        if channel == "email" and scheduled:
+            cancellation_macro = apply_zendesk_macro_to_ticket(
+                int(ticket_id),
+                EMAIL_CANCELLATION_MACRO_TITLE,
+            )
+            ticket = cancellation_macro.get("ticket") or ticket
+            tags = cancellation_macro.get("tags") or tags
         payload = {
             **((link or {}).get("payload") or {}),
             "deployRequested": False,
@@ -11711,6 +11813,15 @@ def cancel_approval_deployment(
             "deploymentCancelledAt": timestamp,
             "previousLiveUrl": cancellation.get("previousUrl"),
             "liveUrl": None,
+            "cancellationMacro": (
+                {
+                    "id": cancellation_macro.get("macroId"),
+                    "title": cancellation_macro.get("macroTitle"),
+                    "appliedAt": now_iso(),
+                }
+                if cancellation_macro
+                else None
+            ),
         }
         saved = save_zendesk_ticket_link(
             row["id"],
@@ -11734,8 +11845,19 @@ def cancel_approval_deployment(
         "approvalId": row["id"],
         "status": "CANCELLED",
         "nextApprovalStatus": next_status,
+        "scheduled": scheduled,
         "netlify": cancellation,
         "zendesk": ticket_result,
+        "cancellationMacro": (
+            {
+                "id": cancellation_macro.get("macroId"),
+                "title": cancellation_macro.get("macroTitle"),
+                "public": cancellation_macro.get("public"),
+                "status": cancellation_macro.get("status"),
+            }
+            if cancellation_macro
+            else None
+        ),
     }
 
 
@@ -11781,11 +11903,6 @@ def update_existing_intake_ticket(
     if not live_url:
         raise HTTPException(status_code=502, detail="The completed deployment did not return a live URL for Zendesk.")
 
-    tags = update_zendesk_ticket_tags(
-        int(ticket_id),
-        remove=ZENDESK_LIFECYCLE_TAGS,
-        add=["asf_managed", "asf_deployed", "asf_stage_live", "asf_repo_ready", f"asf_channel_{channel}"],
-    )
     custom_fields = zendesk_custom_fields(
         {
             "campaignId": context.get("campaignId"),
@@ -11843,6 +11960,14 @@ def update_existing_intake_ticket(
                 "liveUrlFieldId": live_url_field_id,
             },
         )
+    # Arm cancellation only after Zendesk has confirmed the checked deploy field and
+    # live URL. Adding asf_deployed first can make a cancellation trigger observe the
+    # ticket's old unchecked value and immediately disable a brand-new site.
+    tags = update_zendesk_ticket_tags(
+        int(ticket_id),
+        remove=ZENDESK_LIFECYCLE_TAGS,
+        add=["asf_managed", "asf_deployed", "asf_stage_live", "asf_repo_ready", f"asf_channel_{channel}"],
+    )
     payload = {
         **((link or {}).get("payload") or {}),
         "deployRequested": True,
@@ -12971,7 +13096,18 @@ def zendesk_webhook(request: ZendeskWebhookRequest, http_request: Request):
         elif action in CANCEL_DEPLOYMENT_WEBHOOK_ACTIONS:
             if channel not in {"email", "phone"}:
                 raise HTTPException(status_code=409, detail="Cancellation webhook requires an email or phone campaign channel.")
-            result["cancellation"] = cancel_approval_deployment(row, ticket_id, channel)
+            scheduled = False
+            if ticket_id:
+                live_ticket = zendesk_api_request("get", f"/tickets/{int(ticket_id)}.json").get("ticket") or {}
+                scheduled = "asf_10_day_cancellation_due" in {
+                    compact_text(tag) for tag in (live_ticket.get("tags") or [])
+                }
+            result["cancellation"] = cancel_approval_deployment(
+                row,
+                ticket_id,
+                channel,
+                scheduled=scheduled,
+            )
         elif action in {"send_email", "email_send", "send_approved_email", "email_send_requested"}:
             if channel != "email":
                 raise HTTPException(status_code=409, detail="Email send webhook can only run for email-channel Zendesk tickets.")
