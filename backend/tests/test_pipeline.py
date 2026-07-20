@@ -3143,6 +3143,17 @@ def test_campaign_restore_can_include_pending_managed_intake(monkeypatch):
     assert lead["deploy_requested"] == 0
 
 
+def test_managed_zendesk_restore_location_replaces_coordinate_object_with_city():
+    assert main.managed_zendesk_restore_location(
+        "{'lat': -29.8217892, 'lng': 31.0224901}",
+        "485 Lilian Ngoyi Rd, Morningside, Durban, 4001, South Africa",
+    ) == "Durban, South Africa"
+    assert main.managed_zendesk_restore_location(
+        "Gqeberha, South Africa",
+        "45A Newton St, Newton Park, Gqeberha, 6045, South Africa",
+    ) == "Gqeberha, South Africa"
+
+
 def test_orphan_recovery_rolls_back_every_insert_when_ticket_link_identity_conflicts(monkeypatch):
     monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
     monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")

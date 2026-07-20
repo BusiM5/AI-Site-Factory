@@ -13651,6 +13651,25 @@ def managed_zendesk_restore_state(
     }
 
 
+def managed_zendesk_restore_location(value: Any, address: Any) -> str:
+    location = compact_text(value)
+    if location and not (
+        (location.startswith("{") or location.startswith("["))
+        and "lat" in location.lower()
+        and "lng" in location.lower()
+    ):
+        return location
+    address_parts = [part.strip() for part in compact_text(address).split(",") if part.strip()]
+    country = address_parts[-1] if address_parts else "South Africa"
+    for part in reversed(address_parts[:-1]):
+        if re.fullmatch(r"[\d\s-]+", part):
+            continue
+        if any(character.isdigit() for character in part):
+            continue
+        return f"{part}, {country}" if normalize_identity_text(part) != normalize_identity_text(country) else country
+    return country or "South Africa"
+
+
 def recover_managed_zendesk_webhook_approval(
     request: ZendeskWebhookRequest,
     *,
@@ -13810,8 +13829,8 @@ def recover_managed_zendesk_webhook_approval(
         raise HTTPException(status_code=409, detail="The managed phone ticket has no recoverable contact phone.")
 
     industry = compact_text(managed_value("industry"), "Local service")
-    location = compact_text(managed_value("location"), "South Africa")
     address = compact_text(managed_value("address"))
+    location = managed_zendesk_restore_location(managed_value("location"), address)
     contact_name = compact_text(managed_value("contactName"))
     source_url = compact_text(managed_value("sourceUrl"))
     batch_id = compact_text(managed_value("batchId"))
