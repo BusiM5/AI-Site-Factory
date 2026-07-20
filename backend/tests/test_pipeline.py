@@ -3154,6 +3154,15 @@ def test_managed_zendesk_restore_location_replaces_coordinate_object_with_city()
     ) == "Gqeberha, South Africa"
 
 
+def test_managed_zendesk_startup_ticket_ids_are_unique_and_bounded(monkeypatch):
+    monkeypatch.setenv(
+        "ZENDESK_CAMPAIGN_RECOVERY_TICKET_IDS",
+        "5809, 5810 5809,invalid,-1,0,5824",
+    )
+
+    assert main.managed_zendesk_startup_ticket_ids() == [5809, 5810, 5824]
+
+
 def test_orphan_recovery_rolls_back_every_insert_when_ticket_link_identity_conflicts(monkeypatch):
     monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
     monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")

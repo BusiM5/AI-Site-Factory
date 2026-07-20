@@ -11395,6 +11395,14 @@ def restore_campaigns_from_zendesk(request: ZendeskCampaignRestoreRequest):
     }
 
 
+def managed_zendesk_startup_ticket_ids() -> List[int]:
+    configured_ticket_ids = []
+    for value in re.split(r"[,\s]+", compact_text(os.getenv("ZENDESK_CAMPAIGN_RECOVERY_TICKET_IDS"))):
+        if value.isdigit() and int(value) > 0 and int(value) not in configured_ticket_ids:
+            configured_ticket_ids.append(int(value))
+    return configured_ticket_ids[:1000]
+
+
 @app.on_event("startup")
 def bootstrap_managed_zendesk_campaigns_on_startup() -> None:
     """Recover deploy/cancel workflow records when an ephemeral Render database starts empty."""
@@ -11404,18 +11412,35 @@ def bootstrap_managed_zendesk_campaigns_on_startup() -> None:
         return
     with get_pipeline_db() as db:
         existing_campaigns = db.execute("SELECT COUNT(*) AS count FROM campaigns").fetchone()["count"]
-    if existing_campaigns:
+    configured_ticket_ids = managed_zendesk_startup_ticket_ids()
+    if existing_campaigns and not configured_ticket_ids:
         return
     try:
-        result = restore_campaigns_from_zendesk(
-            ZendeskCampaignRestoreRequest(confirm=True, includePendingIntake=False, maxTickets=200)
-        )
+        results = []
+        if not existing_campaigns:
+            results.append(
+                restore_campaigns_from_zendesk(
+                    ZendeskCampaignRestoreRequest(confirm=True, includePendingIntake=False, maxTickets=200)
+                )
+            )
+        if configured_ticket_ids:
+            results.append(
+                restore_campaigns_from_zendesk(
+                    ZendeskCampaignRestoreRequest(
+                        confirm=True,
+                        includePendingIntake=True,
+                        ticketIds=configured_ticket_ids,
+                        maxTickets=max(200, len(configured_ticket_ids)),
+                    )
+                )
+            )
         log_event(
             "info",
             "campaigns.zendesk_startup_recovery",
             "Checked managed Zendesk workflow tickets after starting with an empty campaign database.",
-            restoredCount=result.get("restoredCount", 0),
-            errorCount=result.get("errorCount", 0),
+            restoredCount=sum(result.get("restoredCount", 0) for result in results),
+            errorCount=sum(result.get("errorCount", 0) for result in results),
+            configuredTicketCount=len(configured_ticket_ids),
         )
     except Exception as error:
         log_event(
