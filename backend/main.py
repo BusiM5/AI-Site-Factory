@@ -1293,6 +1293,13 @@ class ZendeskWebhookRequest(BaseModel):
     notes: Optional[str] = None
 
 
+class ZendeskCampaignRestoreRequest(BaseModel):
+    confirm: bool = False
+    includePendingIntake: bool = False
+    ticketIds: List[int] = Field(default_factory=list)
+    maxTickets: int = Field(default=200, ge=1, le=1000)
+
+
 class DeploymentMediaRefreshRequest(BaseModel):
     zendeskTicketId: int
     mainImageUrl: str
@@ -11226,6 +11233,198 @@ def restore_campaign_seed():
     return {"seed": result, **list_campaigns(200)}
 
 
+def managed_zendesk_restore_candidates(
+    request: ZendeskCampaignRestoreRequest,
+) -> List[Dict[str, Any]]:
+    tickets: List[Dict[str, Any]] = []
+    next_url: Optional[str] = "/search.json"
+    params: Optional[Dict[str, Any]] = {
+        "query": "type:ticket tags:asf_managed tags:asf_intake",
+        "per_page": 100,
+        "sort_by": "created_at",
+        "sort_order": "asc",
+    }
+    requested_ticket_ids = {int(ticket_id) for ticket_id in request.ticketIds}
+    pages = 0
+    while next_url and pages < 10 and len(tickets) < request.maxTickets:
+        payload = zendesk_api_request("get", next_url, params=params)
+        for ticket in payload.get("results") or []:
+            ticket_id = int(ticket.get("id") or 0)
+            tags = {compact_text(tag) for tag in (ticket.get("tags") or []) if compact_text(tag)}
+            channel = (
+                "email" if "asf_channel_email" in tags
+                else "phone" if "asf_channel_phone" in tags
+                else ""
+            )
+            if not ticket_id or channel not in {"email", "phone"}:
+                continue
+            if requested_ticket_ids and ticket_id not in requested_ticket_ids:
+                continue
+            if not request.includePendingIntake and not tags.intersection(ZENDESK_RESTORE_WORKFLOW_TAGS):
+                continue
+            tickets.append(ticket)
+            if len(tickets) >= request.maxTickets:
+                break
+        links = payload.get("links") or {}
+        next_url = payload.get("next_page") or links.get("next")
+        params = None
+        pages += 1
+
+    if requested_ticket_ids:
+        found = {int(ticket["id"]) for ticket in tickets}
+        missing = sorted(requested_ticket_ids - found)
+        if missing:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "code": "ZENDESK_RESTORE_TICKETS_NOT_FOUND",
+                    "message": "Some requested tickets were not eligible managed intake tickets.",
+                    "ticketIds": missing,
+                },
+            )
+    return tickets
+
+
+def managed_zendesk_restore_preview(ticket: Dict[str, Any]) -> Dict[str, Any]:
+    tags = {compact_text(tag) for tag in (ticket.get("tags") or []) if compact_text(tag)}
+    channel = "email" if "asf_channel_email" in tags else "phone"
+    contract = require_zendesk_ticket_contract(channel)
+    field_values = {
+        compact_text(item.get("id")): item.get("value")
+        for item in (ticket.get("custom_fields") or [])
+    }
+
+    def managed_value(key: str) -> Any:
+        return field_values.get(compact_text(contract["fieldIds"].get(key)))
+
+    state = managed_zendesk_restore_state(
+        tags,
+        managed_value("deployRequested"),
+        compact_text(managed_value("liveUrl")),
+    )
+    return {
+        "ticketId": int(ticket["id"]),
+        "campaignId": compact_text(managed_value("campaignId")) or None,
+        "campaignName": compact_text(managed_value("campaignName")) or None,
+        "approvalId": compact_text(managed_value("approvalId")) or None,
+        "businessName": compact_text(managed_value("businessName")) or None,
+        "channel": channel,
+        "state": state["deploymentStatus"],
+    }
+
+
+@app.post("/api/campaigns/restore-zendesk")
+def restore_campaigns_from_zendesk(request: ZendeskCampaignRestoreRequest):
+    """Rebuild local campaign state from managed tickets without mutating Zendesk."""
+    tickets = managed_zendesk_restore_candidates(request)
+    previews: List[Dict[str, Any]] = []
+    preview_errors: List[Dict[str, Any]] = []
+    for ticket in tickets:
+        try:
+            previews.append(managed_zendesk_restore_preview(ticket))
+        except Exception as error:
+            preview_errors.append(
+                {
+                    "ticketId": int(ticket.get("id") or 0),
+                    "error": sanitize_message(error),
+                }
+            )
+
+    if not request.confirm:
+        return {
+            "status": "DRY_RUN",
+            "readOnly": True,
+            "candidateCount": len(tickets),
+            "restorableCount": len(previews),
+            "errorCount": len(preview_errors),
+            "candidates": previews,
+            "errors": preview_errors,
+        }
+
+    restored: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    for ticket in tickets:
+        tags = {compact_text(tag) for tag in (ticket.get("tags") or []) if compact_text(tag)}
+        channel = "email" if "asf_channel_email" in tags else "phone"
+        try:
+            row = recover_managed_zendesk_webhook_approval(
+                ZendeskWebhookRequest(
+                    action="restore_managed_ticket",
+                    zendeskTicketId=int(ticket["id"]),
+                    channel=channel,
+                    actor="Zendesk campaign recovery",
+                ),
+                ticket_override=ticket,
+                restore_current_state=True,
+            )
+            restored.append(
+                {
+                    "ticketId": int(ticket["id"]),
+                    "approvalId": row["id"],
+                    "campaignId": safe_json_loads(row["context_json"], {}).get("campaignId"),
+                    "businessName": row["business_name"],
+                    "channel": channel,
+                    "status": row["status"],
+                }
+            )
+        except Exception as error:
+            errors.append(
+                {
+                    "ticketId": int(ticket.get("id") or 0),
+                    "error": sanitize_message(error),
+                }
+            )
+
+    log_event(
+        "warning",
+        "campaigns.zendesk_restore",
+        "Recovered local campaign state from managed Zendesk tickets without changing Zendesk.",
+        candidateCount=len(tickets),
+        restoredCount=len(restored),
+        errorCount=len(errors),
+    )
+    return {
+        "status": "RESTORED" if restored and not errors else "PARTIAL" if restored else "FAILED",
+        "readOnlyZendesk": True,
+        "candidateCount": len(tickets),
+        "restoredCount": len(restored),
+        "errorCount": len(errors),
+        "restored": restored,
+        "errors": errors,
+        **list_campaigns(200),
+    }
+
+
+@app.on_event("startup")
+def bootstrap_managed_zendesk_campaigns_on_startup() -> None:
+    """Recover deploy/cancel workflow records when an ephemeral Render database starts empty."""
+    configured = os.getenv("ENABLE_ZENDESK_CAMPAIGN_RECOVERY_ON_STARTUP")
+    enabled = env_enabled("ENABLE_ZENDESK_CAMPAIGN_RECOVERY_ON_STARTUP") if configured is not None else env_enabled("RENDER")
+    if not enabled:
+        return
+    with get_pipeline_db() as db:
+        existing_campaigns = db.execute("SELECT COUNT(*) AS count FROM campaigns").fetchone()["count"]
+    if existing_campaigns:
+        return
+    try:
+        result = restore_campaigns_from_zendesk(
+            ZendeskCampaignRestoreRequest(confirm=True, includePendingIntake=False, maxTickets=200)
+        )
+        log_event(
+            "info",
+            "campaigns.zendesk_startup_recovery",
+            "Checked managed Zendesk workflow tickets after starting with an empty campaign database.",
+            restoredCount=result.get("restoredCount", 0),
+            errorCount=result.get("errorCount", 0),
+        )
+    except Exception as error:
+        log_event(
+            "warning",
+            "campaigns.zendesk_startup_recovery_failed",
+            str(error),
+        )
+
+
 def campaign_upload_dir() -> str:
     directory = os.getenv(
         "CAMPAIGN_UPLOAD_DIR",
@@ -13393,7 +13592,71 @@ def get_approval_if_present(approval_id: Optional[str]) -> Optional[sqlite3.Row]
         return db.execute("SELECT * FROM approval_records WHERE id = ?", (normalized,)).fetchone()
 
 
-def recover_managed_zendesk_webhook_approval(request: ZendeskWebhookRequest) -> sqlite3.Row:
+ZENDESK_RESTORE_WORKFLOW_TAGS = {
+    "asf_deploy_requested",
+    "asf_deployed",
+    "asf_deployment_cancelled",
+    "asf_generation_failed",
+    "asf_deploy_failed",
+    "asf_stage_failed",
+}
+
+
+def managed_zendesk_restore_state(
+    ticket_tags: Set[str],
+    deploy_requested: Any,
+    live_url: str,
+) -> Dict[str, Any]:
+    """Derive local dashboard state from Zendesk without changing the ticket."""
+    cancelled = "asf_deployment_cancelled" in ticket_tags or "asf_stage_cancelled" in ticket_tags
+    deployed = "asf_deployed" in ticket_tags or "asf_stage_live" in ticket_tags
+    generation_failed = "asf_generation_failed" in ticket_tags
+    deploy_failed = "asf_deploy_failed" in ticket_tags or "asf_stage_failed" in ticket_tags
+    requested = zendesk_ticket_field_value_matches(True, deploy_requested) or (
+        "asf_deploy_requested" in ticket_tags
+    )
+
+    if cancelled:
+        deployment_status = "CANCELLED"
+        approval_status = "AWAITING_DEPLOYMENT"
+        requested = False
+    elif deployed and live_url:
+        deployment_status = "DEPLOYED"
+        approval_status = "APPROVED"
+        requested = True
+    elif generation_failed:
+        deployment_status = "GENERATION_FAILED"
+        approval_status = "GENERATION_FAILED"
+    elif deploy_failed:
+        deployment_status = "DEPLOY_FAILED"
+        approval_status = "EXPORT_FAILED"
+    elif requested:
+        deployment_status = "DEPLOY_REQUESTED"
+        approval_status = "AWAITING_DEPLOYMENT"
+    else:
+        deployment_status = "AWAITING_DEPLOYMENT"
+        approval_status = "AWAITING_DEPLOYMENT"
+
+    generated = deployed or cancelled or generation_failed or deploy_failed or bool(
+        ticket_tags.intersection({"asf_artifact_ready", "asf_repo_ready", "asf_stage_deploying"})
+    )
+    repo_created = deployed or cancelled or "asf_repo_ready" in ticket_tags
+    return {
+        "approvalStatus": approval_status,
+        "deploymentStatus": deployment_status,
+        "requested": requested,
+        "aiGenerationCount": 1 if generated else 0,
+        "repoCreated": repo_created,
+        "liveUrl": live_url if deployment_status == "DEPLOYED" else None,
+    }
+
+
+def recover_managed_zendesk_webhook_approval(
+    request: ZendeskWebhookRequest,
+    *,
+    ticket_override: Optional[Dict[str, Any]] = None,
+    restore_current_state: bool = False,
+) -> sqlite3.Row:
     """Rebuild a deferred campaign approval only from an exact managed Zendesk ticket contract."""
     ticket_id = request.zendeskTicketId
     requested_channel = compact_text(request.channel).lower()
@@ -13408,7 +13671,8 @@ def recover_managed_zendesk_webhook_approval(request: ZendeskWebhookRequest) -> 
         "deployment_cancelled",
     }
     is_cancellation = action in cancellation_recovery_actions
-    if action not in deploy_recovery_actions | cancellation_recovery_actions:
+    restore_actions = {"restore_managed_ticket"} if restore_current_state else set()
+    if action not in deploy_recovery_actions | cancellation_recovery_actions | restore_actions:
         raise HTTPException(
             status_code=409,
             detail="Only a managed deploy or cancellation webhook can recover a missing deferred approval.",
@@ -13432,7 +13696,7 @@ def recover_managed_zendesk_webhook_approval(request: ZendeskWebhookRequest) -> 
                 },
             ) from error
         contract = require_zendesk_ticket_contract(requested_channel)
-    ticket = zendesk_api_request("get", f"/tickets/{ticket_id}.json").get("ticket") or {}
+    ticket = ticket_override or zendesk_api_request("get", f"/tickets/{ticket_id}.json").get("ticket") or {}
     initial_field_values = {
         compact_text(item.get("id")): item.get("value")
         for item in (ticket.get("custom_fields") or [])
@@ -13522,7 +13786,10 @@ def recover_managed_zendesk_webhook_approval(request: ZendeskWebhookRequest) -> 
         or channel_value not in expected_channel_values
         or (compact_text(request.approvalId) and compact_text(request.approvalId) != approval_id)
         or (compact_text(request.canonicalLeadKey) and compact_text(request.canonicalLeadKey) != canonical_key)
-        or not zendesk_ticket_field_value_matches(not is_cancellation, deploy_requested)
+        or (
+            not restore_current_state
+            and not zendesk_ticket_field_value_matches(not is_cancellation, deploy_requested)
+        )
     )
     if missing_values or identity_mismatch:
         raise HTTPException(
@@ -13600,6 +13867,24 @@ def recover_managed_zendesk_webhook_approval(request: ZendeskWebhookRequest) -> 
         "liveUrl": compact_text(managed_value("liveUrl")) or None,
         "customFields": ticket.get("custom_fields") or [],
     }
+    restore_state = managed_zendesk_restore_state(
+        ticket_tags,
+        deploy_requested,
+        compact_text(managed_value("liveUrl")),
+    )
+    if restore_current_state and (
+        {"asf_deployed", "asf_stage_live"}.intersection(ticket_tags)
+        and not restore_state["liveUrl"]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "ZENDESK_ORPHAN_TICKET_IDENTITY_INVALID",
+                "message": "A deployed managed ticket cannot be restored without its live site URL.",
+                "ticketId": ticket_id,
+                "missing": ["liveUrl"],
+            },
+        )
 
     def recovery_conflict(entity: str, message: str) -> None:
         raise HTTPException(
@@ -13812,6 +14097,91 @@ def recover_managed_zendesk_webhook_approval(request: ZendeskWebhookRequest) -> 
                 or compact_text(link_row["ticket_id"]) != compact_text(ticket_id)
             ):
                 recovery_conflict("ticket_link", "The Zendesk ticket identity is already owned by different local state.")
+
+            if restore_current_state:
+                restored_requested_at = (
+                    compact_text(ticket.get("updated_at"), timestamp)
+                    if restore_state["requested"]
+                    else None
+                )
+                restored_completed_at = (
+                    compact_text(ticket.get("updated_at"), timestamp)
+                    if restore_state["deploymentStatus"] in {"DEPLOYED", "CANCELLED"}
+                    else None
+                )
+                restored_zendesk = {
+                    "ticketId": int(ticket_id),
+                    "ticketUrl": f"https://{subdomain}.zendesk.com/agent/tickets/{ticket_id}",
+                    "channel": requested_channel,
+                    "recoveredFromManagedTicket": True,
+                }
+                db.execute(
+                    """
+                    UPDATE approval_records
+                    SET status = ?, zendesk_json = ?, notes = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        restore_state["approvalStatus"],
+                        json.dumps(restored_zendesk, default=str),
+                        "Recovered from the current managed Zendesk ticket state.",
+                        timestamp,
+                        approval_id,
+                    ),
+                )
+                db.execute(
+                    """
+                    UPDATE campaign_deployments
+                    SET status = ?, ai_generation_count = MAX(ai_generation_count, ?),
+                        repo_created = MAX(repo_created, ?), live_url = ?, requested_at = ?,
+                        completed_at = ?, error = NULL, updated_at = ?
+                    WHERE approval_id = ?
+                    """,
+                    (
+                        restore_state["deploymentStatus"],
+                        restore_state["aiGenerationCount"],
+                        1 if restore_state["repoCreated"] else 0,
+                        restore_state["liveUrl"],
+                        restored_requested_at,
+                        restored_completed_at,
+                        timestamp,
+                        approval_id,
+                    ),
+                )
+                db.execute(
+                    f"""
+                    UPDATE {channel_table}
+                    SET status = ?, deploy_requested = ?, updated_at = ?
+                    WHERE approval_id = ?
+                    """,
+                    (
+                        restore_state["deploymentStatus"],
+                        1 if restore_state["requested"] else 0,
+                        timestamp,
+                        approval_id,
+                    ),
+                )
+                link_payload.update(
+                    {
+                        "restoredState": restore_state,
+                        "restoredAt": timestamp,
+                    }
+                )
+                db.execute(
+                    """
+                    UPDATE zendesk_ticket_links
+                    SET status = ?, tags_json = ?, payload_json = ?, updated_at = ?
+                    WHERE approval_id = ? AND channel = ? AND stage = 'intake'
+                    """,
+                    (
+                        ticket.get("status") or "open",
+                        json.dumps(sorted(ticket_tags), default=str),
+                        json.dumps(link_payload, default=str),
+                        timestamp,
+                        approval_id,
+                        requested_channel,
+                    ),
+                )
 
             recovered_campaign_leads = db.execute(
                 """

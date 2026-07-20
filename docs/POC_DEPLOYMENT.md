@@ -11,6 +11,8 @@ This proof-of-concept setup keeps the app cheap and demo-friendly:
 
 Important: Render free services do not provide durable local disks. The SQLite file is acceptable for a live demo, but it should not be treated as production storage. GitHub is the durable copy of each generated `index.html`.
 
+For durable campaign data, upgrade the backend to a paid instance and attach the 1 GB disk declared in `render.yaml` at `/var/data`. Keep `PIPELINE_DB_PATH=/var/data/pipeline.db` and `CAMPAIGN_UPLOAD_DIR=/var/data/uploads`. If a Free instance starts with an empty database, the backend can reconstruct managed tickets that reached deploy/cancel/failure state from Zendesk, but untouched intake rows and uploaded import files still require the persistent disk.
+
 ## Storage contract
 
 AI Site Factory does not store generated customer sites in the main app repository.

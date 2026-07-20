@@ -3049,6 +3049,100 @@ def test_orphan_recovery_keeps_same_campaign_and_pipeline_counts_for_multiple_ti
         assert db.execute("SELECT COUNT(*) AS count FROM zendesk_ticket_links").fetchone()["count"] == 2
 
 
+def test_campaign_restore_from_zendesk_is_dry_run_then_idempotently_restores_live_state(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    field_ids = configure_managed_zendesk_contract()
+    deployed = managed_orphan_zendesk_ticket(
+        field_ids,
+        live_url="https://recovered-site.netlify.app",
+    )
+    deployed["tags"] += ["asf_deployed", "asf_stage_live"]
+    pending = managed_orphan_zendesk_ticket(
+        field_ids,
+        ticket_id=5807,
+        canonical_key="canonical-pending",
+        approval_id="approval-pending",
+        business_name="Pending Plumbing",
+    )
+    pending["tags"] = [tag for tag in pending["tags"] if tag != "asf_deploy_requested"]
+    for field in pending["custom_fields"]:
+        if str(field["id"]) == field_ids["deployRequested"]:
+            field["value"] = False
+
+    monkeypatch.setattr(
+        main,
+        "zendesk_api_request",
+        lambda method, path, **kwargs: {
+            "results": [deployed, pending],
+            "next_page": None,
+        }
+        if path == "/search.json"
+        else (_ for _ in ()).throw(AssertionError(path)),
+    )
+
+    dry_run = client.post("/api/campaigns/restore-zendesk", json={"confirm": False})
+    assert dry_run.status_code == 200
+    assert dry_run.json()["status"] == "DRY_RUN"
+    assert dry_run.json()["candidateCount"] == 1
+    assert dry_run.json()["candidates"][0]["state"] == "DEPLOYED"
+    with main.get_pipeline_db() as db:
+        assert db.execute("SELECT COUNT(*) AS count FROM campaigns").fetchone()["count"] == 0
+
+    restored = client.post("/api/campaigns/restore-zendesk", json={"confirm": True})
+    replay = client.post("/api/campaigns/restore-zendesk", json={"confirm": True})
+    assert restored.status_code == 200
+    assert restored.json()["status"] == "RESTORED"
+    assert restored.json()["restoredCount"] == 1
+    assert replay.status_code == 200
+    assert replay.json()["restoredCount"] == 1
+    with main.get_pipeline_db() as db:
+        assert db.execute("SELECT COUNT(*) AS count FROM campaigns").fetchone()["count"] == 1
+        assert db.execute("SELECT COUNT(*) AS count FROM approval_records").fetchone()["count"] == 1
+        approval = db.execute("SELECT * FROM approval_records").fetchone()
+        deployment = db.execute("SELECT * FROM campaign_deployments").fetchone()
+        lead = db.execute("SELECT * FROM campaign_email_leads").fetchone()
+    assert approval["status"] == "APPROVED"
+    assert deployment["status"] == "DEPLOYED"
+    assert deployment["live_url"] == "https://recovered-site.netlify.app"
+    assert deployment["ai_generation_count"] == 1
+    assert deployment["repo_created"] == 1
+    assert lead["status"] == "DEPLOYED"
+
+
+def test_campaign_restore_can_include_pending_managed_intake(monkeypatch):
+    monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
+    monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
+    monkeypatch.setenv("ZENDESK_API_TOKEN", "zendesk-token")
+    field_ids = configure_managed_zendesk_contract()
+    pending = managed_orphan_zendesk_ticket(field_ids)
+    pending["tags"] = [tag for tag in pending["tags"] if tag != "asf_deploy_requested"]
+    for field in pending["custom_fields"]:
+        if str(field["id"]) == field_ids["deployRequested"]:
+            field["value"] = False
+    monkeypatch.setattr(
+        main,
+        "zendesk_api_request",
+        lambda method, path, **kwargs: {"results": [pending], "next_page": None},
+    )
+
+    response = client.post(
+        "/api/campaigns/restore-zendesk",
+        json={"confirm": True, "includePendingIntake": True},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["restoredCount"] == 1
+    with main.get_pipeline_db() as db:
+        deployment = db.execute("SELECT * FROM campaign_deployments").fetchone()
+        lead = db.execute("SELECT * FROM campaign_email_leads").fetchone()
+    assert deployment["status"] == "AWAITING_DEPLOYMENT"
+    assert deployment["requested_at"] is None
+    assert lead["status"] == "AWAITING_DEPLOYMENT"
+    assert lead["deploy_requested"] == 0
+
+
 def test_orphan_recovery_rolls_back_every_insert_when_ticket_link_identity_conflicts(monkeypatch):
     monkeypatch.setenv("ZENDESK_SUBDOMAIN", "supporthub")
     monkeypatch.setenv("ZENDESK_EMAIL", "agent@example.com")
