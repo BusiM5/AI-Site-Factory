@@ -3228,6 +3228,7 @@ def test_deployment_update_writes_and_verifies_live_url_on_exact_route(monkeypat
     monkeypatch.setattr(main, "update_zendesk_ticket_comment", fake_update)
     def fake_tags(ticket_id, *, add=None, remove=None):
         captured["events"].append("deployed_tags")
+        captured["addedTags"] = list(add or [])
         return ["asf_managed", "asf_deploy_email_fired", "admin_owned", *(add or [])]
 
     monkeypatch.setattr(main, "update_zendesk_ticket_tags", fake_tags)
@@ -3241,6 +3242,8 @@ def test_deployment_update_writes_and_verifies_live_url_on_exact_route(monkeypat
 
     assert result["liveLink"] == "https://alpha.netlify.app"
     assert captured["events"] == ["ticket_fields", "deployed_tags"]
+    assert "asf_deploy_requested" in captured["addedTags"]
+    assert "asf_deployed" in captured["addedTags"]
     assert captured["ticketId"] == 5806
     assert captured["fields"]["brand_id"] == 88
     assert captured["fields"]["ticket_form_id"] == 5001

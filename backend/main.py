@@ -12142,7 +12142,14 @@ def update_existing_intake_ticket(
     tags = update_zendesk_ticket_tags(
         int(ticket_id),
         remove=ZENDESK_LIFECYCLE_TAGS,
-        add=["asf_managed", "asf_deployed", "asf_stage_live", "asf_repo_ready", f"asf_channel_{channel}"],
+        add=[
+            "asf_managed",
+            "asf_deploy_requested",
+            "asf_deployed",
+            "asf_stage_live",
+            "asf_repo_ready",
+            f"asf_channel_{channel}",
+        ],
     )
     payload = {
         **((link or {}).get("payload") or {}),
