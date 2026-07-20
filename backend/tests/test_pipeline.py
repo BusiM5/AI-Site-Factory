@@ -261,6 +261,131 @@ def test_main_business_image_is_injected_without_replacing_a_logo():
     assert "data-ai-business-main-image-container" in generated
 
 
+def test_refresh_deployed_business_media_updates_existing_html_and_redeploys(monkeypatch):
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "refresh-secret")
+    monkeypatch.setenv("GITHUB_OWNER", "owner")
+    approval_id = main.create_approval_record(
+        pipeline_id="pipeline-refresh",
+        canonical_key="canonical-refresh",
+        lead_key="lead-refresh",
+        business_name="Harbour Physiotherapy",
+        site_html='<!doctype html><html><head></head><body><header class="hero"><img src="old.svg" alt="Generated banner"></header></body></html>',
+        context={
+            "businessName": "Harbour Physiotherapy",
+            "industry": "Physiotherapy",
+            "location": "Gqeberha",
+            "contactChannel": "phone",
+        },
+        site_content={},
+        template=dict(main.FREEFORM_SITE_SPEC),
+        status="APPROVED",
+        approval_id="approval-refresh",
+    )
+    row = main.get_approval_or_404(approval_id)
+    contract = {
+        "fieldIds": {
+            "approvalId": "1",
+            "canonicalLeadKey": "2",
+            "businessName": "3",
+            "liveUrl": "4",
+            "deployRequested": "5",
+            "industry": "6",
+            "location": "7",
+            "address": "8",
+        }
+    }
+    ticket = {
+        "id": 6001,
+        "status": "open",
+        "tags": ["asf_deployed", "asf_channel_phone"],
+        "custom_fields": [
+            {"id": 1, "value": approval_id},
+            {"id": 2, "value": "canonical-refresh"},
+            {"id": 3, "value": "Harbour Physiotherapy"},
+            {"id": 4, "value": "https://harbour.netlify.app"},
+            {"id": 5, "value": True},
+            {"id": 6, "value": "Physiotherapy"},
+            {"id": 7, "value": "Gqeberha"},
+            {"id": 8, "value": "1 Harbour Road"},
+        ],
+    }
+    image_url = "https://images.example.com/harbour.jpg"
+    captured = {}
+
+    class ImageResponse(FakeResponse):
+        def close(self):
+            return None
+
+    monkeypatch.setattr(
+        main.requests,
+        "get",
+        lambda *args, **kwargs: ImageResponse(200, headers={"Content-Type": "image/jpeg"}),
+    )
+    monkeypatch.setattr(main, "zendesk_api_request", lambda *args, **kwargs: {"ticket": ticket})
+    monkeypatch.setattr(main, "require_zendesk_ticket_contract", lambda channel: contract)
+    monkeypatch.setattr(main, "resolve_webhook_approval", lambda request: row)
+    monkeypatch.setattr(
+        main,
+        "get_remote_github_repo",
+        lambda *args, **kwargs: {
+            "default_branch": "main",
+            "html_url": "https://github.com/owner/site-refresh",
+            "private": False,
+        },
+    )
+    monkeypatch.setattr(
+        main,
+        "get_github_text_file",
+        lambda *args, **kwargs: {
+            "content": row["html"],
+            "sha": "old-index-sha",
+            "htmlUrl": "https://github.com/owner/site-refresh/blob/main/index.html",
+        },
+    )
+
+    def update_file(owner, repo, branch, path, content, message, headers):
+        captured["html"] = content
+        return {
+            "action": "UPDATED",
+            "contentSha": "new-index-sha",
+            "commitSha": "new-commit-sha",
+            "htmlUrl": "https://github.com/owner/site-refresh/blob/main/index.html",
+        }
+
+    monkeypatch.setattr(main, "put_github_file", update_file)
+    monkeypatch.setattr(
+        main,
+        "deploy_direct_netlify_fallback_for_lead",
+        lambda **kwargs: {
+            "state": "ready",
+            "url": "https://harbour.netlify.app",
+            "deploymentHistoryId": "history-refresh",
+        },
+    )
+    monkeypatch.setattr(main, "zendesk_custom_fields", lambda values: [])
+    monkeypatch.setattr(main, "update_zendesk_ticket_comment", lambda *args, **kwargs: ticket)
+    monkeypatch.setattr(main, "update_zendesk_ticket_tags", lambda *args, **kwargs: ticket["tags"])
+
+    response = client.post(
+        "/api/deployments/refresh-business-media",
+        headers={"x-ai-site-factory-secret": "refresh-secret"},
+        json={
+            "zendeskTicketId": 6001,
+            "mainImageUrl": image_url,
+            "githubRepoFullName": "owner/site-refresh",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "REFRESHED"
+    assert image_url in captured["html"]
+    assert 'data-ai-default-highlight="#0f766e"' in captured["html"]
+    with main.get_pipeline_db() as db:
+        updated = db.execute("SELECT * FROM approval_records WHERE id = ?", (approval_id,)).fetchone()
+    assert updated["status"] == "APPROVED"
+    assert image_url in updated["html"]
+
+
 @pytest.fixture(autouse=True)
 def isolated_pipeline_db(tmp_path, monkeypatch):
     monkeypatch.setenv("PIPELINE_DB_PATH", str(tmp_path / "pipeline.db"))

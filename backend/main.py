@@ -810,6 +810,12 @@ class ZendeskWebhookRequest(BaseModel):
     notes: Optional[str] = None
 
 
+class DeploymentMediaRefreshRequest(BaseModel):
+    zendeskTicketId: int
+    mainImageUrl: str
+    githubRepoFullName: str
+
+
 class DiscoverLeadsRequest(BaseModel):
     presetId: str
     industry: Optional[str] = None
@@ -7005,6 +7011,33 @@ def cancel_netlify_site_for_lead(canonical_key: str, live_url: Optional[str] = N
         "previousUrl": site["url"],
         "cancelledAt": timestamp,
         "recoveredFromLiveUrl": recovered_from_url,
+    }
+
+
+def get_github_text_file(
+    repo_full_name: str,
+    path: str = "index.html",
+    branch: str = "main",
+) -> Dict[str, Any]:
+    response = github_api_request(
+        "get",
+        f"https://api.github.com/repos/{repo_full_name}/contents/{path}",
+        headers=github_headers(),
+        params={"ref": branch},
+        timeout=30,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    try:
+        content = base64.b64decode(compact_text(payload.get("content")).replace("\n", "")).decode("utf-8")
+    except (ValueError, binascii.Error, UnicodeDecodeError) as error:
+        raise RuntimeError(f"GitHub {path} content could not be decoded.") from error
+    if not content.strip():
+        raise RuntimeError(f"GitHub {path} content is empty.")
+    return {
+        "content": content,
+        "sha": payload.get("sha"),
+        "htmlUrl": payload.get("html_url"),
     }
 
 
@@ -14270,6 +14303,189 @@ def regenerate_generated_site(approval_id: str, request: ApprovalActionRequest):
         githubExport=github_export,
         errors=step_errors,
     )
+
+
+@app.post("/api/deployments/refresh-business-media")
+def refresh_deployed_business_media(
+    request: DeploymentMediaRefreshRequest,
+    http_request: Request,
+):
+    expected_secret = require_env("ZENDESK_WEBHOOK_SECRET")
+    provided_secret = (
+        http_request.headers.get("x-ai-site-factory-secret")
+        or http_request.headers.get("x-webhook-secret")
+        or http_request.headers.get("x-zendesk-webhook-secret")
+    )
+    if provided_secret != expected_secret:
+        raise HTTPException(status_code=401, detail="Invalid maintenance webhook secret.")
+
+    main_image_url = normalize_url(request.mainImageUrl)
+    if not main_image_url:
+        raise HTTPException(status_code=400, detail="A valid public mainImageUrl is required.")
+    try:
+        image_probe = requests.get(main_image_url, timeout=30, stream=True)
+        image_probe.raise_for_status()
+        content_type = compact_text(image_probe.headers.get("Content-Type")).lower()
+        image_probe.close()
+    except requests.RequestException as error:
+        raise HTTPException(status_code=400, detail=f"The business image could not be reached: {sanitize_message(error)}") from error
+    if not content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="The mainImageUrl did not return an image content type.")
+
+    repo_full_name = compact_text(request.githubRepoFullName)
+    github_owner = require_env("GITHUB_OWNER")
+    if "/" not in repo_full_name or repo_full_name.split("/", 1)[0].casefold() != github_owner.casefold():
+        raise HTTPException(status_code=409, detail="The GitHub repository is outside the configured AI Site Factory owner.")
+
+    ticket_id = int(request.zendeskTicketId)
+    ticket = zendesk_api_request("get", f"/tickets/{ticket_id}.json").get("ticket") or {}
+    tags = {compact_text(tag) for tag in (ticket.get("tags") or []) if compact_text(tag)}
+    if "asf_deployed" not in tags:
+        raise HTTPException(status_code=409, detail="Only an actively deployed managed ticket can refresh its business image.")
+    channel = "email" if "asf_channel_email" in tags else "phone" if "asf_channel_phone" in tags else ""
+    if not channel:
+        raise HTTPException(status_code=409, detail="The deployed ticket has no managed email or phone channel tag.")
+
+    contract = require_zendesk_ticket_contract(channel)
+    field_values = {
+        compact_text(item.get("id")): item.get("value")
+        for item in (ticket.get("custom_fields") or [])
+    }
+
+    def managed_value(key: str) -> Any:
+        return field_values.get(compact_text(contract["fieldIds"].get(key)))
+
+    approval_id = compact_text(managed_value("approvalId"))
+    canonical_key = compact_text(managed_value("canonicalLeadKey"))
+    business_name = compact_text(managed_value("businessName"))
+    live_url = normalize_url(managed_value("liveUrl"))
+    if not all((approval_id, canonical_key, business_name, live_url)):
+        raise HTTPException(status_code=409, detail="The deployed ticket is missing its managed deployment identity.")
+    if not zendesk_ticket_field_value_matches(True, managed_value("deployRequested")):
+        raise HTTPException(status_code=409, detail="The deployed ticket's Deploy site checkbox is not checked.")
+
+    row = resolve_webhook_approval(
+        ZendeskWebhookRequest(
+            action="deploy_site",
+            approvalId=approval_id,
+            canonicalLeadKey=canonical_key,
+            zendeskTicketId=ticket_id,
+            channel=channel,
+            actor="AI Site Factory media refresh",
+        )
+    )
+    repo = get_remote_github_repo(repo_full_name, github_headers())
+    if not repo:
+        raise HTTPException(status_code=404, detail="The managed GitHub repository could not be found.")
+    branch = compact_text(repo.get("default_branch"), "main")
+    existing_file = get_github_text_file(repo_full_name, "index.html", branch)
+    context = safe_json_loads(row["context_json"], {})
+    context.update(
+        {
+            "businessName": business_name,
+            "industry": compact_text(managed_value("industry"), context.get("industry") or "Local service"),
+            "location": compact_text(managed_value("location"), context.get("location") or "South Africa"),
+            "address": compact_text(managed_value("address"), context.get("address")),
+            "mainImageUrl": main_image_url,
+        }
+    )
+    context["brandTheme"] = business_theme_for_context(context)
+    refreshed_html = ensure_required_site_features(
+        ensure_generated_hero_and_working_links(existing_file["content"], context),
+        context,
+    )
+    if main_image_url not in refreshed_html:
+        raise HTTPException(status_code=500, detail="The refreshed HTML did not preserve the requested business image.")
+
+    owner, repo_name = repo_full_name.split("/", 1)
+    github_update = put_github_file(
+        owner,
+        repo_name,
+        branch,
+        "index.html",
+        refreshed_html,
+        "Restore business main image and aligned colour theme",
+        github_headers(),
+    )
+    github_export = {
+        "exportAction": github_update["action"],
+        "repository": repo_full_name,
+        "repoName": repo_name,
+        "repoUrl": compact_text(repo.get("html_url"), f"https://github.com/{repo_full_name}"),
+        "private": bool(repo.get("private")),
+        "branch": branch,
+        "path": "index.html",
+        "htmlChecksum": html_checksum(refreshed_html),
+        "indexContentSha": github_update.get("contentSha"),
+        "commitSha": github_update.get("commitSha"),
+        "htmlUrl": github_update.get("htmlUrl"),
+        "pipelineId": row["pipeline_id"],
+        "approvalId": row["id"],
+        "exportedAt": now_iso(),
+    }
+    deployment = deploy_direct_netlify_fallback_for_lead(
+        canonical_key=row["canonical_lead_key"],
+        business_name=row["business_name"],
+        site_html=refreshed_html,
+        pipeline_id=row["pipeline_id"],
+        approval_id=row["id"],
+        approved_by="AI Site Factory media refresh",
+        github_export=github_export,
+        git_error=RuntimeError("Refreshing a previously deployed site's business image and colour theme."),
+    )
+    if compact_text(deployment.get("state")).lower() != "ready":
+        raise HTTPException(status_code=502, detail="The refreshed Netlify deployment did not become ready.")
+
+    timestamp = now_iso()
+    with get_pipeline_db() as db:
+        db.execute(
+            """
+            UPDATE approval_records
+            SET status = 'APPROVED', html = ?, html_checksum = ?, context_json = ?,
+                github_export_json = ?, deployment_history_id = ?, approved_by = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                refreshed_html,
+                html_checksum(refreshed_html),
+                json.dumps(context, default=str),
+                json.dumps(github_export, default=str),
+                deployment.get("deploymentHistoryId"),
+                "AI Site Factory media refresh",
+                timestamp,
+                row["id"],
+            ),
+        )
+    custom_fields = zendesk_custom_fields(
+        {"deployRequested": True, "leadStatus": "DEPLOYED", "liveUrl": deployment.get("url") or live_url}
+    )
+    extra_fields: Dict[str, Any] = {"status": ticket.get("status") or "open"}
+    if custom_fields:
+        extra_fields["custom_fields"] = custom_fields
+    update_zendesk_ticket_comment(
+        ticket_id,
+        (
+            "AI Site Factory refreshed the existing website with the business's main listing image "
+            "and an industry-aligned colour palette. The live URL is unchanged."
+        ),
+        public=False,
+        extra_ticket_fields=extra_fields,
+    )
+    final_tags = update_zendesk_ticket_tags(
+        ticket_id,
+        add=["asf_deployed", "asf_stage_live", "asf_repo_ready", "asf_deploy_requested", f"asf_channel_{channel}"],
+    )
+    return {
+        "status": "REFRESHED",
+        "ticketId": ticket_id,
+        "approvalId": row["id"],
+        "businessName": business_name,
+        "mainImageUrl": main_image_url,
+        "brandTheme": context["brandTheme"],
+        "github": github_export,
+        "deployment": deployment,
+        "tags": final_tags,
+    }
 
 
 @app.get("/api/deployments/history")
