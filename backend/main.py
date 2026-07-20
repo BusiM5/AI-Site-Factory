@@ -14323,7 +14323,17 @@ def refresh_deployed_business_media(
     if not main_image_url:
         raise HTTPException(status_code=400, detail="A valid public mainImageUrl is required.")
     try:
-        image_probe = requests.get(main_image_url, timeout=30, stream=True)
+        image_probe = requests.get(
+            main_image_url,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140 Safari/537.36"
+                )
+            },
+            timeout=30,
+            stream=True,
+        )
         image_probe.raise_for_status()
         content_type = compact_text(image_probe.headers.get("Content-Type")).lower()
         image_probe.close()
