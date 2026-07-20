@@ -673,6 +673,7 @@ ZENDESK_SETUP_TAGS = [
     "asf_10_day_cancellation_due",
     "asf_10_day_cancellation_sent",
     "asf_phone_cancellation_due",
+    "asf_phone_cancellation_note_added",
     "asf_deployment_approval_withdrawn",
     "asf_generation_failed",
     "asf_deploy_failed",
