@@ -10978,6 +10978,21 @@ def provision_zendesk_setup(request: ZendeskSetupRequest):
             ("trigger:send_email", "AI Site Factory - Send approved email", "email", form_objects["email"]["id"], "emailSendRequested", "asf_email_send_fired", "send_email"),
         ]
         for resource_key, name, channel, form_id, checkbox_key, fired_tag, webhook_action in trigger_specs:
+            existing = next(
+                (
+                    item
+                    for item in inventory["triggers"]
+                    if compact_text(item.get("id"))
+                    == compact_text(automation_matches[resource_key].get("resourceId"))
+                ),
+                None,
+            )
+            # Zendesk administrators activate these triggers only after reviewing
+            # their conditions and webhook contract. A later idempotent setup run
+            # must not silently undo that production decision. Brand-new triggers
+            # still start inactive, while existing resources retain their current
+            # activation state.
+            trigger_active = bool(existing.get("active")) if existing else False
             checkbox_value = "false" if webhook_action == "cancel_deployment" else "true"
             conditions = [
                 {"field": "status", "operator": "less_than", "value": "solved"},
@@ -10993,19 +11008,21 @@ def provision_zendesk_setup(request: ZendeskSetupRequest):
             )
             trigger_payload = {
                 "title": name,
-                "description": f"[AI Site Factory key={resource_key}] Created inactive for administrator review.",
-                "active": False,
+                "description": (
+                    f"[AI Site Factory key={resource_key}] Managed ticket-action trigger. "
+                    "New triggers start inactive for administrator review; later setup runs preserve the current activation state."
+                ),
+                "active": trigger_active,
                 "conditions": {"all": conditions, "any": []},
                 "actions": [
                     {"field": "notification_webhook", "value": [webhook_id, webhook_body]},
                     {"field": "current_tags", "value": fired_tag},
                 ],
             }
-            existing = next((item for item in inventory["triggers"] if compact_text(item.get("id")) == compact_text(automation_matches[resource_key].get("resourceId"))), None)
             trigger, trigger_action = zendesk_upsert_named_resource(
                 existing=existing, resource_key=resource_key, resource_type="trigger", name=name,
                 create_path="/triggers.json", update_path="/triggers/{id}.json", root_key="trigger",
-                payload={"trigger": trigger_payload}, metadata={"active": False, "channel": channel, "action": webhook_action, "firedTag": fired_tag},
+                payload={"trigger": trigger_payload}, metadata={"active": trigger_active, "channel": channel, "action": webhook_action, "firedTag": fired_tag},
             )
             actions.append({"resourceType": "trigger", "key": resource_key, "name": name, "resourceId": compact_text(trigger.get("id")), "action": trigger_action})
 

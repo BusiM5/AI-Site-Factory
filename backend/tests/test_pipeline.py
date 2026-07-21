@@ -2483,6 +2483,35 @@ def test_zendesk_setup_provisions_inactive_live_only_cancellation_triggers(monke
         assert '"action":"cancel_deployment"' in webhook_action["value"][1]
 
 
+def test_zendesk_setup_rerun_preserves_existing_trigger_activation(monkeypatch):
+    state, _ = zendesk_setup_fake(monkeypatch)
+    monkeypatch.setenv("ZENDESK_WEBHOOK_SECRET", "webhook-secret")
+    request = {
+        "confirm": True,
+        "brandId": "88",
+        "createViews": False,
+        "createAutomation": True,
+        "webhookUrl": "https://backend.example/api/zendesk/webhook",
+    }
+
+    first = client.post("/api/settings/zendesk-setup/provision", json=request)
+    assert first.status_code == 200, first.text
+    assert state["triggers"]
+    assert all(trigger["active"] is False for trigger in state["triggers"])
+
+    for trigger in state["triggers"]:
+        trigger["active"] = True
+
+    second = client.post("/api/settings/zendesk-setup/provision", json=request)
+
+    assert second.status_code == 200, second.text
+    assert all(trigger["active"] is True for trigger in state["triggers"])
+    assert all(
+        "later setup runs preserve the current activation state" in trigger["description"]
+        for trigger in state["triggers"]
+    )
+
+
 def test_live_zendesk_field_reconciliation_replaces_stale_restored_ids(monkeypatch):
     current_ids = configure_managed_zendesk_contract()
     stale_ids = {key: str(8000 + index) for index, key in enumerate(main.ZENDESK_FIELD_KEYS)}
