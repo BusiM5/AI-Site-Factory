@@ -70,6 +70,9 @@ def test_gemini_rate_limit_uses_local_final_html_fallback(monkeypatch):
     assert result["html"].lower().startswith("<!doctype html>")
     assert "bootstrap@5.3.8" in result["html"].lower()
     assert "gsap@3.15" in result["html"].lower()
+    assert "alpinejs@3.15.12" in result["html"].lower()
+    assert "motion@12.42.2" in result["html"].lower()
+    assert 'name="ai-site-seo-gate" content="passed"' in result["html"].lower()
     assert "fallback" in result["qaNotes"].lower()
 
 
@@ -305,6 +308,103 @@ def test_business_theme_defaults_are_industry_aligned_and_persist_on_upgrade():
     assert 'data-ai-theme-name="healthcare"' in upgraded
     assert 'data-ai-default-highlight="#0f766e"' in upgraded
     assert 'data-ai-default-background="#f0fdfa"' in upgraded
+
+
+def test_highly_interactive_profile_enforces_business_details_and_seo_gate():
+    context = {
+        "businessName": "Harbour Physiotherapy",
+        "industry": "Physiotherapy",
+        "location": "Gqeberha",
+        "address": "1 Harbour Road, Gqeberha",
+        "phone": "+27 41 555 0100",
+        "email": "hello@harbour.example",
+        "rating": 4.8,
+        "reviewsCount": 37,
+        "source": "Google Maps",
+        "sourceUrl": "https://maps.example.com/harbour",
+        "mainImageUrl": "https://images.example.com/harbour.jpg",
+        "summary": "Physiotherapy support for movement, mobility, and recovery in Gqeberha.",
+    }
+    source = '''<html><head><title>Generic</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css">
+    </head><body><main><img src="hero.jpg"/><p>Draft</p></main></body></html>'''
+
+    generated = main.ensure_required_site_features(source, context)
+    report = main.validate_generated_site_seo(generated, context)
+    soup = main.BeautifulSoup(generated, "html.parser")
+    schema = main.json.loads(soup.find("script", id="ai-site-local-business-schema").string)
+
+    assert report["passed"] is True
+    assert all(report["checks"].values())
+    assert report["warnings"] == ["canonical URL is deferred until the final production domain is known"]
+    assert report["robots"] == "noindex, nofollow"
+    assert report["indexingEnabled"] is False
+    assert 'name="ai-site-indexing-mode" content="preview"' in generated
+    assert "alpinejs@3.15.12" in generated
+    assert "motion@12.42.2" in generated
+    assert "cdn.tailwindcss.com" not in generated
+    assert "animate.css" not in generated
+    assert "data-ai-site-profile=\"highly-interactive\"" in generated
+    assert "data-ai-business-details" in generated
+    assert "Harbour Physiotherapy" in generated
+    assert "1 Harbour Road, Gqeberha" in generated
+    assert "+27 41 555 0100" in generated
+    assert "hello@harbour.example" in generated
+    assert "4.8 out of 5 from 37 public reviews" in generated
+    assert "https://maps.example.com/harbour" in generated
+    assert len(soup.find_all("h1")) == 1
+    assert soup.find("img").get("alt")
+    assert soup.find("img").get("decoding") == "async"
+    assert schema["@type"] == "LocalBusiness"
+    assert schema["name"] == "Harbour Physiotherapy"
+    assert schema["telephone"] == "+27 41 555 0100"
+    assert schema["address"]["streetAddress"] == "1 Harbour Road, Gqeberha"
+    assert schema["sameAs"] == ["https://maps.example.com/harbour"]
+    assert main.ensure_required_site_features(generated, context) == generated
+
+    unsafe_preview = generated.replace("noindex, nofollow", "index, follow")
+    with pytest.raises(main.SiteSeoValidationError, match="robots"):
+        main.enforce_generated_site_seo(unsafe_preview, context)
+
+
+def test_seo_gate_rejects_an_unenriched_generated_document():
+    context = {
+        "businessName": "Alpha Plumbing",
+        "industry": "Plumbing",
+        "location": "Durban",
+    }
+    invalid = "<!doctype html><html><head><title>Generic</title></head><body><main>Draft</main></body></html>"
+
+    report = main.validate_generated_site_seo(invalid, context)
+
+    assert report["passed"] is False
+    assert "metaDescription" in report["errors"]
+    assert "businessDetails" in report["errors"]
+    assert "localBusinessSchema" in report["errors"]
+    assert "interactiveProfile" in report["errors"]
+    with pytest.raises(main.SiteSeoValidationError, match="failed the SEO validation gate"):
+        main.enforce_generated_site_seo(invalid, context)
+
+
+def test_seo_gate_enables_indexing_only_when_explicitly_requested():
+    context = {
+        "businessName": "Alpha Plumbing",
+        "industry": "Plumbing",
+        "location": "Durban",
+        "seoIndexingEnabled": True,
+    }
+
+    generated = main.ensure_required_site_features(
+        "<!doctype html><html><head></head><body><main><h1>Alpha Plumbing</h1></main></body></html>",
+        context,
+    )
+    report = main.validate_generated_site_seo(generated, context)
+
+    assert report["passed"] is True
+    assert report["robots"] == "index, follow, max-image-preview:large"
+    assert report["indexingEnabled"] is True
+    assert 'name="ai-site-indexing-mode" content="production"' in generated
 
 
 def test_main_business_image_is_injected_without_replacing_a_logo():
@@ -725,7 +825,7 @@ def stub_generation(monkeypatch, model_calls=None, export_calls=None):
         lambda lead_brief: calls.append("gemini_final") or {
             "html": "<!doctype html><html><head><title>Final</title></head><body><main>Final</main></body></html>",
             "qaNotes": "Final",
-            "stylingLibraries": ["Bootstrap", "Tailwind CSS", "Animate.css"],
+            "stylingLibraries": ["Bootstrap", "Alpine.js", "GSAP", "Motion Mini"],
         },
     )
 
@@ -923,7 +1023,7 @@ def test_discover_filters_out_website_present_leads(monkeypatch):
     assert payload["provinceStats"]["South Africa"]["websitesSkipped"] == 1
 
 
-def test_pipeline_generates_bootstrap_gsap_html_and_exports_to_github_before_approval(monkeypatch):
+def test_pipeline_generates_highly_interactive_html_and_exports_to_github_before_approval(monkeypatch):
     model_calls, export_calls = stub_generation(monkeypatch)
     monkeypatch.setattr(
         main,
@@ -941,9 +1041,13 @@ def test_pipeline_generates_bootstrap_gsap_html_and_exports_to_github_before_app
     assert result["pendingApprovalId"]
     assert result["githubExport"]["repoUrl"].startswith("https://github.com/")
     assert "bootstrap@5" in result["pendingPreviewHtml"]
-    assert "cdn.tailwindcss.com" in result["pendingPreviewHtml"]
-    assert "animate.css" in result["pendingPreviewHtml"].lower()
+    assert "alpinejs@3.15.12" in result["pendingPreviewHtml"]
+    assert "motion@12.42.2" in result["pendingPreviewHtml"]
+    assert "cdn.tailwindcss.com" not in result["pendingPreviewHtml"]
+    assert "animate.css" not in result["pendingPreviewHtml"].lower()
     assert "data-ai-site-theme-widget" in result["pendingPreviewHtml"]
+    assert "data-ai-business-details" in result["pendingPreviewHtml"]
+    assert 'name="ai-site-seo-gate" content="passed"' in result["pendingPreviewHtml"]
     assert model_calls == ["groq_compact", "gemini_final"]
     assert len(export_calls) == 1
 
@@ -952,7 +1056,7 @@ def test_pipeline_generates_bootstrap_gsap_html_and_exports_to_github_before_app
     assert detail["githubExport"]["commitSha"]
 
 
-def test_fallback_landing_page_renderer_is_bootstrap_gsap_and_polished():
+def test_fallback_landing_page_renderer_is_interactive_and_polished():
     html = main.render_site_html(
         {
             "businessName": "Alpha Plumbing",
@@ -984,9 +1088,13 @@ def test_fallback_landing_page_renderer_is_bootstrap_gsap_and_polished():
     lower = html.lower()
     assert "bootstrap@5.3.8" in lower
     assert "sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" in html
-    assert "cdn.tailwindcss.com" in lower
-    assert "animate.css" in lower
+    assert "alpinejs@3.15.12" in lower
+    assert "motion@12.42.2" in lower
+    assert "cdn.tailwindcss.com" not in lower
+    assert "animate.css" not in lower
     assert "data-ai-site-theme-widget" in lower
+    assert "data-ai-business-details" in lower
+    assert 'name="ai-site-seo-gate" content="passed"' in lower
     assert "gsap@3.15" in lower
     assert "class=\"hero hero-section\"" in lower
     assert "btn-brand" in lower
@@ -1005,6 +1113,7 @@ def test_pipeline_records_github_export_without_netlify_before_approval(monkeypa
     step_names = [step["step"] for step in steps]
 
     assert response.status_code == 200
+    assert "seo_validation" in step_names
     assert "github_export" in step_names
     assert "netlify_deploy" not in step_names
 

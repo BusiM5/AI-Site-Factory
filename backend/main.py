@@ -212,10 +212,31 @@ NETLIFY_GITHUB_INSTALLATION_DEFAULTS = {"busim5": 99999032}
 FREEFORM_SITE_SPEC = {
     "id": FREEFORM_TEMPLATE_ID,
     "name": "Gemini Freeform",
-    "description": "Gemini controls page structure and visual direction; backend enforces required libraries and safety features.",
+    "description": "Gemini controls page structure and visual direction; backend enforces the highly interactive profile, business facts, SEO, and safety features.",
     "accent": "#0f9f96",
     "background": "#f8fbff",
+    "siteProfile": "highly-interactive",
 }
+
+HIGHLY_INTERACTIVE_SITE_PROFILE = {
+    "id": "highly-interactive",
+    "name": "Highly Interactive",
+    "libraries": {
+        "layout": "Bootstrap 5.3.8",
+        "interaction": "Alpine.js 3.15.12",
+        "heroAnimation": "GSAP 3.15",
+        "scrollAnimation": "Motion Mini 12.42.2",
+    },
+    "features": [
+        "business detail tabs",
+        "fact-based FAQ accordions",
+        "theme controls",
+        "reduced-motion-safe hero animation",
+        "viewport-triggered section reveals",
+        "SEO validation gate",
+    ],
+}
+FREEFORM_SITE_SPEC["profile"] = HIGHLY_INTERACTIVE_SITE_PROFILE
 
 LANDING_PAGE_PROMPT_HEADER = """
 You are creating a production-ready, single-file HTML landing page for a business with no current website.
@@ -225,9 +246,13 @@ The html value must be a complete <!doctype html> document.
 Rules:
 - Use only the supplied public lead/business information. Do not invent awards, prices, guarantees, team members, certifications, or unavailable services.
 - Gemini may choose the page structure, copy hierarchy, and styling direction.
-- The page must include Bootstrap 5.3.8 and at least two additional styling libraries. Prefer Bootstrap 5.3.8, Tailwind browser CDN, and Animate.css when unsure.
+- Use Bootstrap 5.3.8 as the only styling framework. Do not use the Tailwind browser CDN or Animate.css.
+- Implement the highly interactive profile with Alpine.js 3.15.12 for stateful components, GSAP 3.15 for hero choreography, and Motion Mini 12.42.2 for viewport reveals and micro-interactions. Respect prefers-reduced-motion.
 - Include a visible dynamic color/theme widget that lets visitors change site colors and persists selections with localStorage.
 - Include accessible semantic sections, mobile-first responsive layout, clear contact options, and grounded calls to action.
+- Include a visible Business Details section that explicitly states every supplied fact that is useful to a visitor: business name, industry/category, location, address, phone, email, rating/review count, source listing, and main image. Omit unavailable values instead of inventing them.
+- Include crawlable Alpine-powered detail tabs and fact-based FAQ accordions. Interactive content must remain present in the HTML source and usable without animation.
+- Include one descriptive h1, a unique title, a concise meta description, robots metadata, Open Graph metadata, and LocalBusiness JSON-LD based only on supplied facts. The backend SEO gate will normalize and validate them.
 - When mainImageUrl is supplied, use that exact public business-listing image as the prominent hero/banner image. Otherwise, include a generated hero image personalised to the business name, industry, location, and public lead context; prefer an inline SVG or data URI and do not rely on unrelated stock-photo URLs.
 - Use the supplied brandTheme as the default page palette. Keep the colours appropriate to the business industry and maintain accessible text contrast; the colour widget may let visitors override those defaults.
 - Treat the supplied businessProfile as the authoritative copy plan. Use its tagline, services heading, services intro, and four distinct services; weave in the business name and location naturally. Never repeat generic cards such as "Local service" when a specific profile is available.
@@ -4894,6 +4919,7 @@ def build_public_lead_context(
         "sourceNote": "Public Google Maps, business listing, and website context.",
         "rawLead": raw_lead,
         "noWebsiteLead": not bool(normalize_url(website) or normalize_domain(lead.domain)),
+        "seoIndexingEnabled": False,
     }
     context["brandTheme"] = business_theme_for_context(context)
     context["businessProfile"] = personalized_business_profile(context)
@@ -4950,6 +4976,7 @@ def compact_lead_with_groq(context: Dict[str, Any]) -> Dict[str, Any]:
     brief["mainImageUrl"] = normalize_url(context.get("mainImageUrl")) or normalize_url(brief.get("mainImageUrl"))
     brief["brandTheme"] = business_theme_for_context(context)
     brief["businessProfile"] = business_profile
+    brief["seoIndexingEnabled"] = context.get("seoIndexingEnabled") is True
     brief.setdefault("noWebsiteLead", True)
     brief.setdefault("designHints", [])
     brief.setdefault("complianceNotes", "Use public lead details only; outreach requires opt-in or agent consent handling.")
@@ -5102,7 +5129,7 @@ def generate_final_html_with_gemini(lead_brief: Dict[str, Any]) -> Dict[str, Any
         log_event(
             "warning",
             "provider.gemini_final_html.fallback",
-            "Gemini final HTML was unavailable. Using the local Bootstrap/GSAP renderer.",
+            "Gemini final HTML was unavailable. Using the local highly interactive renderer.",
             reason=str(error),
         )
         fallback_html = build_bootstrap_gsap_landing_html(
@@ -5113,7 +5140,7 @@ def generate_final_html_with_gemini(lead_brief: Dict[str, Any]) -> Dict[str, Any
             "html": fallback_html,
             "qaNotes": "Gemini was temporarily unavailable; backend generated the validated local fallback.",
             "structureNotes": "Deterministic hero, services, about, contact, and footer layout.",
-            "stylingLibraries": ["Bootstrap", "GSAP"],
+            "stylingLibraries": ["Bootstrap", "Alpine.js", "GSAP", "Motion Mini"],
             "promptHeader": LANDING_PAGE_PROMPT_HEADER,
             "fallbackReason": sanitize_message(error),
         }
@@ -5150,9 +5177,9 @@ def generate_final_html_with_gemini(lead_brief: Dict[str, Any]) -> Dict[str, Any
     )
     return {
         "html": final_html,
-        "qaNotes": result.get("qaNotes") or "Gemini generated final HTML; backend enforced required assets and color widget.",
+        "qaNotes": result.get("qaNotes") or "Gemini generated final HTML; backend enforced the interactive profile, business facts, SEO gate, and color widget.",
         "structureNotes": result.get("structureNotes"),
-        "stylingLibraries": result.get("stylingLibraries") or ["Bootstrap", "Tailwind CSS", "Animate.css"],
+        "stylingLibraries": ["Bootstrap", "Alpine.js", "GSAP", "Motion Mini"],
         "promptHeader": LANDING_PAGE_PROMPT_HEADER,
     }
 
@@ -5162,8 +5189,8 @@ def generate_page_prompt_with_gemini(context: Dict[str, Any], template: Dict[str
         "Create a production-ready prompt for a single-file HTML landing page. "
         "Return strict JSON with keys: pagePrompt, designNotes, contentGuardrails, imageDirection. "
         "The pagePrompt must preserve: hero, four service cards, about section, contact section, footer. "
-        "The page must use Bootstrap 5.3.8 CSS from https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css and GSAP 3.15 from https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js for responsive layout/components and entry animations. "
-        "Require an animated hero section, strong CTA buttons, modern service cards, polished gradients, spacing, shadows, hover effects, and responsive layout. "
+        "The page must use Bootstrap 5.3.8 as its only styling framework, Alpine.js 3.15.12 for stateful interactions, GSAP 3.15 for hero choreography, and Motion Mini 12.42.2 for viewport reveals. "
+        "Require an animated hero, business-detail tabs, fact-based FAQs, strong CTA buttons, modern service cards, polished gradients, spacing, shadows, hover effects, reduced-motion support, SEO metadata, and responsive layout. "
         "Use only public lead context. Do not invent awards, prices, guarantees, or unavailable services.\n\n"
         f"Template: {model_safe_json(template)}\n"
         f"Lead context: {model_safe_json(context)}"
@@ -5185,7 +5212,7 @@ def generate_page_prompt_with_gemini(context: Dict[str, Any], template: Dict[str
         (
             f"Build a standalone responsive HTML landing page for {context.get('businessName')} "
             f"in {context.get('location')}. Include a hero, exactly four service cards, about, "
-            "contact, and footer. Use Bootstrap 5.3.8 CSS CDN, GSAP 3.15 CDN animations, accessible semantic HTML, strong CTA buttons, modern cards, polished gradients, spacing, shadows, hover effects, and grounded claims only."
+            "contact, explicit business details, fact-based FAQs, and footer. Use Bootstrap 5.3.8, Alpine.js 3.15.12, GSAP 3.15, Motion Mini 12.42.2, accessible semantic HTML, reduced-motion support, SEO metadata, strong CTA buttons, modern cards, polished gradients, spacing, shadows, hover effects, and grounded claims only."
         ),
     )
     result.setdefault("designNotes", f"Use accent {template.get('accent')} and background {template.get('background')}.")
@@ -5690,7 +5717,7 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
 
   <script>
     window.addEventListener("DOMContentLoaded", function () {{
-      if (!window.gsap) return;
+      if (!window.gsap || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
 
       gsap.from(".hero-animate", {{
         y: 36,
@@ -5860,11 +5887,459 @@ def existing_site_business_theme(site_html: str) -> Optional[Dict[str, str]]:
     }
 
 
+class SiteSeoValidationError(RuntimeError):
+    def __init__(self, report: Dict[str, Any]):
+        self.report = report
+        failures = ", ".join(report.get("errors") or ["unknown SEO validation error"])
+        super().__init__(f"Generated site failed the SEO validation gate: {failures}")
+
+
+def ensure_html_document_shell(site_html: str) -> str:
+    html_value = str(site_html or "").strip()
+    if not html_value:
+        html_value = "<html><head></head><body></body></html>"
+    if not re.search(r"<!doctype\s+html", html_value, flags=re.IGNORECASE):
+        html_value = f"<!doctype html>\n{html_value}"
+    if not re.search(r"<html\b", html_value, flags=re.IGNORECASE):
+        body_value = re.sub(r"<!doctype\s+html>", "", html_value, flags=re.IGNORECASE)
+        html_value = f'<!doctype html>\n<html lang="en"><head></head><body>{body_value}</body></html>'
+    if re.search(r"<html\b[^>]*\blang=", html_value, flags=re.IGNORECASE):
+        html_value = re.sub(
+            r"(<html\b[^>]*\blang=)([\"'])[^\"']*\2",
+            r'\1"en"',
+            html_value,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+    else:
+        html_value = re.sub(r"<html\b([^>]*)>", r'<html\1 lang="en">', html_value, count=1, flags=re.IGNORECASE)
+    if not re.search(r"<head\b", html_value, flags=re.IGNORECASE):
+        html_value = re.sub(r"(<html\b[^>]*>)", r"\1\n<head></head>", html_value, count=1, flags=re.IGNORECASE)
+    if not re.search(r"<body\b", html_value, flags=re.IGNORECASE):
+        html_value = inject_before_closing_tag(html_value, "html", "<body></body>")
+    return html_value
+
+
+def replace_head_element(site_html: str, pattern: str, replacement: str) -> str:
+    cleaned = re.sub(
+        rf"[ \t]*{pattern}[ \t]*(?:\r?\n)?",
+        "",
+        site_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return inject_before_closing_tag(cleaned, "head", f"  {replacement}")
+
+
+def concise_meta_text(value: Any, fallback: str, limit: int = 160) -> str:
+    plain = compact_text(html.unescape(re.sub(r"<[^>]+>", " ", str(value or ""))), fallback)
+    if len(plain) <= limit:
+        return plain
+    shortened = plain[:limit].rsplit(" ", 1)[0].rstrip(" ,;:-.")
+    return f"{shortened[: limit - 1].rstrip()}." if shortened else plain[:limit]
+
+
+def ensure_primary_heading(site_html: str, context: Dict[str, Any]) -> str:
+    business_name = html.escape(compact_text(context.get("businessName"), "Local Business"))
+    h1_pattern = re.compile(r"<h1\b(?P<attrs>[^>]*)>(?P<body>.*?)</h1>", flags=re.IGNORECASE | re.DOTALL)
+    matches = list(h1_pattern.finditer(site_html))
+    if not matches:
+        heading = f'<header class="container py-4" data-ai-primary-heading><h1>{business_name}</h1></header>'
+        if re.search(r"<main\b[^>]*>", site_html, flags=re.IGNORECASE):
+            return re.sub(
+                r"<main\b[^>]*>",
+                lambda match: f"{match.group(0)}\n{heading}",
+                site_html,
+                count=1,
+                flags=re.IGNORECASE,
+            )
+        return re.sub(
+            r"<body\b[^>]*>",
+            lambda match: f"{match.group(0)}\n{heading}",
+            site_html,
+            count=1,
+            flags=re.IGNORECASE,
+        )
+
+    seen = 0
+
+    def keep_one_h1(match: re.Match) -> str:
+        nonlocal seen
+        seen += 1
+        if seen == 1:
+            return match.group(0)
+        return f"<h2{match.group('attrs')}>{match.group('body')}</h2>"
+
+    return h1_pattern.sub(keep_one_h1, site_html)
+
+
+def ensure_image_alt_text(site_html: str, context: Dict[str, Any]) -> str:
+    business_name = compact_text(context.get("businessName"), "Local Business")
+    industry = compact_text(context.get("industry") or context.get("category"), "business")
+    fallback_alt = html.escape(f"{business_name} {industry} visual", quote=True)
+
+    def update_image(match: re.Match) -> str:
+        tag = match.group(0)
+        additions = []
+        if not re.search(r"\balt\s*=", tag, flags=re.IGNORECASE):
+            additions.append(f'alt="{fallback_alt}"')
+        if not re.search(r"\bdecoding\s*=", tag, flags=re.IGNORECASE):
+            additions.append('decoding="async"')
+        if not additions:
+            return tag
+        closing = " />" if re.search(r"/\s*>$", tag) else ">"
+        tag_without_closing = re.sub(r"\s*/?>$", "", tag)
+        return f"{tag_without_closing} {' '.join(additions)}{closing}"
+
+    return re.sub(r"<img\b[^>]*>", update_image, site_html, flags=re.IGNORECASE | re.DOTALL)
+
+
+def business_details_section(context: Dict[str, Any]) -> str:
+    profile = personalized_business_profile(context)
+    business_name_raw = compact_text(context.get("businessName"), "Local Business")
+    industry_raw = compact_text(profile.get("industry"), context.get("industry") or "Local Business")
+    location_raw = compact_text(context.get("location"), "South Africa")
+    address_raw = compact_text(context.get("address"))
+    phone_raw = compact_text(context.get("phone"))
+    email_raw = normalize_email_identity(context.get("email"))
+    rating_raw = compact_text(context.get("rating"))
+    reviews_raw = compact_text(context.get("reviewsCount"))
+    source_raw = compact_text(context.get("source") or context.get("sourceLabel"), "Public business listing")
+    source_url = normalize_url(context.get("sourceUrl"))
+    summary_raw = concise_meta_text(
+        context.get("summary") or profile.get("heroCaption"),
+        f"Learn about {business_name_raw}, a {industry_raw} business serving {location_raw}.",
+        240,
+    )
+
+    def escaped(value: Any) -> str:
+        return html.escape(compact_text(value))
+
+    facts: List[Tuple[str, str]] = [
+        ("Business", business_name_raw),
+        ("Industry", industry_raw),
+        ("Location", location_raw),
+    ]
+    if address_raw:
+        facts.append(("Address", address_raw))
+    if phone_raw:
+        facts.append(("Phone", phone_raw))
+    if email_raw:
+        facts.append(("Email", email_raw))
+    if rating_raw:
+        rating_detail = f"{rating_raw} out of 5"
+        if reviews_raw:
+            rating_detail += f" from {reviews_raw} public reviews"
+        facts.append(("Public rating", rating_detail))
+    elif reviews_raw:
+        facts.append(("Public reviews", reviews_raw))
+    facts.append(("Information source", source_raw))
+
+    fact_markup = "".join(
+        f'<div class="ai-business-fact"><dt>{escaped(label)}</dt><dd>{escaped(value)}</dd></div>'
+        for label, value in facts
+    )
+    contact_links = []
+    if phone_raw:
+        contact_links.append(
+            f'<a class="btn btn-primary" href="tel:{html.escape(phone_raw, quote=True)}">Call {escaped(phone_raw)}</a>'
+        )
+    if email_raw:
+        contact_links.append(
+            f'<a class="btn btn-outline-primary" href="mailto:{html.escape(email_raw, quote=True)}">Email {escaped(email_raw)}</a>'
+        )
+    if source_url:
+        contact_links.append(
+            f'<a class="btn btn-outline-secondary" href="{html.escape(source_url, quote=True)}" target="_blank" rel="noreferrer">View {escaped(source_raw)}</a>'
+        )
+    if not contact_links:
+        contact_links.append('<a class="btn btn-primary" href="#contact">View contact options</a>')
+
+    service_titles = [compact_text(service.get("title")) for service in profile.get("services", []) if compact_text(service.get("title"))]
+    services_text = ", ".join(service_titles) or industry_raw
+    location_text = address_raw or location_raw
+    contact_text = " or ".join(value for value in (phone_raw, email_raw) if value) or "the contact options shown on this page"
+    faq_items = [
+        (f"What does {business_name_raw} offer?", f"The supplied business profile lists {services_text}."),
+        (f"Where is {business_name_raw} located?", f"The public business details identify {location_text}."),
+        (f"How can I contact {business_name_raw}?", f"Use {contact_text} to contact the business directly."),
+    ]
+    faq_markup = "".join(
+        f'''<article class="ai-business-faq" x-data="{{ open: false }}">
+          <h3><button type="button" @click="open = !open" :aria-expanded="open.toString()" data-ai-interaction>{escaped(question)}<span aria-hidden="true">+</span></button></h3>
+          <div x-show="open" x-cloak><p>{escaped(answer)}</p></div>
+        </article>'''
+        for question, answer in faq_items
+    )
+
+    return f'''<section id="business-details" class="ai-business-details section-padding" data-ai-business-details data-ai-reveal x-data="{{ activeTab: 'overview' }}">
+  <div class="container">
+    <span class="section-kicker">Verified public profile</span>
+    <h2>Business details for {escaped(business_name_raw)}</h2>
+    <p class="ai-business-summary">{escaped(summary_raw)}</p>
+    <div class="ai-business-tabs" role="tablist" aria-label="Business information">
+      <button type="button" role="tab" @click="activeTab = 'overview'" :aria-selected="(activeTab === 'overview').toString()" :class="{{ active: activeTab === 'overview' }}" data-ai-interaction>Overview</button>
+      <button type="button" role="tab" @click="activeTab = 'contact'" :aria-selected="(activeTab === 'contact').toString()" :class="{{ active: activeTab === 'contact' }}" data-ai-interaction>Contact</button>
+      <button type="button" role="tab" @click="activeTab = 'questions'" :aria-selected="(activeTab === 'questions').toString()" :class="{{ active: activeTab === 'questions' }}" data-ai-interaction>Common questions</button>
+    </div>
+    <div class="ai-business-panel" x-show="activeTab === 'overview'">
+      <dl class="ai-business-facts">{fact_markup}</dl>
+    </div>
+    <div class="ai-business-panel" x-show="activeTab === 'contact'" x-cloak>
+      <p>Contact {escaped(business_name_raw)} using the verified details supplied with this business record.</p>
+      <div class="ai-business-actions">{''.join(contact_links)}</div>
+    </div>
+    <div class="ai-business-panel" x-show="activeTab === 'questions'" x-cloak>
+      <div class="ai-business-faqs">{faq_markup}</div>
+    </div>
+  </div>
+</section>'''
+
+
+def ensure_business_details_section(site_html: str, context: Dict[str, Any]) -> str:
+    section = business_details_section(context)
+    if "data-ai-business-details" in site_html.lower():
+        return re.sub(
+            r"<section\b[^>]*data-ai-business-details[^>]*>.*?</section>",
+            section,
+            site_html,
+            count=1,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+    contact_match = re.search(r"<section\b[^>]*\bid=[\"']contact[\"'][^>]*>", site_html, flags=re.IGNORECASE)
+    if contact_match:
+        return site_html[:contact_match.start()] + section + "\n" + site_html[contact_match.start():]
+    return inject_before_closing_tag(site_html, "main" if "</main>" in site_html.lower() else "body", section)
+
+
+def local_business_schema(context: Dict[str, Any], description: str) -> Dict[str, Any]:
+    schema: Dict[str, Any] = {
+        "@context": "https://schema.org",
+        "@type": "LocalBusiness",
+        "name": compact_text(context.get("businessName"), "Local Business"),
+        "description": description,
+        "areaServed": compact_text(context.get("location"), "South Africa"),
+    }
+    phone = compact_text(context.get("phone"))
+    email = normalize_email_identity(context.get("email"))
+    address = compact_text(context.get("address"))
+    image_url = normalize_url(context.get("mainImageUrl"))
+    source_url = normalize_url(context.get("sourceUrl"))
+    if phone:
+        schema["telephone"] = phone
+    if email:
+        schema["email"] = email
+    if address:
+        schema["address"] = {"@type": "PostalAddress", "streetAddress": address}
+    if image_url:
+        schema["image"] = image_url
+    if source_url:
+        schema["sameAs"] = [source_url]
+    return schema
+
+
+def ensure_site_seo_metadata(site_html: str, context: Dict[str, Any]) -> str:
+    html_value = ensure_html_document_shell(site_html)
+    profile = personalized_business_profile(context)
+    business_name = compact_text(context.get("businessName"), "Local Business")
+    industry = compact_text(profile.get("industry"), context.get("industry") or "Local Business")
+    location = compact_text(context.get("location"), "South Africa")
+    title = concise_meta_text(f"{business_name} | {industry} in {location}", business_name, 70)
+    description = concise_meta_text(
+        context.get("summary") or profile.get("heroCaption"),
+        f"Explore {industry.lower()} services, verified business details, and contact options for {business_name} in {location}.",
+    )
+    title_escaped = html.escape(title)
+    description_escaped = html.escape(description, quote=True)
+    image_url = normalize_url(context.get("mainImageUrl"))
+    theme = business_theme_for_context(context)
+    indexing_enabled = context.get("seoIndexingEnabled") is True
+    robots_content = "index, follow, max-image-preview:large" if indexing_enabled else "noindex, nofollow"
+    indexing_mode = "production" if indexing_enabled else "preview"
+
+    html_value = replace_head_element(html_value, r"<title\b[^>]*>.*?</title>", f"<title>{title_escaped}</title>")
+    html_value = replace_head_element(
+        html_value,
+        r"<meta\b(?=[^>]*\bname=[\"']description[\"'])[^>]*>",
+        f'<meta name="description" content="{description_escaped}">',
+    )
+    html_value = replace_head_element(
+        html_value,
+        r"<meta\b(?=[^>]*\bname=[\"']robots[\"'])[^>]*>",
+        f'<meta name="robots" content="{robots_content}">',
+    )
+    html_value = replace_head_element(
+        html_value,
+        r"<meta\b(?=[^>]*\bname=[\"']ai-site-indexing-mode[\"'])[^>]*>",
+        f'<meta name="ai-site-indexing-mode" content="{indexing_mode}">',
+    )
+    html_value = replace_head_element(
+        html_value,
+        r"<meta\b(?=[^>]*\bname=[\"']theme-color[\"'])[^>]*>",
+        f'<meta name="theme-color" content="{theme["highlight"]}">',
+    )
+    social_tags = [
+        '<meta property="og:type" content="website">',
+        f'<meta property="og:title" content="{html.escape(title, quote=True)}">',
+        f'<meta property="og:description" content="{description_escaped}">',
+        '<meta name="twitter:card" content="summary_large_image">',
+        f'<meta name="twitter:title" content="{html.escape(title, quote=True)}">',
+        f'<meta name="twitter:description" content="{description_escaped}">',
+    ]
+    if image_url:
+        image_escaped = html.escape(image_url, quote=True)
+        social_tags.extend(
+            [
+                f'<meta property="og:image" content="{image_escaped}">',
+                f'<meta name="twitter:image" content="{image_escaped}">',
+            ]
+        )
+    for attribute, key, tag in (
+        ("property", "og:type", social_tags[0]),
+        ("property", "og:title", social_tags[1]),
+        ("property", "og:description", social_tags[2]),
+        ("name", "twitter:card", social_tags[3]),
+        ("name", "twitter:title", social_tags[4]),
+        ("name", "twitter:description", social_tags[5]),
+    ):
+        html_value = replace_head_element(
+            html_value,
+            rf"<meta\b(?=[^>]*\b{attribute}=[\"']{re.escape(key)}[\"'])[^>]*>",
+            tag,
+        )
+    if image_url:
+        html_value = replace_head_element(
+            html_value,
+            r"<meta\b(?=[^>]*\bproperty=[\"']og:image[\"'])[^>]*>",
+            social_tags[6],
+        )
+        html_value = replace_head_element(
+            html_value,
+            r"<meta\b(?=[^>]*\bname=[\"']twitter:image[\"'])[^>]*>",
+            social_tags[7],
+        )
+
+    schema_markup = (
+        '<script id="ai-site-local-business-schema" type="application/ld+json">'
+        + json.dumps(local_business_schema(context, description), ensure_ascii=False).replace("</", "<\\/")
+        + "</script>"
+    )
+    html_value = re.sub(
+        r"[ \t]*<script\b[^>]*\bid=[\"']ai-site-local-business-schema[\"'][^>]*>.*?</script>[ \t]*(?:\r?\n)?",
+        "",
+        html_value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    html_value = inject_before_closing_tag(html_value, "head", schema_markup)
+
+    html_value = ensure_primary_heading(html_value, context)
+    return ensure_image_alt_text(html_value, context)
+
+
+def validate_generated_site_seo(site_html: str, context: Dict[str, Any]) -> Dict[str, Any]:
+    soup = BeautifulSoup(site_html, "html.parser")
+    business_name = compact_text(context.get("businessName"))
+    industry = compact_text(personalized_business_profile(context).get("industry"))
+    location = compact_text(context.get("location"))
+    visible_text = normalize_identity_text(soup.get_text(" ", strip=True))
+    title = compact_text(soup.title.get_text(" ", strip=True) if soup.title else "")
+    description_tag = soup.find("meta", attrs={"name": re.compile(r"^description$", re.IGNORECASE)})
+    robots_tag = soup.find("meta", attrs={"name": re.compile(r"^robots$", re.IGNORECASE)})
+    robots_value = compact_text(robots_tag.get("content") if robots_tag else "").lower()
+    robots_tokens = {token.strip() for token in robots_value.split(",") if token.strip()}
+    expected_robots = {"index", "follow"} if context.get("seoIndexingEnabled") is True else {"noindex", "nofollow"}
+    schema_tag = soup.find("script", attrs={"id": "ai-site-local-business-schema"})
+    schema_value: Dict[str, Any] = {}
+    schema_valid = False
+    if schema_tag:
+        try:
+            schema_value = json.loads(schema_tag.string or schema_tag.get_text())
+            schema_valid = (
+                schema_value.get("@context") == "https://schema.org"
+                and schema_value.get("@type") == "LocalBusiness"
+                and normalize_identity_text(schema_value.get("name")) == normalize_identity_text(business_name)
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            schema_valid = False
+
+    expected_facts = [value for value in (business_name, industry, location) if compact_text(value)]
+    for optional_key in ("address", "phone", "email", "rating", "reviewsCount"):
+        optional_value = compact_text(context.get(optional_key))
+        if optional_value:
+            expected_facts.append(optional_value)
+    facts_present = all(normalize_identity_text(value) in visible_text for value in expected_facts)
+    images = soup.find_all("img")
+    image_alt_valid = all(image.has_attr("alt") for image in images)
+    checks = {
+        "doctype": bool(re.search(r"<!doctype\s+html", site_html, flags=re.IGNORECASE)),
+        "language": bool(soup.html and compact_text(soup.html.get("lang"))),
+        "title": bool(title and business_name and normalize_identity_text(business_name) in normalize_identity_text(title)),
+        "metaDescription": bool(description_tag and compact_text(description_tag.get("content"))),
+        "robots": bool(robots_tag and expected_robots.issubset(robots_tokens)),
+        "singleH1": len(soup.find_all("h1")) == 1,
+        "businessDetails": bool(soup.find(attrs={"data-ai-business-details": True})) and facts_present,
+        "localBusinessSchema": schema_valid,
+        "imageAltText": image_alt_valid,
+        "interactiveProfile": (
+            "alpinejs@3.15.12" in site_html.lower()
+            and "motion@12.42.2" in site_html.lower()
+            and bool(soup.find(attrs={"x-data": True}))
+        ),
+    }
+    errors = [name for name, passed in checks.items() if not passed]
+    warnings = []
+    if not soup.find("link", attrs={"rel": lambda value: value and "canonical" in value}):
+        warnings.append("canonical URL is deferred until the final production domain is known")
+    if len(title) > 70:
+        warnings.append("title may be truncated in search results")
+    description = compact_text(description_tag.get("content") if description_tag else "")
+    if len(description) > 160:
+        warnings.append("meta description exceeds the preferred concise summary length")
+    return {
+        "passed": not errors,
+        "checks": checks,
+        "errors": errors,
+        "warnings": warnings,
+        "title": title,
+        "description": description,
+        "robots": robots_value,
+        "indexingEnabled": "index" in robots_tokens,
+    }
+
+
+def enforce_generated_site_seo(site_html: str, context: Dict[str, Any]) -> Dict[str, Any]:
+    report = validate_generated_site_seo(site_html, context)
+    if not report["passed"]:
+        raise SiteSeoValidationError(report)
+    return report
+
+
+def remove_disallowed_generated_site_assets(site_html: str) -> str:
+    html_value = re.sub(
+        r"\s*<script\b(?=[^>]*\bsrc=[\"'][^\"']*cdn\.tailwindcss\.com[^\"']*[\"'])[^>]*>\s*</script>",
+        "",
+        site_html,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    return re.sub(
+        r"\s*<link\b(?=[^>]*\bhref=[\"'][^\"']*(?:animate(?:\.min)?\.css|/animate\.css/)[^\"']*[\"'])[^>]*>",
+        "",
+        html_value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+
+
 def ensure_required_site_features(
     site_html: str,
     theme_context: Optional[Dict[str, Any]] = None,
 ) -> str:
-    html_value = upgrade_legacy_fallback_image_data_uris(site_html)
+    html_value = remove_disallowed_generated_site_assets(
+        ensure_html_document_shell(upgrade_legacy_fallback_image_data_uris(site_html))
+    )
+    has_business_context = bool(
+        isinstance(theme_context, dict) and compact_text(theme_context.get("businessName"))
+    )
+    if has_business_context:
+        html_value = ensure_business_details_section(html_value, theme_context)
     lower_html = html_value.lower()
     business_theme = (
         business_theme_for_context(theme_context)
@@ -5879,12 +6354,45 @@ def ensure_required_site_features(
         'rel="stylesheet" '
         'integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">'
     )
-    tailwind_js = '<script src="https://cdn.tailwindcss.com"></script>'
-    animate_css = '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/animate.css/4.1.1/animate.min.css">'
+    alpine_js = (
+        '<script id="ai-site-alpine-runtime" defer '
+        'src="https://cdn.jsdelivr.net/npm/alpinejs@3.15.12/dist/cdn.min.js"></script>'
+    )
+    motion_js = (
+        '<script id="ai-site-motion-runtime" type="module">'
+        'import { animate } from "https://cdn.jsdelivr.net/npm/motion@12.42.2/mini/+esm";'
+        'window.aiSiteMotionAnimate = animate;'
+        '</script>'
+    )
     bootstrap_js = (
         '<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/js/bootstrap.bundle.min.js"></script>'
     )
     gsap_js = '<script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js"></script>'
+    interactive_css = """<style id="ai-site-interactive-profile-style" data-ai-site-profile="highly-interactive">
+  [x-cloak] { display: none !important; }
+  .ai-business-details { padding: clamp(3.5rem, 8vw, 6.5rem) 0; background: color-mix(in srgb, var(--ai-background) 92%, var(--ai-highlight) 8%); }
+  .ai-business-details h2 { max-width: 820px; margin: .5rem 0 1rem; font-size: clamp(2rem, 5vw, 3.5rem); }
+  .ai-business-summary { max-width: 760px; color: color-mix(in srgb, var(--ai-text) 75%, transparent); font-size: 1.08rem; }
+  .ai-business-tabs { display: flex; flex-wrap: wrap; gap: .65rem; margin: 1.75rem 0 1rem; }
+  .ai-business-tabs button { min-height: 44px; padding: .7rem 1rem; border: 1px solid color-mix(in srgb, var(--ai-highlight) 35%, transparent); border-radius: 999px; background: transparent; color: var(--ai-text); font-weight: 800; }
+  .ai-business-tabs button.active, .ai-business-tabs button:hover, .ai-business-tabs button:focus-visible { background: var(--ai-highlight); color: var(--ai-on-highlight); outline-offset: 3px; }
+  .ai-business-panel { padding: clamp(1.1rem, 3vw, 2rem); border: 1px solid color-mix(in srgb, var(--ai-highlight) 24%, transparent); border-radius: 22px; background: color-mix(in srgb, var(--ai-background) 82%, #ffffff 18%); box-shadow: 0 18px 55px rgba(15, 23, 42, .09); }
+  .ai-business-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: .85rem; margin: 0; }
+  .ai-business-fact { min-width: 0; padding: 1rem; border-radius: 15px; background: color-mix(in srgb, var(--ai-background) 88%, var(--ai-highlight) 12%); }
+  .ai-business-fact dt { margin-bottom: .3rem; color: var(--ai-highlight); font-size: .75rem; font-weight: 900; letter-spacing: .08em; text-transform: uppercase; }
+  .ai-business-fact dd { margin: 0; overflow-wrap: anywhere; color: var(--ai-text); font-weight: 750; }
+  .ai-business-actions { display: flex; flex-wrap: wrap; gap: .75rem; }
+  .ai-business-faq { border-bottom: 1px solid color-mix(in srgb, var(--ai-highlight) 22%, transparent); }
+  .ai-business-faq:last-child { border-bottom: 0; }
+  .ai-business-faq h3 { margin: 0; font-size: 1rem; }
+  .ai-business-faq button { width: 100%; min-height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 1rem; border: 0; background: transparent; color: var(--ai-text); text-align: left; font: inherit; font-weight: 850; }
+  .ai-business-faq p { margin: 0; padding: 0 0 1rem; }
+  [data-ai-interaction] { transition: transform .2s ease, box-shadow .2s ease; }
+  @media (prefers-reduced-motion: reduce) {
+    html { scroll-behavior: auto !important; }
+    *, *::before, *::after { animation-duration: .001ms !important; animation-iteration-count: 1 !important; transition-duration: .001ms !important; }
+  }
+</style>"""
     widget_css = """<style id="ai-site-theme-widget-style" data-ai-site-theme-version="3">
   :root {
     --ai-text: __AI_TEXT__;
@@ -6176,10 +6684,11 @@ def ensure_required_site_features(
         widget_html = widget_html.replace(token, value)
         widget_js = widget_js.replace(token, value)
     animation_js = """
-<script>
+<script id="ai-site-gsap-fallback-animation">
   window.addEventListener("DOMContentLoaded", function () {
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     if (window.gsap) {
-      gsap.from("header, .hero, main section, .card, .service-card", {
+      gsap.from("header, .hero, .hero-content > *, .hero-visual", {
         y: 24,
         opacity: 0,
         duration: 0.75,
@@ -6187,6 +6696,36 @@ def ensure_required_site_features(
         stagger: 0.08
       });
     }
+  });
+</script>"""
+    interactive_js = """<script id="ai-site-interactive-profile-script" data-ai-site-profile="highly-interactive">
+  window.addEventListener("DOMContentLoaded", function () {
+    var reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reducedMotion || !window.aiSiteMotionAnimate) return;
+    var animate = window.aiSiteMotionAnimate;
+    var reveal = function (element) {
+      if (element.dataset.aiRevealed) return;
+      element.dataset.aiRevealed = "true";
+      animate(element, { opacity: [0, 1], transform: ["translateY(28px)", "translateY(0px)"] }, { duration: .65, ease: "easeOut" });
+    };
+    var targets = Array.from(document.querySelectorAll("main > section, [data-ai-reveal]"));
+    if ("IntersectionObserver" in window) {
+      var observer = new IntersectionObserver(function (entries) {
+        entries.forEach(function (entry) {
+          if (!entry.isIntersecting) return;
+          reveal(entry.target);
+          observer.unobserve(entry.target);
+        });
+      }, { threshold: .12 });
+      targets.forEach(function (element) { observer.observe(element); });
+    } else {
+      targets.forEach(reveal);
+    }
+    document.querySelectorAll("[data-ai-interaction]").forEach(function (element) {
+      element.addEventListener("click", function () {
+        animate(element, { transform: ["scale(1)", "scale(.97)", "scale(1)"] }, { duration: .24 });
+      });
+    });
   });
 </script>"""
 
@@ -6218,12 +6757,23 @@ def ensure_required_site_features(
         html_value = inject_before_closing_tag(html_value, "head", f"  {bootstrap_css}")
 
     lower_html = html_value.lower()
-    if "cdn.tailwindcss.com" not in lower_html:
-        html_value = inject_before_closing_tag(html_value, "head", f"  {tailwind_js}")
+    if "alpinejs@3.15.12" not in lower_html:
+        html_value = inject_before_closing_tag(html_value, "head", f"  {alpine_js}")
 
     lower_html = html_value.lower()
-    if "animate.css" not in lower_html and "animate.min.css" not in lower_html:
-        html_value = inject_before_closing_tag(html_value, "head", f"  {animate_css}")
+    if "motion@12.42.2" not in lower_html:
+        html_value = inject_before_closing_tag(html_value, "head", f"  {motion_js}")
+
+    lower_html = html_value.lower()
+    if "ai-site-interactive-profile-style" in lower_html:
+        html_value = replace_element_by_id(
+            html_value,
+            "style",
+            "ai-site-interactive-profile-style",
+            interactive_css,
+        )
+    else:
+        html_value = inject_before_closing_tag(html_value, "head", interactive_css)
 
     lower_html = html_value.lower()
     if "ai-site-theme-widget-style" not in lower_html:
@@ -6235,18 +6785,37 @@ def ensure_required_site_features(
         scripts.append(bootstrap_js)
     if "gsap@3.15/dist/gsap.min.js" not in lower_html:
         scripts.append(gsap_js)
-    if "gsap.from" not in lower_html:
+    if "gsap.from" not in lower_html and "ai-site-gsap-fallback-animation" not in lower_html:
         scripts.append(animation_js)
     if "data-ai-site-theme-widget" not in lower_html:
         scripts.append(widget_html)
     if "ai-site-theme-widget-script" not in lower_html:
         scripts.append(widget_js)
+    if "ai-site-interactive-profile-script" not in lower_html:
+        scripts.append(interactive_js)
 
     if scripts:
         injection = "\n".join(scripts)
         html_value = inject_before_closing_tag(html_value, "body", injection)
 
+    if has_business_context:
+        html_value = ensure_site_seo_metadata(html_value, theme_context)
+        report = enforce_generated_site_seo(html_value, theme_context)
+        html_value = replace_head_element(
+            html_value,
+            r"<meta\b(?=[^>]*\bname=[\"']ai-site-seo-gate[\"'])[^>]*>",
+            '<meta name="ai-site-seo-gate" content="passed">',
+        )
+
     return html_value
+
+
+def prepare_generated_site_artifact(site_html: str, context: Dict[str, Any]) -> Dict[str, Any]:
+    enriched_html = ensure_required_site_features(site_html, context)
+    return {
+        "html": enriched_html,
+        "seoValidation": enforce_generated_site_seo(enriched_html, context),
+    }
 
 
 def ensure_bootstrap_gsap_assets(
@@ -6895,7 +7464,7 @@ def render_site_html(
   <script src="https://cdn.jsdelivr.net/npm/gsap@3.15/dist/gsap.min.js"></script>
   <script>
     window.addEventListener("DOMContentLoaded", function () {{
-      if (window.gsap) {{
+      if (window.gsap && !window.matchMedia("(prefers-reduced-motion: reduce)").matches) {{
         gsap.from(".hero-content > *", {{ y: 18, opacity: 0, duration: 0.75, ease: "power2.out", stagger: 0.08 }});
         gsap.from(".hero-image", {{ y: 24, opacity: 0, duration: 0.8, ease: "power2.out", delay: 0.15 }});
         gsap.from(".service-card, .about-band .row, .contact-card", {{ y: 22, opacity: 0, duration: 0.7, ease: "power2.out", stagger: 0.08, delay: 0.25 }});
@@ -9912,13 +10481,22 @@ def run_pipeline(request: PipelineRunRequest):
                 lambda: generate_final_html_with_gemini(groq_brief),
                 retryable=True,
             )
-            pending_html = ensure_required_site_features(final_html_result["html"], groq_brief)
+            quality_result = run_step(
+                "seo_validation",
+                "local",
+                lambda: prepare_generated_site_artifact(final_html_result["html"], groq_brief),
+                retryable=False,
+            )
+            pending_html = quality_result["html"]
+            seo_validation = quality_result["seoValidation"]
             site_content = {
                 "promptHeader": LANDING_PAGE_PROMPT_HEADER,
                 "groqBrief": groq_brief,
                 "geminiQaNotes": final_html_result.get("qaNotes"),
                 "structureNotes": final_html_result.get("structureNotes"),
                 "stylingLibraries": final_html_result.get("stylingLibraries"),
+                "siteProfile": HIGHLY_INTERACTIVE_SITE_PROFILE,
+                "seoValidation": seo_validation,
                 "finalHtmlChecksum": html_checksum(pending_html),
             }
             approval_id = create_approval_record(
@@ -13516,13 +14094,21 @@ def prepare_deferred_approval(approval_id: str) -> sqlite3.Row:
             )
             brief = run_deferred_step("groq_compact_lead", "groq", lambda: compact_lead_with_groq(cleaned_context))
             final_html_result = run_deferred_step("gemini_final_html", "gemini", lambda: generate_final_html_with_gemini(brief))
-            site_html = ensure_required_site_features(final_html_result["html"], brief)
+            quality_result = run_deferred_step(
+                "seo_validation",
+                "local",
+                lambda: prepare_generated_site_artifact(final_html_result["html"], brief),
+            )
+            site_html = quality_result["html"]
+            seo_validation = quality_result["seoValidation"]
             site_content = {
                 "deferredGeneration": True,
                 "generatedOnDeployRequest": True,
                 "groqBrief": brief,
                 "geminiQaNotes": final_html_result.get("qaNotes"),
                 "stylingLibraries": final_html_result.get("stylingLibraries"),
+                "siteProfile": HIGHLY_INTERACTIVE_SITE_PROFILE,
+                "seoValidation": seo_validation,
                 "finalHtmlChecksum": html_checksum(site_html),
             }
             # Persist the expensive AI artifact before GitHub I/O so a transient
@@ -15377,13 +15963,21 @@ def regenerate_generated_site(approval_id: str, request: ApprovalActionRequest):
             "gemini",
             lambda: generate_final_html_with_gemini(groq_brief),
         )
-        final_html = ensure_required_site_features(final_html_result["html"], groq_brief)
+        quality_result = run_regenerate_step(
+            "seo_validation",
+            "local",
+            lambda: prepare_generated_site_artifact(final_html_result["html"], groq_brief),
+        )
+        final_html = quality_result["html"]
+        seo_validation = quality_result["seoValidation"]
         site_content = {
             "promptHeader": LANDING_PAGE_PROMPT_HEADER,
             "groqBrief": groq_brief,
             "geminiQaNotes": final_html_result.get("qaNotes"),
             "structureNotes": final_html_result.get("structureNotes"),
             "stylingLibraries": final_html_result.get("stylingLibraries"),
+            "siteProfile": HIGHLY_INTERACTIVE_SITE_PROFILE,
+            "seoValidation": seo_validation,
             "finalHtmlChecksum": html_checksum(final_html),
             "regeneratedFromApprovalId": approval_id,
             "requestedBy": requested_by,
