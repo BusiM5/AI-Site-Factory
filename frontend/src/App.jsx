@@ -53,6 +53,7 @@ const BACKEND_UNREACHABLE_NOTICE = {
   tone: "danger",
   text: "The backend is temporarily unavailable. Retrying automatically.",
 };
+const DISCOVERY_NOTICE_DURATION_MS = 8000;
 
 const FALLBACK_PRESETS = [
   { id: "restaurants", label: "Restaurants", industry: "Restaurant", description: "Restaurants, cafes, and takeaways." },
@@ -441,6 +442,12 @@ function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign 
   const [error, setError] = useState("");
   const update = (patch) => setForm((current) => ({ ...current, ...patch }));
   const busy = ["QUEUED", "RUNNING"].includes(activity?.status);
+
+  useEffect(() => {
+    if (!error) return undefined;
+    const timer = window.setTimeout(() => setError(""), DISCOVERY_NOTICE_DURATION_MS);
+    return () => window.clearTimeout(timer);
+  }, [error]);
 
   const submit = async (event) => {
     event.preventDefault();
@@ -926,6 +933,16 @@ function AppShell({ session, onSessionChange, preferenceState }) {
   const activeDiscoveryPolls = useRef(new Set());
   const handledDiscoveryJobs = useRef(new Set());
 
+  useEffect(() => {
+    if (notice?.source !== "discovery") return undefined;
+    const currentNotice = notice;
+    const timer = window.setTimeout(
+      () => setNotice((current) => current === currentNotice ? null : current),
+      DISCOVERY_NOTICE_DURATION_MS,
+    );
+    return () => window.clearTimeout(timer);
+  }, [notice]);
+
   const setSelectedCampaignId = useCallback((value) => {
     setSelectedCampaignIdState(value);
     if (value) localStorage.setItem("asf_campaign_id", value); else localStorage.removeItem("asf_campaign_id");
@@ -1062,16 +1079,24 @@ function AppShell({ session, onSessionChange, preferenceState }) {
           ? `${job.campaign?.metrics?.channelLeads || 0} validated lead records are ready.`
           : job.error || "The background lead search failed.",
     };
-    setDiscoveryActivity(activity);
+    if (isActive) {
+      setDiscoveryActivity(activity);
+    } else {
+      setDiscoveryActivity((current) => (
+        current?.jobId && current.jobId !== job.jobId && ["QUEUED", "RUNNING"].includes(current.status)
+          ? current
+          : null
+      ));
+    }
     if (job.status === "COMPLETED" && job.campaign && !handledDiscoveryJobs.current.has(job.jobId)) {
       handledDiscoveryJobs.current.add(job.jobId);
       setSelectedCampaignId(job.campaign.campaignId);
       setDetail(job.campaign);
-      setNotice({ tone: "success", text: `${job.campaign.campaignName} completed in the background with ${job.campaign.metrics?.channelLeads || 0} lead records.` });
+      setNotice({ source: "discovery", tone: "success", text: `${job.campaign.campaignName} completed in the background with ${job.campaign.metrics?.channelLeads || 0} lead records.` });
       refresh(true);
     } else if (job.status === "FAILED" && !handledDiscoveryJobs.current.has(job.jobId)) {
       handledDiscoveryJobs.current.add(job.jobId);
-      setNotice({ tone: "danger", text: job.error || "The background lead search failed." });
+      setNotice({ source: "discovery", tone: "danger", text: job.error || "The background lead search failed." });
     }
   }, [refresh, setSelectedCampaignId]);
 
@@ -1099,10 +1124,11 @@ function AppShell({ session, onSessionChange, preferenceState }) {
       const { data } = await axios.get(`${API_BASE}/api/campaigns/intake/jobs?limit=20`, { timeout: 30000 });
       const jobs = data.jobs || [];
       const active = jobs.find((job) => ["QUEUED", "RUNNING"].includes(job.status));
-      const latest = active || jobs[0];
-      if (latest) applyDiscoveryJob(latest);
       if (active) {
+        applyDiscoveryJob(active);
         void pollDiscoveryJob(active.jobId);
+      } else {
+        setDiscoveryActivity((current) => current?.jobId ? null : current);
       }
       return jobs;
     } catch {
@@ -1119,8 +1145,8 @@ function AppShell({ session, onSessionChange, preferenceState }) {
       return data;
     } catch (requestError) {
       const message = errorMessage(requestError);
-      setDiscoveryActivity({ status: "FAILED", completedAt: new Date().toISOString(), message });
-      setNotice({ tone: "danger", text: message });
+      setDiscoveryActivity(null);
+      setNotice({ source: "discovery", tone: "danger", text: message });
       throw requestError;
     }
   }, [applyDiscoveryJob, pollDiscoveryJob]);
