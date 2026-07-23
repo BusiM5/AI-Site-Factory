@@ -981,22 +981,38 @@ def test_discover_leads_accepts_custom_industry_and_search_intent(monkeypatch):
     assert payload["preset"]["id"] == "custom"
     assert payload["preset"]["industry"] == "Solar Energy"
     assert payload["leads"][0]["category"] == "Solar Energy"
-    assert calls == [("commercial solar installers in Cape Town, South Africa", "Cape Town, South Africa", 5)]
+    assert calls == [("commercial solar installers in Cape Town, South Africa", "Cape Town, South Africa", 10)]
 
 
-def test_apify_search_broadens_the_real_query_inside_a_two_minute_budget(monkeypatch):
-    captured = {}
+def test_apify_search_uses_one_focused_query_inside_a_two_minute_budget(monkeypatch):
+    captured = {"posts": [], "gets": []}
 
     def fake_post(url, **kwargs):
-        captured["url"] = url
+        captured["posts"].append(url)
         captured["payload"] = kwargs["json"]
-        captured["timeout"] = kwargs["timeout"]
-        return FakeResponse(payload=[apify_item(121, province="KwaZulu-Natal")])
+        return FakeResponse(
+            payload={
+                "data": {
+                    "id": "run-121",
+                    "defaultDatasetId": "dataset-121",
+                    "status": "RUNNING",
+                }
+            }
+        )
+
+    def fake_get(url, **kwargs):
+        captured["gets"].append(url)
+        if "/actor-runs/run-121" in url:
+            return FakeResponse(payload={"data": {"id": "run-121", "status": "SUCCEEDED"}})
+        if "/datasets/dataset-121/items" in url:
+            return FakeResponse(payload=[apify_item(121, province="KwaZulu-Natal")])
+        raise AssertionError(url)
 
     monkeypatch.setenv("APIFY_API_TOKEN", "test-apify-token")
     monkeypatch.delenv("APIFY_DISCOVERY_BUDGET_SECONDS", raising=False)
     monkeypatch.delenv("APIFY_DISCOVERY_TIMEOUT_SECONDS", raising=False)
     monkeypatch.setattr(main.requests, "post", fake_post)
+    monkeypatch.setattr(main.requests, "get", fake_get)
 
     result = main.run_apify_google_maps(
         "plumbers in Durban, South Africa",
@@ -1005,13 +1021,54 @@ def test_apify_search_broadens_the_real_query_inside_a_two_minute_budget(monkeyp
     )
 
     assert len(result) == 1
-    assert captured["payload"]["searchStringsArray"] == [
-        "plumbers in Durban, South Africa",
-        "plumbers near Durban, South Africa",
-    ]
-    assert captured["timeout"] <= 120
-    assert "timeout=115" in captured["url"]
-    assert "maxItems=100" in captured["url"]
+    assert captured["payload"]["searchStringsArray"] == ["plumbers in Durban, South Africa"]
+    assert captured["payload"]["includeWebResults"] is False
+    assert captured["payload"]["maxCrawledPlacesPerSearch"] == 100
+    assert len(captured["posts"]) == 1
+    assert "/runs?timeout=105" in captured["posts"][0]
+    assert any("/actor-runs/run-121?waitForFinish=" in url for url in captured["gets"])
+    assert any("/datasets/dataset-121/items?clean=true&format=json&limit=100" in url for url in captured["gets"])
+
+
+def test_apify_search_returns_verified_partial_dataset_when_actor_times_out(monkeypatch):
+    calls = {"posts": 0}
+
+    def fake_post(_url, **_kwargs):
+        calls["posts"] += 1
+        return FakeResponse(
+            payload={
+                "data": {
+                    "id": "run-partial",
+                    "defaultDatasetId": "dataset-partial",
+                    "status": "RUNNING",
+                }
+            }
+        )
+
+    def fake_get(url, **_kwargs):
+        if "/actor-runs/run-partial" in url:
+            return FakeResponse(
+                payload={
+                    "data": {
+                        "id": "run-partial",
+                        "status": "TIMED-OUT",
+                        "statusMessage": "Actor reached its time limit.",
+                    }
+                }
+            )
+        if "/datasets/dataset-partial/items" in url:
+            return FakeResponse(payload=[apify_item(122, province="Gauteng")])
+        raise AssertionError(url)
+
+    monkeypatch.setenv("APIFY_API_TOKEN", "test-apify-token")
+    monkeypatch.setattr(main.requests, "post", fake_post)
+    monkeypatch.setattr(main.requests, "get", fake_get)
+
+    result = main.run_apify_google_maps("dentists in Johannesburg, South Africa", 20, "Johannesburg, South Africa")
+
+    assert calls["posts"] == 1
+    assert len(result) == 1
+    assert result[0]["title"] == "Lead Business 122"
 
 
 def test_custom_discovery_requires_industry_and_search_intent():

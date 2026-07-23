@@ -4401,11 +4401,7 @@ def build_google_maps_query(preset: Dict[str, Any], location: str, custom_query:
 
 def apify_google_maps_search_variants(query: str) -> List[str]:
     primary = compact_text(query)
-    variants = [primary] if primary else []
-    intent, separator, location = primary.rpartition(" in ")
-    if separator and intent and location:
-        variants.append(f"{intent} near {location}")
-    return list(dict.fromkeys(value for value in variants if value))
+    return [primary] if primary else []
 
 
 def run_apify_google_maps(query: str, limit: int, location: str = "South Africa") -> List[Dict[str, Any]]:
@@ -4413,7 +4409,7 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
     actor_id = os.getenv("APIFY_GOOGLE_MAPS_ACTOR_ID", "compass/crawler-google-places").replace("/", "~")
     max_items = max(limit, 5)
     country_code = infer_country_code(location)
-    search_variants = apify_google_maps_search_variants(query)
+    search_terms = apify_google_maps_search_variants(query)
 
     log_event(
         "info",
@@ -4424,88 +4420,90 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
         limit=max_items,
         actorId=actor_id,
         countryCode=country_code,
-        searchVariantCount=len(search_variants),
+        searchVariantCount=len(search_terms),
     )
 
     total_budget = max(90, min(int(os.getenv("APIFY_DISCOVERY_BUDGET_SECONDS", "120")), 120))
-    provider_timeout = max(
-        85,
-        min(
-            int(os.getenv("APIFY_DISCOVERY_TIMEOUT_SECONDS", "115")),
-            115,
-            total_budget - 3,
-        ),
+    actor_timeout = max(
+        75,
+        min(int(os.getenv("APIFY_DISCOVERY_TIMEOUT_SECONDS", "105")), 105, total_budget - 15),
     )
     deadline = time.monotonic() + total_budget
-
-    def provider_request(payload: Dict[str, Any]):
-        remaining = deadline - time.monotonic()
-        if remaining <= 2:
-            raise TimeoutError("The two-minute Apify discovery budget was exhausted.")
-        actor_timeout = max(1, min(provider_timeout, int(remaining - 1)))
-        request_timeout = max(2.0, min(float(actor_timeout + 2), remaining))
-        url = (
-            f"https://api.apify.com/v2/actors/{actor_id}/run-sync-get-dataset-items"
-            f"?clean=true&format=json&timeout={actor_timeout}&maxItems={max_items}"
-        )
-        return requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=request_timeout,
-        )
-
-    payload = {
-        "searchStringsArray": search_variants,
-        "language": "en",
-        "maxCrawledPlacesPerSearch": max_items,
-        "includeWebResults": True,
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
     }
 
-    # Some Google Maps actors support country/location fields; if unsupported, we retry safely below.
-    if country_code:
-        payload["countryCode"] = country_code
-        payload["locationQuery"] = location
+    payload = {
+        "searchStringsArray": search_terms,
+        "language": "en",
+        "maxCrawledPlacesPerSearch": max_items,
+        "includeWebResults": False,
+    }
 
-    response = provider_request(payload)
+    start_response = requests.post(
+        f"https://api.apify.com/v2/actors/{actor_id}/runs?timeout={actor_timeout}",
+        headers=headers,
+        json=payload,
+        timeout=20,
+    )
+    start_response.raise_for_status()
+    start_payload = start_response.json()
+    run = start_payload.get("data", start_payload) if isinstance(start_payload, dict) else {}
+    run_id = compact_text(run.get("id"))
+    dataset_id = compact_text(run.get("defaultDatasetId"))
+    status = compact_text(run.get("status")).upper()
+    status_message = compact_text(run.get("statusMessage"))
+    if not run_id or not dataset_id:
+        raise RuntimeError("Apify did not return a run ID and dataset ID.")
 
-    if response.status_code == 400:
-        log_event(
-            "warning",
-            "provider.apify.retry_minimal_payload",
-            "Apify rejected the extended payload. Retrying with minimal payload.",
-            query=query,
-            statusCode=response.status_code,
-            responseText=response.text[:500],
+    terminal_statuses = {"SUCCEEDED", "FAILED", "ABORTED", "TIMED-OUT"}
+    while status not in terminal_statuses and deadline - time.monotonic() > 12:
+        remaining = deadline - time.monotonic()
+        wait_seconds = max(1, min(10, int(remaining - 10)))
+        run_response = requests.get(
+            f"https://api.apify.com/v2/actor-runs/{run_id}?waitForFinish={wait_seconds}",
+            headers=headers,
+            timeout=wait_seconds + 3,
         )
-        minimal_payload = {
-            "searchStringsArray": search_variants,
-            "language": "en",
-            "maxCrawledPlacesPerSearch": max_items,
-            "includeWebResults": True,
-        }
-        response = provider_request(minimal_payload)
+        run_response.raise_for_status()
+        run_payload = run_response.json()
+        run = run_payload.get("data", run_payload) if isinstance(run_payload, dict) else {}
+        status = compact_text(run.get("status")).upper()
+        status_message = compact_text(run.get("statusMessage"))
 
-    response.raise_for_status()
+    remaining = deadline - time.monotonic()
+    if remaining <= 2:
+        raise TimeoutError("The two-minute Apify discovery budget was exhausted before its dataset could be read.")
+
+    dataset_response = requests.get(
+        f"https://api.apify.com/v2/datasets/{dataset_id}/items"
+        f"?clean=true&format=json&limit={max_items}",
+        headers=headers,
+        timeout=max(2.0, min(10.0, remaining)),
+    )
+    dataset_response.raise_for_status()
+    data = dataset_response.json()
+    if isinstance(data, dict) and isinstance(data.get("data"), list):
+        data = data["data"]
+    elif isinstance(data, dict) and isinstance(data.get("items"), list):
+        data = data["items"]
+    items = data if isinstance(data, list) else []
+
+    if not items and status in {"FAILED", "ABORTED", "TIMED-OUT"}:
+        detail = f": {status_message}" if status_message else ""
+        raise RuntimeError(f"Apify actor ended with status {status}{detail}")
 
     log_event(
         "info",
         "provider.apify.finish",
         "Apify returned Google Maps items.",
-        statusCode=response.status_code,
+        runId=run_id,
+        runStatus=status or "UNKNOWN",
+        itemCount=len(items),
+        partial=status != "SUCCEEDED",
     )
-
-    data = response.json()
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict) and isinstance(data.get("data"), list):
-        return data["data"]
-    if isinstance(data, dict) and isinstance(data.get("items"), list):
-        return data["items"]
-    return []
+    return items
 
 
 def item_matches_requested_location(
@@ -10129,7 +10127,7 @@ def discover_leads(request: DiscoverLeadsRequest):
     preset = resolve_lead_preset(request.presetId, request.industry, request.query)
     location = compact_text(request.location, "Durban, South Africa")
     limit = max(1, min(int(request.limit or 5), 100))
-    apify_limit = min(max(limit * 5, 5), 250)
+    apify_limit = min(max(limit * 2, 10), 100)
     primary_query = build_google_maps_query(preset, location, request.query)
 
     if not request.forceRefresh:
