@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from uuid import NAMESPACE_URL, uuid4, uuid5
 import base64
@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 import time
 import zipfile
 from urllib.parse import urlparse
@@ -66,6 +67,9 @@ API_SAFETY_CHECK_RESULTS: Dict[str, Dict[str, Any]] = {}
 ADMIN_SESSION_COOKIE = "asf_admin_session"
 ADMIN_LOGIN_ATTEMPTS: Dict[str, List[float]] = {}
 ADMIN_SESSION_MAX_AGE_SECONDS = int(os.getenv("ADMIN_SESSION_MAX_AGE_SECONDS", str(8 * 60 * 60)))
+BACKGROUND_JOB_LOCK = threading.Lock()
+ACTIVE_CAMPAIGN_INTAKE_JOBS: Set[str] = set()
+ACTIVE_CAMPAIGN_IMPORT_JOBS: Set[str] = set()
 
 
 def admin_auth_settings() -> Dict[str, Any]:
@@ -1336,7 +1340,7 @@ class DiscoverLeadsRequest(BaseModel):
     industry: Optional[str] = None
     location: str = "South Africa"
     query: Optional[str] = None
-    limit: int = 3
+    limit: int = Field(default=3, ge=1, le=100)
     forceRefresh: bool = False
 
 
@@ -1346,7 +1350,7 @@ class CampaignIntakeRequest(BaseModel):
     industry: Optional[str] = None
     location: str = "South Africa"
     query: Optional[str] = None
-    limit: int = Field(default=10, ge=1)
+    limit: int = Field(default=10, ge=1, le=100)
     channels: List[str] = Field(default_factory=lambda: ["email", "phone"])
     forceRefresh: bool = True
     syncZendesk: bool = True
@@ -1645,7 +1649,14 @@ def normalize_domain(value: Optional[str]) -> Optional[str]:
 
 def normalize_email_identity(value: Optional[str]) -> Optional[str]:
     email = compact_text(value).lower()
-    return email if email and "@" in email else None
+    if not email or len(email) > 254:
+        return None
+    if not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", email):
+        return None
+    local_part, domain = email.rsplit("@", 1)
+    if len(local_part) > 64 or ".." in email or domain.endswith((".invalid", ".localhost")):
+        return None
+    return email
 
 
 def normalize_phone_identity(value: Optional[str]) -> Optional[str]:
@@ -1730,9 +1741,6 @@ def is_qualified_discovery_lead(lead: DiscoveredLead) -> bool:
 
 SOUTH_AFRICA_TERMS = [
     "south africa",
-    "za",
-    "zaf",
-    ".co.za",
     "gauteng",
     "kwazulu-natal",
     "kwazulu natal",
@@ -1830,6 +1838,7 @@ PIPELINE_SEED_ANCHOR_TABLES = [
 
 PIPELINE_DATA_CLEANUP_VERSION = "demo-reset-2026-07-17-v1"
 PIPELINE_OPERATIONAL_TABLES = [
+    "campaign_intake_jobs",
     "campaign_import_items",
     "campaign_import_jobs",
     "campaign_lead_identity_claims",
@@ -1993,6 +2002,25 @@ def init_pipeline_db() -> None:
                 completed_at TEXT,
                 FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS campaign_intake_jobs (
+                id TEXT PRIMARY KEY,
+                request_json TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'QUEUED',
+                stage TEXT NOT NULL DEFAULT 'QUEUED',
+                progress_percent REAL NOT NULL DEFAULT 0,
+                campaign_id TEXT,
+                result_json TEXT,
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                started_at TEXT,
+                completed_at TEXT,
+                FOREIGN KEY(campaign_id) REFERENCES campaigns(id) ON DELETE SET NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_campaign_intake_jobs_status
+            ON campaign_intake_jobs(status, created_at);
 
             CREATE TABLE IF NOT EXISTS campaign_import_items (
                 id TEXT PRIMARY KEY,
@@ -2310,6 +2338,12 @@ def init_pipeline_db() -> None:
             """
         )
         ensure_db_column(db, "campaigns", "idempotency_key", "idempotency_key TEXT")
+        ensure_db_column(
+            db,
+            "campaign_import_jobs",
+            "background_requested",
+            "background_requested INTEGER NOT NULL DEFAULT 0",
+        )
         ensure_db_column(db, "zendesk_ticket_links", "external_id", "external_id TEXT")
         db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_campaigns_idempotency_key "
@@ -2751,12 +2785,12 @@ def lead_identity_conflicts(lead: DiscoveredLead, canonical_key: str) -> Dict[st
 
 
 def lead_has_contact(lead: DiscoveredLead) -> bool:
-    return bool(normalize_email_identity(lead.email) or compact_text(lead.phone))
+    return bool(normalize_email_identity(lead.email) or normalize_phone_identity(lead.phone))
 
 
 def lead_contact_bucket(lead: DiscoveredLead) -> str:
     has_email = bool(normalize_email_identity(lead.email))
-    has_phone = bool(compact_text(lead.phone))
+    has_phone = bool(normalize_phone_identity(lead.phone))
     if has_email and has_phone:
         return "email_phone"
     if has_email:
@@ -2843,24 +2877,23 @@ def select_mixed_contact_leads(leads: List[DiscoveredLead], limit: int) -> List[
 def mixed_channel_counts(leads: List[DiscoveredLead]) -> Dict[str, int]:
     return {
         "emailLeads": sum(1 for lead in leads if normalize_email_identity(lead.email)),
-        "phoneLeads": sum(1 for lead in leads if compact_text(lead.phone)),
+        "phoneLeads": sum(1 for lead in leads if normalize_phone_identity(lead.phone)),
         "emailAndPhoneLeads": sum(
-            1 for lead in leads if normalize_email_identity(lead.email) and compact_text(lead.phone)
+            1 for lead in leads if normalize_email_identity(lead.email) and normalize_phone_identity(lead.phone)
         ),
     }
 
 
-def require_mixed_contact_channels(leads: List[DiscoveredLead], source_label: str) -> Dict[str, int]:
+def require_contactable_leads(leads: List[DiscoveredLead], source_label: str) -> Dict[str, int]:
     counts = mixed_channel_counts(leads)
-    if counts["emailLeads"] < 1 or counts["phoneLeads"] < 1:
-        missing = "email" if counts["emailLeads"] < 1 else "phone"
+    if counts["emailLeads"] < 1 and counts["phoneLeads"] < 1:
         raise HTTPException(
             status_code=422,
             detail={
-                "code": "MIXED_LEADS_REQUIRED",
+                "code": "CONTACTABLE_LEADS_REQUIRED",
                 "message": (
-                    f"{source_label} does not contain a mixed contact set. Add at least one valid {missing} lead "
-                    "so the campaign can create both Email and Call channel records."
+                    f"{source_label} does not contain any valid contact details. "
+                    "Include at least one real email address or phone number."
                 ),
                 **counts,
             },
@@ -4345,7 +4378,13 @@ if env_enabled("ENABLE_LEGACY_CAMPAIGN_BACKFILL"):
 
 def infer_country_code(location: str) -> Optional[str]:
     location_lower = compact_text(location).lower()
-    if "south africa" in location_lower or any(term in location_lower for term in SOUTH_AFRICA_TERMS):
+    location_tokens = set(re.findall(r"[a-z]+", location_lower))
+    if (
+        "south africa" in location_lower
+        or location_lower.strip() in {"za", "zaf"}
+        or bool({"za", "zaf"}.intersection(location_tokens))
+        or any(term in location_lower for term in SOUTH_AFRICA_TERMS)
+    ):
         return "za"
     return None
 
@@ -4360,11 +4399,21 @@ def build_google_maps_query(preset: Dict[str, Any], location: str, custom_query:
     return f"{query_term} in {location_term}"
 
 
+def apify_google_maps_search_variants(query: str) -> List[str]:
+    primary = compact_text(query)
+    variants = [primary] if primary else []
+    intent, separator, location = primary.rpartition(" in ")
+    if separator and intent and location:
+        variants.append(f"{intent} near {location}")
+    return list(dict.fromkeys(value for value in variants if value))
+
+
 def run_apify_google_maps(query: str, limit: int, location: str = "South Africa") -> List[Dict[str, Any]]:
     token = require_env("APIFY_API_TOKEN")
     actor_id = os.getenv("APIFY_GOOGLE_MAPS_ACTOR_ID", "compass/crawler-google-places").replace("/", "~")
     max_items = max(limit, 5)
     country_code = infer_country_code(location)
+    search_variants = apify_google_maps_search_variants(query)
 
     log_event(
         "info",
@@ -4375,15 +4424,42 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
         limit=max_items,
         actorId=actor_id,
         countryCode=country_code,
+        searchVariantCount=len(search_variants),
     )
 
-    url = (
-        f"https://api.apify.com/v2/actors/{actor_id}/run-sync-get-dataset-items"
-        f"?clean=true&format=json&timeout=180&maxItems={max_items}"
+    total_budget = max(15, min(int(os.getenv("APIFY_DISCOVERY_BUDGET_SECONDS", "58")), 58))
+    provider_timeout = max(
+        10,
+        min(
+            int(os.getenv("APIFY_DISCOVERY_TIMEOUT_SECONDS", "55")),
+            55,
+            total_budget - 3,
+        ),
     )
+    deadline = time.monotonic() + total_budget
+
+    def provider_request(payload: Dict[str, Any]):
+        remaining = deadline - time.monotonic()
+        if remaining <= 2:
+            raise TimeoutError("The one-minute Apify discovery budget was exhausted.")
+        actor_timeout = max(1, min(provider_timeout, int(remaining - 1)))
+        request_timeout = max(2.0, min(float(actor_timeout + 2), remaining))
+        url = (
+            f"https://api.apify.com/v2/actors/{actor_id}/run-sync-get-dataset-items"
+            f"?clean=true&format=json&timeout={actor_timeout}&maxItems={max_items}"
+        )
+        return requests.post(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=request_timeout,
+        )
 
     payload = {
-        "searchStringsArray": [query],
+        "searchStringsArray": search_variants,
         "language": "en",
         "maxCrawledPlacesPerSearch": max_items,
         "includeWebResults": True,
@@ -4394,15 +4470,7 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
         payload["countryCode"] = country_code
         payload["locationQuery"] = location
 
-    response = requests.post(
-        url,
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=540,
-    )
+    response = provider_request(payload)
 
     if response.status_code == 400:
         log_event(
@@ -4414,20 +4482,12 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
             responseText=response.text[:500],
         )
         minimal_payload = {
-            "searchStringsArray": [query],
+            "searchStringsArray": search_variants,
             "language": "en",
             "maxCrawledPlacesPerSearch": max_items,
             "includeWebResults": True,
         }
-        response = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            },
-            json=minimal_payload,
-            timeout=540,
-        )
+        response = provider_request(minimal_payload)
 
     response.raise_for_status()
 
@@ -4486,7 +4546,14 @@ def item_matches_requested_location(
         ]
     ).lower()
 
-    if "south africa" in requested or any(term in requested for term in SOUTH_AFRICA_TERMS):
+    requested_tokens = set(re.findall(r"[a-z]+", requested))
+    south_africa_requested = (
+        "south africa" in requested
+        or requested.strip() in {"za", "zaf"}
+        or bool({"za", "zaf"}.intersection(requested_tokens))
+        or any(term in requested for term in SOUTH_AFRICA_TERMS)
+    )
+    if south_africa_requested:
         if country_value in ["za", "zaf", "south africa"]:
             return True
         if domain and ".co.za" in domain.lower():
@@ -4526,7 +4593,7 @@ def normalize_apify_items(
             continue
 
         website = normalize_url(first_present(item, ["website", "site", "homepage"]))
-        domain = domain_from_url(website)
+        domain = normalize_domain(first_present(item, ["domain", "websiteDomain", "website_domain"]) or domain_from_url(website))
         address = first_present(item, ["address", "street", "fullAddress", "formattedAddress"])
         phone = first_present(item, ["phone", "phoneUnformatted", "contactPhone", "telephone"])
         email = extract_email_from_item(item)
@@ -10061,8 +10128,8 @@ def get_site_templates():
 def discover_leads(request: DiscoverLeadsRequest):
     preset = resolve_lead_preset(request.presetId, request.industry, request.query)
     location = compact_text(request.location, "Durban, South Africa")
-    limit = max(1, request.limit or 5)
-    apify_limit = max(limit * 5, 5)
+    limit = max(1, min(int(request.limit or 5), 100))
+    apify_limit = min(max(limit * 5, 5), 250)
     primary_query = build_google_maps_query(preset, location, request.query)
 
     if not request.forceRefresh:
@@ -10168,45 +10235,23 @@ def discover_leads(request: DiscoverLeadsRequest):
         selected_leads = select_mixed_contact_leads(eligible_leads, limit)
 
     except Exception as error:
-        warnings.append(f"Apify failed, demo fallback leads were used: {sanitize_message(error)}")
-
-        demo_category = preset.get("industry", "Local Service")
-        demo_businesses = [
-            f"{location.split(',')[0]} {demo_category} Co",
-            f"Reliable {demo_category} Durban",
-            f"Quick Help {demo_category}",
-        ]
-
-        fallback_identities: Set[str] = set()
-        for index, business_name in enumerate(demo_businesses[:limit], start=1):
-            lead = DiscoveredLead(
-                leadKey=stable_lead_key(business_name, location, demo_category),
-                canonicalLeadKey=stable_lead_key("demo", business_name, location, demo_category),
-                businessName=business_name,
-                email=f"demo{index}@example.com",
-                phone=f"+27 31 000 {index:04d}",
-                website=None,
-                domain=None,
-                category=demo_category,
-                address=location,
-                location=location,
-                province=None,
-                rating=None,
-                reviewsCount=None,
-                source="demo-fallback",
-                sourceUrl=None,
-                notes="Demo fallback lead used because the live Apify request failed or timed out.",
-                raw={"fallback": True},
-            )
-            identity_keys = {identity_key for _identity_type, identity_key in lead_identity_pairs(lead)}
-            if generated_lead_identity_conflicts(lead, lead.canonicalLeadKey or "") or identity_keys.intersection(fallback_identities):
-                duplicates_skipped += 1
-                province_stats[location]["duplicatesSkipped"] += 1
-                continue
-            fallback_identities.update(identity_keys)
-            selected_leads.append(lead)
-        raw_fetched = len(selected_leads)
-        eligible_leads = selected_leads[:]
+        message = sanitize_message(error)
+        log_event(
+            "error",
+            "leads.discover.provider_failed",
+            "Apify lead discovery failed. No fallback contacts were generated.",
+            error=message,
+            query=primary_query,
+            location=location,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "code": "APIFY_DISCOVERY_FAILED",
+                "message": "Apify could not complete the lead search within one minute. No contacts were invented; retry the search.",
+                "providerError": message,
+            },
+        ) from error
 
     for lead in selected_leads:
         try:
@@ -10217,11 +10262,11 @@ def discover_leads(request: DiscoverLeadsRequest):
     province_stats[location]["selected"] = len(selected_leads)
     province_stats[location]["eligible"] = len(eligible_leads)
     province_stats[location]["emailLeads"] = sum(1 for lead in selected_leads if normalize_email_identity(lead.email))
-    province_stats[location]["phoneLeads"] = sum(1 for lead in selected_leads if compact_text(lead.phone))
+    province_stats[location]["phoneLeads"] = sum(1 for lead in selected_leads if normalize_phone_identity(lead.phone))
     province_stats[location]["emailAndPhoneLeads"] = sum(
         1
         for lead in selected_leads
-        if normalize_email_identity(lead.email) and compact_text(lead.phone)
+        if normalize_email_identity(lead.email) and normalize_phone_identity(lead.phone)
     )
 
     if not selected_leads:
@@ -11620,6 +11665,8 @@ def campaign_request_idempotency_key(request: CampaignIntakeRequest, channels: L
     supplied = compact_text(request.idempotencyKey)
     if supplied:
         material = f"request:{supplied}"
+    elif request.forceRefresh and "forceRefresh" in request.model_fields_set:
+        material = f"force-refresh:{uuid4()}"
     else:
         material = json.dumps(
             {
@@ -11631,6 +11678,7 @@ def campaign_request_idempotency_key(request: CampaignIntakeRequest, channels: L
                 "limit": int(request.limit),
                 "channels": sorted(channels),
                 "autoGenerateMetadata": bool(request.autoGenerateMetadata),
+                "forceRefresh": bool(request.forceRefresh),
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -12122,7 +12170,16 @@ def normalize_uploaded_lead(
     )
     phone_text = uploaded_row_value(
         row,
-        ["phone", "phoneNumber", "phone_number", "contactPhone", "contact_phone", "telephone"],
+        [
+            "phone",
+            "phoneUnformatted",
+            "phone_unformatted",
+            "phoneNumber",
+            "phone_number",
+            "contactPhone",
+            "contact_phone",
+            "telephone",
+        ],
     )
     phone = extract_phone_from_text(phone_text or "") or phone_text
     website = normalize_url(uploaded_row_value(row, ["website", "websiteUrl", "website_url"]))
@@ -12192,6 +12249,7 @@ def campaign_import_job_summary(row: sqlite3.Row, include_campaign: bool = True)
         "progressPercent": round((processed / total) * 100, 1) if total else 0,
         "chunkSize": row["chunk_size"],
         "channels": safe_json_loads(row["channels_json"], []),
+        "backgroundRequested": bool(row["background_requested"]),
         "error": row["error"],
         "errors": safe_json_loads(row["errors_json"], []),
         "createdAt": row["created_at"],
@@ -12330,6 +12388,8 @@ def ensure_uploaded_campaign_lead(
     lead: DiscoveredLead,
     channels: List[str],
 ) -> Dict[str, Any]:
+    if lead_has_website(lead):
+        raise ValueError("The row has a website or domain and is not eligible for the no-website campaign.")
     canonical_key = lead.canonicalLeadKey or canonical_lead_key_for_lead(lead)
     pipeline_id = campaign["id"]
     timestamp = now_iso()
@@ -12359,7 +12419,7 @@ def ensure_uploaded_campaign_lead(
     available: List[str] = []
     if normalize_email_identity(lead.email) and "email" in channels:
         available.append("email")
-    if compact_text(lead.phone) and "phone" in channels:
+    if normalize_phone_identity(lead.phone) and "phone" in channels:
         available.append("phone")
     if not available:
         raise ValueError("The row has no email or phone value for the selected campaign channels.")
@@ -12580,13 +12640,19 @@ def list_campaign_imports(limit: int = 20):
         rows = db.execute(
             "SELECT * FROM campaign_import_jobs ORDER BY created_at DESC LIMIT ?", (safe_limit,)
         ).fetchall()
+    for row in rows:
+        if row["background_requested"] and row["status"] not in {"COMPLETED", "FAILED"}:
+            schedule_campaign_import_job(row["id"])
     return {"jobs": [campaign_import_job_summary(row, include_campaign=False) for row in rows]}
 
 
 @app.get("/api/campaigns/imports/{job_id}")
 def get_campaign_import(job_id: str):
     require_zendesk_workspace_ready()
-    return campaign_import_job_summary(get_campaign_import_job_or_404(job_id))
+    job = get_campaign_import_job_or_404(job_id)
+    if job["background_requested"] and job["status"] not in {"COMPLETED", "FAILED"}:
+        schedule_campaign_import_job(job_id)
+    return campaign_import_job_summary(job)
 
 
 @app.post("/api/campaigns/import")
@@ -12598,6 +12664,7 @@ async def create_campaign_import(
     channels: str = Form("email,phone"),
     chunkSize: int = Form(5),
     autoGenerateMetadata: bool = Form(False),
+    background: bool = Form(False),
 ):
     require_zendesk_workspace_ready()
     campaign_name = compact_text(campaignName)
@@ -12617,17 +12684,17 @@ async def create_campaign_import(
     preview_leads: List[DiscoveredLead] = []
     for row_number, raw_row in enumerate(rows, start=1):
         try:
-            preview_leads.append(
-                normalize_uploaded_lead(
-                    raw_row,
-                    row_number,
-                    compact_text(industry, "Local service"),
-                    compact_text(location, "South Africa"),
-                )
+            preview_lead = normalize_uploaded_lead(
+                raw_row,
+                row_number,
+                compact_text(industry, "Local service"),
+                compact_text(location, "South Africa"),
             )
+            if not lead_has_website(preview_lead) and lead_has_contact(preview_lead):
+                preview_leads.append(preview_lead)
         except ValueError:
             continue
-    mixed_counts = require_mixed_contact_channels(preview_leads, "The uploaded lead file")
+    mixed_counts = require_contactable_leads(preview_leads, "The uploaded lead file")
     metadata_suggestion = suggest_campaign_metadata(
         preview_leads,
         compact_text(location, "South Africa"),
@@ -12651,8 +12718,17 @@ async def create_campaign_import(
             (idempotency_key,),
         ).fetchone()
     if existing_job:
+        if background and not existing_job["background_requested"]:
+            with get_pipeline_db() as db:
+                db.execute(
+                    "UPDATE campaign_import_jobs SET background_requested = 1, updated_at = ? WHERE id = ?",
+                    (now_iso(), existing_job["id"]),
+                )
+            existing_job = get_campaign_import_job_or_404(existing_job["id"])
         result = campaign_import_job_summary(existing_job)
         result["idempotentReplay"] = True
+        if background and existing_job["status"] not in {"COMPLETED", "FAILED"}:
+            schedule_campaign_import_job(existing_job["id"])
         return result
 
     campaign_id = str(uuid5(NAMESPACE_URL, idempotency_key))
@@ -12682,12 +12758,12 @@ async def create_campaign_import(
             """
             INSERT OR IGNORE INTO campaign_import_jobs (
                 id, campaign_id, file_name, file_path, file_type, status, total_rows,
-                chunk_size, channels_json, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?)
+                chunk_size, channels_json, background_requested, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'QUEUED', ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id, campaign_id, safe_file_name, stored_path, file_type, len(rows),
-                safe_chunk_size, json.dumps(selected_channels), timestamp, timestamp,
+                safe_chunk_size, json.dumps(selected_channels), int(background), timestamp, timestamp,
             ),
         )
         created_job = job_insert.rowcount == 1
@@ -12729,6 +12805,8 @@ async def create_campaign_import(
     result["idempotentReplay"] = False
     result["metadataSuggestion"] = metadata_suggestion
     result["mixedChannelCounts"] = mixed_counts
+    if background:
+        schedule_campaign_import_job(job_id)
     return result
 
 
@@ -12741,6 +12819,15 @@ def process_campaign_import(job_id: str):
     verify_zendesk_ticket_contracts(safe_json_loads(job["channels_json"], ["email", "phone"]))
     with get_pipeline_db() as db:
         db.execute("BEGIN IMMEDIATE")
+        stale_before = (datetime.now() - timedelta(minutes=5)).isoformat()
+        db.execute(
+            """
+            UPDATE campaign_import_items
+            SET status = 'PENDING', updated_at = ?
+            WHERE job_id = ? AND status = 'PROCESSING' AND updated_at < ?
+            """,
+            (now_iso(), job_id, stale_before),
+        )
         campaign = db.execute("SELECT * FROM campaigns WHERE id = ?", (job["campaign_id"],)).fetchone()
         items = db.execute(
             """
@@ -12783,13 +12870,22 @@ def process_campaign_import(job_id: str):
                     ),
                 )
         except Exception as error:
-            attempts = 3 if isinstance(error, ValueError) else (item["attempts"] or 0) + 1
+            validation_error = isinstance(error, ValueError)
+            attempts = 3 if validation_error else (item["attempts"] or 0) + 1
+            item_status = "SKIPPED" if validation_error else "FAILED"
             with get_pipeline_db() as db:
                 db.execute(
-                    "UPDATE campaign_import_items SET status = 'FAILED', attempts = ?, error = ?, updated_at = ? WHERE id = ?",
-                    (attempts, sanitize_message(error), now_iso(), item["id"]),
+                    "UPDATE campaign_import_items SET status = ?, attempts = ?, error = ?, updated_at = ? WHERE id = ?",
+                    (item_status, attempts, sanitize_message(error), now_iso(), item["id"]),
                 )
-            log_event("error", "campaign.import.row_failed", str(error), jobId=job_id, row=item["row_number"], attempts=attempts)
+            log_event(
+                "warning" if validation_error else "error",
+                "campaign.import.row_skipped" if validation_error else "campaign.import.row_failed",
+                str(error),
+                jobId=job_id,
+                row=item["row_number"],
+                attempts=attempts,
+            )
     return refresh_campaign_import_job(job_id)
 
 
@@ -12808,7 +12904,58 @@ def retry_campaign_import(job_id: str):
             "UPDATE campaign_import_jobs SET status = 'QUEUED', error = NULL, completed_at = NULL, updated_at = ? WHERE id = ?",
             (now_iso(), job_id),
         )
-    return campaign_import_job_summary(get_campaign_import_job_or_404(job_id))
+    refreshed = get_campaign_import_job_or_404(job_id)
+    if refreshed["background_requested"]:
+        schedule_campaign_import_job(job_id)
+    return campaign_import_job_summary(refreshed)
+
+
+def run_campaign_import_background(job_id: str) -> None:
+    try:
+        while True:
+            job = get_campaign_import_job_or_404(job_id)
+            if job["status"] in {"COMPLETED", "FAILED"}:
+                return
+            before = int(job["processed_rows"] or 0)
+            result = process_campaign_import(job_id)
+            if result["status"] in {"COMPLETED", "FAILED"}:
+                return
+            if int(result.get("processedRows") or 0) == before:
+                time.sleep(1.5)
+    except Exception as error:
+        message = sanitize_message(error)
+        with get_pipeline_db() as db:
+            db.execute(
+                """
+                UPDATE campaign_import_jobs
+                SET status = 'FAILED', error = ?, updated_at = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (message, now_iso(), now_iso(), job_id),
+            )
+        log_event("error", "campaign.import.background_failed", message, jobId=job_id)
+    finally:
+        with BACKGROUND_JOB_LOCK:
+            ACTIVE_CAMPAIGN_IMPORT_JOBS.discard(job_id)
+
+
+def schedule_campaign_import_job(job_id: str) -> bool:
+    with get_pipeline_db() as db:
+        job = db.execute("SELECT * FROM campaign_import_jobs WHERE id = ?", (job_id,)).fetchone()
+    if not job or not job["background_requested"] or job["status"] in {"COMPLETED", "FAILED"}:
+        return False
+    with BACKGROUND_JOB_LOCK:
+        if job_id in ACTIVE_CAMPAIGN_IMPORT_JOBS:
+            return False
+        ACTIVE_CAMPAIGN_IMPORT_JOBS.add(job_id)
+    worker = threading.Thread(
+        target=run_campaign_import_background,
+        args=(job_id,),
+        name=f"campaign-import-{job_id[:8]}",
+        daemon=True,
+    )
+    worker.start()
+    return True
 
 
 @app.get("/api/campaigns/{campaign_id}")
@@ -13142,7 +13289,7 @@ def create_campaign_intake(request: CampaignIntakeRequest):
             forceRefresh=request.forceRefresh,
         )
     )
-    mixed_counts = require_mixed_contact_channels(discovery.leads, "The Apify search result")
+    mixed_counts = require_contactable_leads(discovery.leads, "The Apify search result")
     metadata_suggestion = suggest_campaign_metadata(
         discovery.leads,
         discovery.location,
@@ -13184,6 +13331,215 @@ def create_campaign_intake(request: CampaignIntakeRequest):
     result["metadataSuggestion"] = metadata_suggestion
     result["mixedChannelCounts"] = mixed_counts
     return result
+
+
+def campaign_intake_job_summary(row: sqlite3.Row) -> Dict[str, Any]:
+    request_payload = safe_json_loads(row["request_json"], {})
+    result = safe_json_loads(row["result_json"], None)
+    return {
+        "jobId": row["id"],
+        "status": row["status"],
+        "stage": row["stage"],
+        "progressPercent": row["progress_percent"] or 0,
+        "campaignId": row["campaign_id"],
+        "campaign": result,
+        "error": row["error"],
+        "request": {
+            "campaignName": request_payload.get("campaignName"),
+            "presetId": request_payload.get("presetId"),
+            "industry": request_payload.get("industry"),
+            "location": request_payload.get("location"),
+            "query": request_payload.get("query"),
+            "limit": request_payload.get("limit"),
+            "forceRefresh": request_payload.get("forceRefresh"),
+        },
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+        "startedAt": row["started_at"],
+        "completedAt": row["completed_at"],
+    }
+
+
+def get_campaign_intake_job_or_404(job_id: str) -> sqlite3.Row:
+    with get_pipeline_db() as db:
+        row = db.execute("SELECT * FROM campaign_intake_jobs WHERE id = ?", (job_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Campaign intake job not found.")
+    return row
+
+
+def campaign_background_error_message(error: Exception) -> str:
+    if isinstance(error, HTTPException):
+        detail = error.detail
+        if isinstance(detail, dict):
+            return compact_text(detail.get("message"), sanitize_message(detail))
+        return compact_text(detail, sanitize_message(error))
+    return sanitize_message(error)
+
+
+def run_campaign_intake_background(job_id: str) -> None:
+    try:
+        job = get_campaign_intake_job_or_404(job_id)
+        request = CampaignIntakeRequest.model_validate(safe_json_loads(job["request_json"], {}))
+        started_at = now_iso()
+        with get_pipeline_db() as db:
+            db.execute(
+                """
+                UPDATE campaign_intake_jobs
+                SET status = 'RUNNING', stage = 'SEARCHING_AND_CREATING_TICKETS',
+                    progress_percent = 10, error = NULL, started_at = COALESCE(started_at, ?),
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (started_at, started_at, job_id),
+            )
+        result = create_campaign_intake(request)
+        completed_at = now_iso()
+        with get_pipeline_db() as db:
+            db.execute(
+                """
+                UPDATE campaign_intake_jobs
+                SET status = 'COMPLETED', stage = 'COMPLETED', progress_percent = 100,
+                    campaign_id = ?, result_json = ?, error = NULL, updated_at = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (
+                    result.get("campaignId"),
+                    json.dumps(result, default=str),
+                    completed_at,
+                    completed_at,
+                    job_id,
+                ),
+            )
+    except Exception as error:
+        message = campaign_background_error_message(error)
+        completed_at = now_iso()
+        with get_pipeline_db() as db:
+            db.execute(
+                """
+                UPDATE campaign_intake_jobs
+                SET status = 'FAILED', stage = 'FAILED', error = ?, updated_at = ?, completed_at = ?
+                WHERE id = ?
+                """,
+                (message, completed_at, completed_at, job_id),
+            )
+        log_event("error", "campaign.intake.background_failed", message, jobId=job_id)
+    finally:
+        with BACKGROUND_JOB_LOCK:
+            ACTIVE_CAMPAIGN_INTAKE_JOBS.discard(job_id)
+
+
+def schedule_campaign_intake_job(job_id: str) -> bool:
+    job = get_campaign_intake_job_or_404(job_id)
+    if job["status"] in {"COMPLETED", "FAILED"}:
+        return False
+    with BACKGROUND_JOB_LOCK:
+        if job_id in ACTIVE_CAMPAIGN_INTAKE_JOBS:
+            return False
+        ACTIVE_CAMPAIGN_INTAKE_JOBS.add(job_id)
+    worker = threading.Thread(
+        target=run_campaign_intake_background,
+        args=(job_id,),
+        name=f"campaign-intake-{job_id[:8]}",
+        daemon=True,
+    )
+    worker.start()
+    return True
+
+
+@app.post("/api/campaigns/intake/jobs")
+def create_campaign_intake_job(request: CampaignIntakeRequest):
+    require_zendesk_workspace_ready()
+    campaign_name = compact_text(request.campaignName)
+    if not campaign_name and not request.autoGenerateMetadata:
+        raise HTTPException(status_code=400, detail="Campaign name is required.")
+    verify_zendesk_ticket_contracts(["email", "phone"])
+    job_id = str(uuid4())
+    queued_request = request.model_copy(deep=True)
+    if queued_request.forceRefresh and not compact_text(queued_request.idempotencyKey):
+        queued_request.idempotencyKey = f"background:{job_id}"
+    timestamp = now_iso()
+    with get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT INTO campaign_intake_jobs (
+                id, request_json, status, stage, progress_percent, created_at, updated_at
+            ) VALUES (?, ?, 'QUEUED', 'QUEUED', 0, ?, ?)
+            """,
+            (job_id, json.dumps(queued_request.model_dump(), default=str), timestamp, timestamp),
+        )
+    schedule_campaign_intake_job(job_id)
+    return campaign_intake_job_summary(get_campaign_intake_job_or_404(job_id))
+
+
+@app.get("/api/campaigns/intake/jobs")
+def list_campaign_intake_jobs(limit: int = 20):
+    require_zendesk_workspace_ready()
+    safe_limit = max(1, min(limit, 100))
+    with get_pipeline_db() as db:
+        rows = db.execute(
+            "SELECT * FROM campaign_intake_jobs ORDER BY created_at DESC LIMIT ?",
+            (safe_limit,),
+        ).fetchall()
+    for row in rows:
+        if row["status"] in {"QUEUED", "RUNNING"}:
+            schedule_campaign_intake_job(row["id"])
+    return {"jobs": [campaign_intake_job_summary(row) for row in rows]}
+
+
+@app.get("/api/campaigns/intake/jobs/{job_id}")
+def get_campaign_intake_job(job_id: str):
+    require_zendesk_workspace_ready()
+    job = get_campaign_intake_job_or_404(job_id)
+    if job["status"] in {"QUEUED", "RUNNING"}:
+        schedule_campaign_intake_job(job_id)
+    return campaign_intake_job_summary(job)
+
+
+@app.post("/api/campaigns/intake/jobs/{job_id}/retry")
+def retry_campaign_intake_job(job_id: str):
+    require_zendesk_workspace_ready()
+    job = get_campaign_intake_job_or_404(job_id)
+    if job["status"] != "FAILED":
+        return campaign_intake_job_summary(job)
+    timestamp = now_iso()
+    with get_pipeline_db() as db:
+        db.execute(
+            """
+            UPDATE campaign_intake_jobs
+            SET status = 'QUEUED', stage = 'QUEUED', progress_percent = 0,
+                error = NULL, result_json = NULL, campaign_id = NULL,
+                updated_at = ?, started_at = NULL, completed_at = NULL
+            WHERE id = ?
+            """,
+            (timestamp, job_id),
+        )
+    schedule_campaign_intake_job(job_id)
+    return campaign_intake_job_summary(get_campaign_intake_job_or_404(job_id))
+
+
+@app.on_event("startup")
+def resume_campaign_background_jobs_on_startup() -> None:
+    with get_pipeline_db() as db:
+        intake_job_ids = [
+            row["id"]
+            for row in db.execute(
+                "SELECT id FROM campaign_intake_jobs WHERE status IN ('QUEUED', 'RUNNING')"
+            ).fetchall()
+        ]
+        import_job_ids = [
+            row["id"]
+            for row in db.execute(
+                """
+                SELECT id FROM campaign_import_jobs
+                WHERE background_requested = 1 AND status NOT IN ('COMPLETED', 'FAILED')
+                """
+            ).fetchall()
+        ]
+    for job_id in intake_job_ids:
+        schedule_campaign_intake_job(job_id)
+    for job_id in import_job_ids:
+        schedule_campaign_import_job(job_id)
 
 
 @app.post("/api/campaigns/{campaign_id}/sync-zendesk")

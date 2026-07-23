@@ -2,6 +2,7 @@ import base64
 import re
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -983,6 +984,33 @@ def test_discover_leads_accepts_custom_industry_and_search_intent(monkeypatch):
     assert calls == [("commercial solar installers in Cape Town, South Africa", "Cape Town, South Africa", 5)]
 
 
+def test_apify_search_broadens_the_real_query_inside_a_one_minute_budget(monkeypatch):
+    captured = {}
+
+    def fake_post(url, **kwargs):
+        captured["url"] = url
+        captured["payload"] = kwargs["json"]
+        captured["timeout"] = kwargs["timeout"]
+        return FakeResponse(payload=[apify_item(121, province="KwaZulu-Natal")])
+
+    monkeypatch.setenv("APIFY_API_TOKEN", "test-apify-token")
+    monkeypatch.setattr(main.requests, "post", fake_post)
+
+    result = main.run_apify_google_maps(
+        "plumbers in Durban, South Africa",
+        100,
+        "Durban, South Africa",
+    )
+
+    assert len(result) == 1
+    assert captured["payload"]["searchStringsArray"] == [
+        "plumbers in Durban, South Africa",
+        "plumbers near Durban, South Africa",
+    ]
+    assert captured["timeout"] <= 58
+    assert "maxItems=100" in captured["url"]
+
+
 def test_custom_discovery_requires_industry_and_search_intent():
     response = client.post(
         "/api/leads/discover",
@@ -1006,6 +1034,51 @@ def test_discover_force_refresh_can_reuse_discovered_leads(monkeypatch):
     assert len(second.json()["leads"]) == 1
     assert second.json()["leads"][0]["businessName"] == "Lead Business 1"
     assert second.json()["duplicatesSkipped"] == 0
+
+
+def test_discover_provider_failure_never_invents_fallback_contacts(monkeypatch):
+    monkeypatch.setattr(
+        main,
+        "run_apify_google_maps",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("provider unavailable")),
+    )
+
+    response = client.post(
+        "/api/leads/discover",
+        json={
+            "presetId": "plumbers",
+            "location": "Durban, South Africa",
+            "limit": 5,
+            "forceRefresh": True,
+        },
+    )
+
+    assert response.status_code == 502
+    assert response.json()["detail"]["code"] == "APIFY_DISCOVERY_FAILED"
+    with main.get_pipeline_db() as db:
+        assert db.execute("SELECT COUNT(*) FROM lead_registry").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM discovery_batches").fetchone()[0] == 0
+
+
+def test_contact_validation_rejects_malformed_values():
+    assert main.normalize_email_identity("valid.person@example.com") == "valid.person@example.com"
+    assert main.normalize_email_identity("bad@") is None
+    assert main.normalize_email_identity("a@b") is None
+    assert main.normalize_phone_identity("N/A") is None
+    assert main.normalize_phone_identity("+27 31 555 0123") == "27315550123"
+
+
+def test_south_africa_filter_does_not_match_incidental_za_substrings():
+    item = {
+        "title": "Pizza Plaza",
+        "address": "New York, United States",
+        "country": "United States",
+        "phone": "+1 212 555 0123",
+    }
+
+    leads = main.normalize_apify_items([item], "Restaurant", "South Africa", 5)
+
+    assert leads == []
 
 
 def test_discover_filters_out_website_present_leads(monkeypatch):
@@ -4186,16 +4259,17 @@ def test_single_admin_login_protects_api_and_uses_http_only_session(monkeypatch)
         client.cookies.clear()
 
 
-def test_campaign_rejects_single_channel_search_before_zendesk_creation(monkeypatch):
+def test_campaign_accepts_phone_only_search_without_inventing_email(monkeypatch):
     phone_only = apify_item(298, province="KwaZulu-Natal")
     phone_only.pop("email", None)
+    ticket_calls = []
     monkeypatch.setattr(main, "run_apify_google_maps", lambda *args, **kwargs: [phone_only])
     monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
     monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
     monkeypatch.setattr(
         main,
         "create_zendesk_intake_tickets",
-        lambda **kwargs: (_ for _ in ()).throw(AssertionError("Zendesk must not be called for a single-channel result")),
+        lambda **kwargs: ticket_calls.append(kwargs) or [{"ticketId": 8791}],
     )
 
     response = client.post(
@@ -4210,9 +4284,79 @@ def test_campaign_rejects_single_channel_search_before_zendesk_creation(monkeypa
         },
     )
 
-    assert response.status_code == 422
-    assert response.json()["detail"]["code"] == "MIXED_LEADS_REQUIRED"
-    assert response.json()["detail"]["emailLeads"] == 0
+    assert response.status_code == 200, response.text
+    assert response.json()["metrics"]["emailLeads"] == 0
+    assert response.json()["metrics"]["callLeads"] == 1
+    assert response.json()["callLeads"][0]["phone"] == phone_only["phone"]
+    assert len(ticket_calls) == 1
+    assert ticket_calls[0]["requested_channels"] == ["phone"]
+
+
+def test_campaign_search_job_keeps_running_after_the_submitter_moves_away(monkeypatch):
+    phone_only = apify_item(2981, province="KwaZulu-Natal")
+    phone_only.pop("email", None)
+    search_started = threading.Event()
+    release_search = threading.Event()
+
+    def delayed_search(*args, **kwargs):
+        search_started.set()
+        assert release_search.wait(timeout=3)
+        return [phone_only]
+
+    monkeypatch.setattr(main, "run_apify_google_maps", delayed_search)
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
+    monkeypatch.setattr(
+        main,
+        "create_zendesk_intake_tickets",
+        lambda **kwargs: [{"ticketId": 8792}],
+    )
+
+    queued = client.post(
+        "/api/campaigns/intake/jobs",
+        json={
+            "campaignName": "Background phone leads",
+            "presetId": "plumbers",
+            "location": "Durban, South Africa",
+            "limit": 2,
+            "channels": ["email", "phone"],
+            "syncZendesk": True,
+        },
+    )
+
+    try:
+        assert queued.status_code == 200, queued.text
+        assert queued.json()["status"] in {"QUEUED", "RUNNING"}
+        assert search_started.wait(timeout=1)
+        assert client.get("/api/presets").status_code == 200
+    finally:
+        release_search.set()
+
+    job_id = queued.json()["jobId"]
+    result = None
+    for _ in range(100):
+        result = client.get(f"/api/campaigns/intake/jobs/{job_id}").json()
+        if result["status"] in {"COMPLETED", "FAILED"}:
+            break
+        time.sleep(0.02)
+
+    assert result["status"] == "COMPLETED", result
+    assert result["campaign"]["metrics"]["callLeads"] == 1
+    assert result["campaign"]["metrics"]["emailLeads"] == 0
+
+
+def test_explicit_force_refresh_creates_a_new_api_idempotency_key():
+    request = main.CampaignIntakeRequest(
+        campaignName="Fresh search",
+        presetId="plumbers",
+        location="Durban, South Africa",
+        forceRefresh=True,
+    )
+
+    first = main.campaign_request_idempotency_key(request, ["email", "phone"])
+    second = main.campaign_request_idempotency_key(request, ["email", "phone"])
+
+    assert first != second
 
 
 def test_campaign_auto_generates_name_and_industry_from_mixed_results(monkeypatch):
@@ -4465,7 +4609,41 @@ def test_uploaded_campaign_processes_durable_chunks_without_generating_sites(mon
     assert completed["campaign"]["metrics"]["aiGenerations"] == 0
 
 
-def test_uploaded_campaign_can_generate_metadata_and_requires_mixed_contacts(monkeypatch):
+def test_uploaded_campaign_skips_website_rows_without_failing_the_file(monkeypatch):
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
+    ticket_ids = iter([8111, 8112])
+    monkeypatch.setattr(main, "create_zendesk_intake_tickets", lambda **kwargs: [{"ticketId": next(ticket_ids)}])
+    csv_data = (
+        "businessName,email,phone,website,industry,location\n"
+        "Email Lead,email@example.com,,,Plumbing,Durban\n"
+        "Call Lead,,+27 31 555 0123,,Plumbing,Durban\n"
+        "Existing Website,site@example.com,+27 31 555 0199,https://existing.example,Plumbing,Durban\n"
+    )
+
+    queued = client.post(
+        "/api/campaigns/import",
+        data={
+            "campaignName": "No website upload",
+            "industry": "Plumbing",
+            "location": "Durban",
+            "channels": "email,phone",
+            "chunkSize": "10",
+        },
+        files={"file": ("verified-leads.csv", csv_data, "text/csv")},
+    )
+    assert queued.status_code == 200, queued.text
+
+    result = client.post(f"/api/campaigns/imports/{queued.json()['jobId']}/process")
+
+    assert result.status_code == 200, result.text
+    assert result.json()["status"] == "COMPLETED"
+    assert result.json()["succeededRows"] == 2
+    assert result.json()["skippedRows"] == 1
+    assert result.json()["failedRows"] == 0
+
+
+def test_uploaded_campaign_can_generate_metadata_and_accepts_single_contact_channel(monkeypatch):
     monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
     monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
     mixed_csv = (
@@ -4498,13 +4676,90 @@ def test_uploaded_campaign_can_generate_metadata_and_requires_mixed_contacts(mon
     }
 
     email_only_csv = "businessName,email,industry,location\nEmail Only,only@example.com,Plumbing,Durban\n"
-    rejected = client.post(
+    email_only = client.post(
         "/api/campaigns/import",
         data={"campaignName": "Email only", "industry": "Plumbing", "location": "Durban"},
         files={"file": ("email-only.csv", email_only_csv, "text/csv")},
     )
-    assert rejected.status_code == 422
-    assert rejected.json()["detail"]["code"] == "MIXED_LEADS_REQUIRED"
+    assert email_only.status_code == 200, email_only.text
+    assert email_only.json()["mixedChannelCounts"] == {
+        "emailLeads": 1,
+        "phoneLeads": 0,
+        "emailAndPhoneLeads": 0,
+    }
+
+
+def test_apify_google_places_phone_export_uploads_in_the_background(monkeypatch):
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
+    monkeypatch.setattr(
+        main,
+        "create_zendesk_intake_tickets",
+        lambda **kwargs: [{"ticketId": 8120}],
+    )
+    csv_data = (
+        "title,phone,phoneUnformatted,website,url,categoryName,address\n"
+        "No Website Plumbing,,+27 31 555 0188,,https://maps.google.com/place/one,Plumber,\"Durban, South Africa\"\n"
+        "Existing Website,+27 31 555 0199,,https://existing.example,https://maps.google.com/place/two,Plumber,\"Durban, South Africa\"\n"
+    )
+
+    queued = client.post(
+        "/api/campaigns/import",
+        data={
+            "campaignName": "",
+            "industry": "Local service",
+            "location": "South Africa",
+            "channels": "email,phone",
+            "chunkSize": "1",
+            "autoGenerateMetadata": "true",
+            "background": "true",
+        },
+        files={"file": ("dataset_crawler-google-places.csv", csv_data, "text/csv")},
+    )
+
+    assert queued.status_code == 200, queued.text
+    payload = queued.json()
+    assert payload["fileName"] == "dataset_crawler-google-places.csv"
+    assert payload["backgroundRequested"] is True
+    assert payload["mixedChannelCounts"]["emailLeads"] == 0
+    assert payload["mixedChannelCounts"]["phoneLeads"] == 1
+
+    job_id = payload["jobId"]
+    result = None
+    for _ in range(100):
+        result = client.get(f"/api/campaigns/imports/{job_id}").json()
+        if result["status"] in {"COMPLETED", "FAILED"}:
+            break
+        time.sleep(0.02)
+
+    assert result["status"] == "COMPLETED", result
+    assert result["succeededRows"] == 1
+    assert result["skippedRows"] == 1
+    assert result["campaign"]["metrics"]["emailLeads"] == 0
+    assert result["campaign"]["metrics"]["callLeads"] == 1
+
+
+def test_uploaded_file_without_any_contact_details_is_rejected(monkeypatch):
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
+    response = client.post(
+        "/api/campaigns/import",
+        data={
+            "campaignName": "No contacts",
+            "industry": "Plumbing",
+            "location": "Durban",
+        },
+        files={
+            "file": (
+                "no-contacts.csv",
+                "title,website,address\nNo Contact,,Durban\n",
+                "text/csv",
+            )
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["detail"]["code"] == "CONTACTABLE_LEADS_REQUIRED"
 
 
 def test_uploaded_generic_row_ids_do_not_create_distinct_lead_identities():

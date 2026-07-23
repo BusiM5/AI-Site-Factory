@@ -190,7 +190,7 @@ erDiagram
    - leads with an existing website;
    - leads without either phone or email;
    - duplicate/canonical identities already claimed or generated.
-5. The selection algorithm attempts a mixed contact set.
+5. The selection algorithm balances email and phone contacts when both exist, while accepting any lead that has at least one validated email or phone number.
 6. Campaign creation fails if the resulting set lacks an email route or a phone route.
 7. The backend creates approval placeholders but does not generate HTML.
 8. It creates/reuses a Zendesk organization and a business-named end-user requester, then creates separate email and/or phone tickets with the correct form, brand, fields, tags, and private intake note.

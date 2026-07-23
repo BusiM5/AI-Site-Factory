@@ -114,6 +114,8 @@ function formatDate(value) {
   return new Date(value).toLocaleString();
 }
 
+const wait = (milliseconds) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+
 function statusTone(status = "") {
   const value = String(status).toUpperCase();
   if (["DEPLOYED", "APPROVED", "COMPLETED", "REUSED_DEPLOYMENT", "READY", "CONNECTED", "TICKET_READY"].includes(value)) return "success";
@@ -425,7 +427,7 @@ function OverviewPage({ campaigns, totals, onSelectCampaign, reducedMotion = fal
   );
 }
 
-function CampaignForm({ presets, connection, onCreated }) {
+function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign }) {
   const [form, setForm] = useState({
     campaignName: "",
     presetId: presets[0]?.id || "restaurants",
@@ -436,9 +438,9 @@ function CampaignForm({ presets, connection, onCreated }) {
     forceRefresh: true,
     autoGenerateMetadata: true,
   });
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const update = (patch) => setForm((current) => ({ ...current, ...patch }));
+  const busy = ["QUEUED", "RUNNING"].includes(activity?.status);
 
   const submit = async (event) => {
     event.preventDefault();
@@ -447,9 +449,8 @@ function CampaignForm({ presets, connection, onCreated }) {
       setError("Enter both an industry and search intent for a custom campaign.");
       return;
     }
-    setBusy(true);
     try {
-      const { data } = await axios.post(`${API_BASE}/api/campaigns/intake`, {
+      await onLaunch({
         campaignName: form.campaignName,
         presetId: form.presetId,
         industry: form.industry,
@@ -460,13 +461,13 @@ function CampaignForm({ presets, connection, onCreated }) {
         forceRefresh: form.forceRefresh,
         syncZendesk: true,
         autoGenerateMetadata: form.autoGenerateMetadata,
-      }, { timeout: 900000 });
-      onCreated(data);
+        idempotencyKey: form.forceRefresh
+          ? (window.crypto?.randomUUID?.() || `fresh-${Date.now()}-${Math.random().toString(16).slice(2)}`)
+          : null,
+      });
       setForm((current) => ({ ...current, campaignName: "", forceRefresh: true }));
     } catch (requestError) {
       setError(errorMessage(requestError));
-    } finally {
-      setBusy(false);
     }
   };
 
@@ -490,91 +491,55 @@ function CampaignForm({ presets, connection, onCreated }) {
       <div className="form-grid three">
         <label>Industry<input required value={form.industry} onChange={(event) => update({ industry: event.target.value, presetId: "custom" })} placeholder="e.g. Solar energy" /></label>
         <label>Search intent<input required={form.presetId === "custom"} value={form.query} onChange={(event) => update({ query: event.target.value })} placeholder="e.g. commercial solar installers" /><small>{form.presetId === "custom" ? "Required for custom campaigns." : "Optional: refine the selected preset."}</small></label>
-        <label>Lead target<input type="number" min="2" value={form.limit} onChange={(event) => update({ limit: Math.max(2, Number(event.target.value) || 2) })} /><small>The result must contain both email and phone contacts.</small></label>
+        <label>Lead target<input type="number" min="2" max="100" value={form.limit} onChange={(event) => update({ limit: Math.max(2, Math.min(100, Number(event.target.value) || 2)) })} /><small>Choose 2–100 verified, no-website leads. Every accepted lead must have a real email address or phone number.</small></label>
       </div>
       <div className="channel-choice">
-        <label className="checked channel-required"><input type="checkbox" checked readOnly /><Mail size={20} /><span><strong>Email leads required</strong><small>Every campaign includes an email queue</small></span></label>
-        <label className="checked channel-required"><input type="checkbox" checked readOnly /><Phone size={20} /><span><strong>Call leads required</strong><small>Every campaign includes a phone queue</small></span></label>
+        <article className="checked channel-required"><Mail size={20} /><span><strong>Email leads when available</strong><small>Valid email contacts create email queue records</small></span></article>
+        <article className="checked channel-required"><Phone size={20} /><span><strong>Call leads when available</strong><small>Valid phone contacts create call queue records</small></span></article>
       </div>
       <div className="form-options">
-        <label><input type="checkbox" checked readOnly />Create Zendesk intake tickets (required)</label>
         <label><input type="checkbox" checked={form.autoGenerateMetadata} onChange={(event) => update({ autoGenerateMetadata: event.target.checked })} />Generate campaign name and stored industry from results</label>
         <label><input type="checkbox" checked={form.forceRefresh} onChange={(event) => update({ forceRefresh: event.target.checked })} />Force a fresh Apify run</label>
       </div>
-      <div className="mixed-channel-note"><ShieldCheck size={20} /><div><strong>Mixed-channel guarantee</strong><p>The campaign is created only when the search returns at least one valid email lead and one valid phone lead. No contact information is invented.</p></div></div>
+      <div className="required-setting"><TicketCheck size={17} /><span><strong>Zendesk intake is required</strong><small>Tickets are created after Apify returns the verified lead set.</small></span></div>
+      <div className="mixed-channel-note"><ShieldCheck size={20} /><div><strong>Real-contact guarantee</strong><p>Every lead must contain at least one valid email address or phone number. Missing contact channels are never invented.</p></div></div>
       <div className="deferred-note"><Zap size={22} /><div><strong>Cost-safe by design</strong><p>This step finds and tags leads only. Gemini, GitHub, and Netlify are not called until an agent requests deployment.</p></div></div>
+      {activity && <div className={`background-activity ${activity.status.toLowerCase()}`}>
+        <div><strong>{["QUEUED", "RUNNING"].includes(activity.status) ? "Lead search running in the background" : activity.status === "COMPLETED" ? "Lead search completed" : "Lead search needs attention"}</strong><StatusBadge status={activity.status} /></div>
+        <p>{["QUEUED", "RUNNING"].includes(activity.status) ? "The backend owns this search now. You can leave this page—or reload it—without stopping Apify or Zendesk intake." : activity.message}</p>
+        {activity.status === "COMPLETED" && activity.campaign && <button className="ghost-button" type="button" onClick={() => onOpenCampaign(activity.campaign.campaignId)}>Open {activity.campaign.metrics?.channelLeads || 0} lead records</button>}
+      </div>}
       {error && <div className="inline-alert danger">{error}</div>}
-      <div className="form-submit"><button className="primary-button" type="submit" disabled={busy || !connection.workspaceReady}>{busy ? <><RefreshCw className="spin" size={18} />Finding leads…</> : <><Rocket size={18} />Launch campaign</>}</button><span>Lead target is dynamic; Zendesk tickets are created before the workspace opens.</span></div>
+      <div className="form-submit"><button className="primary-button" type="submit" disabled={busy || !connection.workspaceReady}>{busy ? <><RefreshCw className="spin" size={18} />Running in background…</> : <><Rocket size={18} />Launch campaign</>}</button><span>The search continues if you leave this page.</span></div>
     </form>
   );
 }
 
-function UploadCampaignForm({ connection, onCreated }) {
+function UploadCampaignForm({ connection, activity, jobs, onUpload, onRetry, onResume, onOpenCampaign }) {
   const [form, setForm] = useState({ campaignName: "", industry: "Local service", location: "South Africa", chunkSize: 5, autoGenerateMetadata: true });
   const [file, setFile] = useState(null);
-  const [job, setJob] = useState(null);
-  const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const update = (patch) => setForm((current) => ({ ...current, ...patch }));
-
-  useEffect(() => {
-    if (!connection.workspaceReady) return;
-    axios.get(`${API_BASE}/api/campaigns/imports?limit=10`, { timeout: 20000 })
-      .then(({ data }) => {
-        const active = (data.jobs || []).find((item) => !["COMPLETED"].includes(item.status));
-        if (active) setJob(active);
-      })
-      .catch(() => {});
-  }, [connection.workspaceReady]);
-
-  const drainJob = async (jobId) => {
-    setBusy(true); setError("");
-    try {
-      let current = job?.jobId === jobId ? job : null;
-      while (!current || !["COMPLETED", "FAILED"].includes(current.status)) {
-        const response = await axios.post(`${API_BASE}/api/campaigns/imports/${jobId}/process`, {}, { timeout: 300000 });
-        current = response.data; setJob(current);
-      }
-      if (current.status === "COMPLETED") {
-        onCreated(current.campaign);
-        setFile(null);
-        setForm((value) => ({ ...value, campaignName: "" }));
-      }
-    } catch (requestError) {
-      setError(`${errorMessage(requestError)} The import is saved and can be resumed.`);
-    } finally {
-      setBusy(false);
-    }
-  };
+  const job = activity?.job || jobs[0] || null;
+  const busy = activity?.status === "UPLOADING" || activity?.status === "PROCESSING";
 
   const submit = async (event) => {
     event.preventDefault(); setError("");
     if (!file) { setError("Choose a CSV, JSON, or JSONL lead file."); return; }
-    setBusy(true);
     try {
-      const payload = new FormData();
-      payload.append("file", file);
-      payload.append("campaignName", form.campaignName);
-      payload.append("industry", form.industry);
-      payload.append("location", form.location);
-      payload.append("channels", "email,phone");
-      payload.append("chunkSize", String(form.chunkSize));
-      payload.append("autoGenerateMetadata", String(form.autoGenerateMetadata));
-      const { data } = await axios.post(`${API_BASE}/api/campaigns/import`, payload, { timeout: 120000 });
-      setJob(data); setBusy(false);
-      await drainJob(data.jobId);
+      await onUpload(file, form);
+      setForm((value) => ({ ...value, campaignName: "" }));
     } catch (requestError) {
-      setError(errorMessage(requestError)); setBusy(false);
+      setError(errorMessage(requestError));
     }
   };
 
   const retry = async () => {
     if (!job?.jobId) return;
-    setBusy(true); setError("");
     try {
-      const { data } = await axios.post(`${API_BASE}/api/campaigns/imports/${job.jobId}/retry`, {}, { timeout: 30000 });
-      setJob(data); setBusy(false); await drainJob(job.jobId);
-    } catch (requestError) { setError(errorMessage(requestError)); setBusy(false); }
+      setError("");
+      await onRetry(job.jobId);
+    } catch (requestError) { setError(errorMessage(requestError)); }
   };
 
   return (
@@ -589,28 +554,35 @@ function UploadCampaignForm({ connection, onCreated }) {
       </div>
       <label className={`upload-dropzone ${file ? "selected" : ""}`}><Upload size={25} /><span><strong>{file?.name || "Choose lead data"}</strong><small>CSV, JSON, or JSONL · flexible Apify/Amplifier-style field names</small></span><input type="file" accept=".csv,.json,.jsonl,application/json,text/csv" onChange={(event) => setFile(event.target.files?.[0] || null)} /></label>
       <div className="channel-choice">
-        <label className="checked channel-required"><input type="checkbox" checked readOnly /><Mail size={20} /><span><strong>Email leads required</strong><small>The file must include at least one valid email</small></span></label>
-        <label className="checked channel-required"><input type="checkbox" checked readOnly /><Phone size={20} /><span><strong>Call leads required</strong><small>The file must include at least one valid phone number</small></span></label>
+        <article className="checked channel-required"><Mail size={20} /><span><strong>Email leads when present</strong><small>Rows with valid emails create email tickets</small></span></article>
+        <article className="checked channel-required"><Phone size={20} /><span><strong>Call leads when present</strong><small>Rows with valid phone numbers create call tickets</small></span></article>
       </div>
       <div className="form-options"><label><input type="checkbox" checked={form.autoGenerateMetadata} onChange={(event) => update({ autoGenerateMetadata: event.target.checked })} />Generate campaign name and industry from uploaded rows</label></div>
-      <div className="mixed-channel-note"><ShieldCheck size={20} /><div><strong>Mixed-file validation</strong><p>The upload is checked before any tickets are created. Files containing only email or only phone contacts are stopped with a clear explanation.</p></div></div>
-      {job && <div className="import-progress"><div><strong>{job.fileName}</strong><StatusBadge status={job.status} /></div><div className="progress-track"><i style={{ width: `${job.progressPercent || 0}%` }} /></div><p>{Number(job.processedRows || 0).toLocaleString()} of {Number(job.totalRows || 0).toLocaleString()} rows processed · {job.succeededRows || 0} created · {job.skippedRows || 0} duplicates · {job.failedRows || 0} failed</p>{job.fileRetained && <small>The original file is retained until this job completes.</small>}</div>}
+      <div className="mixed-channel-note"><ShieldCheck size={20} /><div><strong>Contact validation</strong><p>Phone-only, email-only, and mixed files are accepted. Each imported row still needs at least one valid contact method, and no missing details are invented.</p></div></div>
+      {activity?.status === "UPLOADING" && <div className="background-activity running"><div><strong>{activity.fileName}</strong><StatusBadge status="UPLOADING" /></div><p>The file is being saved. You can leave this page without interrupting it.</p></div>}
+      {job && <div className="import-progress"><div><strong>{job.fileName}</strong><StatusBadge status={job.status} /></div><div className="progress-track"><i style={{ width: `${job.progressPercent || 0}%` }} /></div><p>{Number(job.processedRows || 0).toLocaleString()} of {Number(job.totalRows || 0).toLocaleString()} rows processed · {job.succeededRows || 0} created · {job.skippedRows || 0} skipped · {job.failedRows || 0} failed</p>{job.fileRetained && <small>The original file is retained until this job completes.</small>}{job.status === "COMPLETED" && <button className="ghost-button" type="button" onClick={() => onOpenCampaign(job.campaignId)}>Open imported leads</button>}</div>}
       {error && <div className="inline-alert danger">{error}</div>}
       <div className="form-submit">
-        <button className="primary-button" type="submit" disabled={busy || !file || !connection.workspaceReady}>{busy ? <><RefreshCw className="spin" size={18} />Processing chunks…</> : <><Upload size={18} />Upload and create tickets</>}</button>
-        {job && job.status !== "COMPLETED" && <button className="ghost-button" type="button" disabled={busy} onClick={job.status === "FAILED" ? retry : () => drainJob(job.jobId)}>{job.status === "FAILED" ? "Retry failed rows" : "Resume import"}</button>}
+        <button className="primary-button" type="submit" disabled={busy || !file || !connection.workspaceReady}>{busy ? <><RefreshCw className="spin" size={18} />Working in background…</> : <><Upload size={18} />Upload and create tickets</>}</button>
+        {job && job.status !== "COMPLETED" && <button className="ghost-button" type="button" disabled={busy} onClick={job.status === "FAILED" ? retry : () => onResume(job.jobId)}>{job.status === "FAILED" ? "Retry failed rows" : "Resume import"}</button>}
+      </div>
+      <div className="upload-history">
+        <div className="preset-heading"><strong>Upload history</strong><span>Files and processing results remain visible after you change pages.</span></div>
+        {jobs.length ? jobs.map((item) => <article key={item.jobId}><div><Upload size={16} /><span><strong>{item.fileName}</strong><small>{formatDate(item.createdAt)} · {item.totalRows} rows</small></span></div><div><StatusBadge status={item.status} /><small>{item.progressPercent || 0}%</small></div></article>) : <p>No lead files uploaded yet.</p>}
       </div>
     </form>
   );
 }
 
-function CampaignsPage({ presets, connection, onCreated }) {
+function CampaignsPage({ presets, connection, discoveryActivity, importActivity, importJobs, onLaunch, onUpload, onRetryImport, onResumeImport, onOpenCampaign }) {
   const [mode, setMode] = useState("discover");
   return (
     <div className="page-stack">
       <PageSection title="Create a lead campaign" eyebrow="Zendesk-first intake" description="Discover new leads or upload an existing lead file. Both paths create tagged Zendesk tickets and defer site generation.">
         <div className="campaign-mode-tabs"><button type="button" className={mode === "discover" ? "active" : ""} onClick={() => setMode("discover")}><MapPin size={17} />Find leads</button><button type="button" className={mode === "upload" ? "active" : ""} onClick={() => setMode("upload")}><Upload size={17} />Upload lead data</button></div>
-        {mode === "discover" ? <CampaignForm presets={presets} connection={connection} onCreated={onCreated} /> : <UploadCampaignForm connection={connection} onCreated={onCreated} />}
+        {mode === "discover"
+          ? <CampaignForm presets={presets} connection={connection} activity={discoveryActivity} onLaunch={onLaunch} onOpenCampaign={onOpenCampaign} />
+          : <UploadCampaignForm connection={connection} activity={importActivity} jobs={importJobs} onUpload={onUpload} onRetry={onRetryImport} onResume={onResumeImport} onOpenCampaign={onOpenCampaign} />}
       </PageSection>
       <div className="form-tag-grid">
         <article><Mail size={22} /><div><strong>Email form</strong><p>Business, contact email, location, source URL, campaign IDs, deploy checkbox, and email-send checkbox.</p><code>asf_form_email_lead</code></div></article>
@@ -946,7 +918,13 @@ function AppShell({ session, onSessionChange, preferenceState }) {
   const [refreshing, setRefreshing] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [notice, setNotice] = useState(null);
+  const [discoveryActivity, setDiscoveryActivity] = useState(null);
+  const [importActivity, setImportActivity] = useState(null);
+  const [importJobs, setImportJobs] = useState([]);
   const selectionInitialized = useRef(false);
+  const activeImportWorkers = useRef(new Set());
+  const activeDiscoveryPolls = useRef(new Set());
+  const handledDiscoveryJobs = useRef(new Set());
 
   const setSelectedCampaignId = useCallback((value) => {
     setSelectedCampaignIdState(value);
@@ -1020,17 +998,182 @@ function AppShell({ session, onSessionChange, preferenceState }) {
     return () => window.clearInterval(timer);
   }, [refresh, selectedCampaignId, loadDetail, detailRouteActive]);
 
+  const rememberImportJob = useCallback((job) => {
+    if (!job?.jobId) return;
+    setImportJobs((current) => [job, ...current.filter((item) => item.jobId !== job.jobId)].slice(0, 50));
+  }, []);
+
+  const loadImportJobs = useCallback(async () => {
+    if (!connection.workspaceReady) {
+      setImportJobs([]);
+      return [];
+    }
+    try {
+      const { data } = await axios.get(`${API_BASE}/api/campaigns/imports?limit=50`, { timeout: 30000 });
+      const jobs = data.jobs || [];
+      setImportJobs(jobs);
+      return jobs;
+    } catch {
+      return [];
+    }
+  }, [connection.workspaceReady]);
+
+  const processImportJob = useCallback(async (jobId) => {
+    if (!jobId || activeImportWorkers.current.has(jobId)) return;
+    activeImportWorkers.current.add(jobId);
+    try {
+      let current = (await axios.get(`${API_BASE}/api/campaigns/imports/${jobId}`, { timeout: 30000 })).data;
+      rememberImportJob(current);
+      setImportActivity({
+        status: current.status === "COMPLETED" ? "COMPLETED" : current.status === "FAILED" ? "FAILED" : "PROCESSING",
+        fileName: current.fileName,
+        job: current,
+      });
+      while (!["COMPLETED", "FAILED"].includes(current.status)) {
+        await wait(1500);
+        current = (await axios.get(`${API_BASE}/api/campaigns/imports/${jobId}`, { timeout: 30000 })).data;
+        rememberImportJob(current);
+        setImportActivity({ status: current.status === "COMPLETED" ? "COMPLETED" : current.status === "FAILED" ? "FAILED" : "PROCESSING", fileName: current.fileName, job: current });
+      }
+      if (current.status === "COMPLETED" && current.campaign) {
+        setSelectedCampaignId(current.campaign.campaignId);
+        setDetail(current.campaign);
+        setNotice({ tone: "success", text: `${current.fileName} uploaded successfully. ${current.succeededRows || 0} leads were created.` });
+        refresh(true);
+      } else if (current.status === "FAILED") {
+        setNotice({ tone: "danger", text: `${current.fileName} finished with ${current.failedRows || 0} failed rows. Open Upload history to review or retry it.` });
+      }
+    } catch (requestError) {
+      setImportActivity((current) => ({ ...(current || {}), status: "FAILED", message: `${errorMessage(requestError)} The saved import can be resumed.` }));
+    } finally {
+      activeImportWorkers.current.delete(jobId);
+      loadImportJobs();
+    }
+  }, [loadImportJobs, refresh, rememberImportJob, setSelectedCampaignId]);
+
+  const applyDiscoveryJob = useCallback((job) => {
+    if (!job?.jobId) return;
+    const isActive = ["QUEUED", "RUNNING"].includes(job.status);
+    const activity = {
+      ...job,
+      message: isActive
+        ? "The backend is continuing this search independently of the page."
+        : job.status === "COMPLETED"
+          ? `${job.campaign?.metrics?.channelLeads || 0} validated lead records are ready.`
+          : job.error || "The background lead search failed.",
+    };
+    setDiscoveryActivity(activity);
+    if (job.status === "COMPLETED" && job.campaign && !handledDiscoveryJobs.current.has(job.jobId)) {
+      handledDiscoveryJobs.current.add(job.jobId);
+      setSelectedCampaignId(job.campaign.campaignId);
+      setDetail(job.campaign);
+      setNotice({ tone: "success", text: `${job.campaign.campaignName} completed in the background with ${job.campaign.metrics?.channelLeads || 0} lead records.` });
+      refresh(true);
+    } else if (job.status === "FAILED" && !handledDiscoveryJobs.current.has(job.jobId)) {
+      handledDiscoveryJobs.current.add(job.jobId);
+      setNotice({ tone: "danger", text: job.error || "The background lead search failed." });
+    }
+  }, [refresh, setSelectedCampaignId]);
+
+  const pollDiscoveryJob = useCallback(async (jobId) => {
+    if (!jobId || activeDiscoveryPolls.current.has(jobId)) return;
+    activeDiscoveryPolls.current.add(jobId);
+    try {
+      let current = (await axios.get(`${API_BASE}/api/campaigns/intake/jobs/${jobId}`, { timeout: 30000 })).data;
+      applyDiscoveryJob(current);
+      while (["QUEUED", "RUNNING"].includes(current.status)) {
+        await wait(1500);
+        current = (await axios.get(`${API_BASE}/api/campaigns/intake/jobs/${jobId}`, { timeout: 30000 })).data;
+        applyDiscoveryJob(current);
+      }
+    } catch (requestError) {
+      setNotice({ tone: "danger", text: `${errorMessage(requestError)} The backend job remains saved and will be checked again.` });
+    } finally {
+      activeDiscoveryPolls.current.delete(jobId);
+    }
+  }, [applyDiscoveryJob]);
+
+  const loadDiscoveryJobs = useCallback(async () => {
+    if (!connection.workspaceReady) return [];
+    try {
+      const { data } = await axios.get(`${API_BASE}/api/campaigns/intake/jobs?limit=20`, { timeout: 30000 });
+      const jobs = data.jobs || [];
+      const active = jobs.find((job) => ["QUEUED", "RUNNING"].includes(job.status));
+      const latest = active || jobs[0];
+      if (latest) applyDiscoveryJob(latest);
+      if (active) {
+        void pollDiscoveryJob(active.jobId);
+      }
+      return jobs;
+    } catch {
+      return [];
+    }
+  }, [applyDiscoveryJob, connection.workspaceReady, pollDiscoveryJob]);
+
+  const launchCampaign = useCallback(async (request) => {
+    setDiscoveryActivity({ status: "QUEUED", startedAt: new Date().toISOString(), request, message: "Saving the background lead search." });
+    try {
+      const { data } = await axios.post(`${API_BASE}/api/campaigns/intake/jobs`, request, { timeout: 30000 });
+      applyDiscoveryJob(data);
+      void pollDiscoveryJob(data.jobId);
+      return data;
+    } catch (requestError) {
+      const message = errorMessage(requestError);
+      setDiscoveryActivity({ status: "FAILED", completedAt: new Date().toISOString(), message });
+      setNotice({ tone: "danger", text: message });
+      throw requestError;
+    }
+  }, [applyDiscoveryJob, pollDiscoveryJob]);
+
+  const uploadCampaignFile = useCallback(async (file, form) => {
+    setImportActivity({ status: "UPLOADING", fileName: file.name, job: null });
+    try {
+      const payload = new FormData();
+      payload.append("file", file);
+      payload.append("campaignName", form.campaignName);
+      payload.append("industry", form.industry);
+      payload.append("location", form.location);
+      payload.append("channels", "email,phone");
+      payload.append("chunkSize", String(form.chunkSize));
+      payload.append("autoGenerateMetadata", String(form.autoGenerateMetadata));
+      payload.append("background", "true");
+      const { data } = await axios.post(`${API_BASE}/api/campaigns/import`, payload, { timeout: 120000 });
+      rememberImportJob(data);
+      setImportActivity({ status: "PROCESSING", fileName: data.fileName, job: data });
+      void processImportJob(data.jobId);
+      return data;
+    } catch (requestError) {
+      setImportActivity({ status: "FAILED", fileName: file.name, message: errorMessage(requestError), job: null });
+      throw requestError;
+    }
+  }, [processImportJob, rememberImportJob]);
+
+  const retryImport = useCallback(async (jobId) => {
+    const { data } = await axios.post(`${API_BASE}/api/campaigns/imports/${jobId}/retry`, {}, { timeout: 30000 });
+    rememberImportJob(data);
+    setImportActivity({ status: "PROCESSING", fileName: data.fileName, job: data });
+    void processImportJob(jobId);
+  }, [processImportJob, rememberImportJob]);
+
+  useEffect(() => {
+    if (!connection.workspaceReady) return undefined;
+    loadDiscoveryJobs();
+    loadImportJobs();
+    const timer = window.setInterval(() => { loadDiscoveryJobs(); loadImportJobs(); }, 5000);
+    return () => window.clearInterval(timer);
+  }, [connection.workspaceReady, loadDiscoveryJobs, loadImportJobs]);
+
+  useEffect(() => {
+    const activeJob = importJobs.find((job) => ["QUEUED", "PROCESSING", "RETRY_PENDING"].includes(job.status));
+    if (activeJob) void processImportJob(activeJob.jobId);
+  }, [importJobs, processImportJob]);
+
   const selectAndOpen = (campaignId) => {
     if (!connection.workspaceReady) {
       setNotice({ tone: "warning", text: "Finish the Zendesk brand, field, and form setup before opening campaign workspaces." });
       navigate("/zendesk"); return;
     }
     setSelectedCampaignId(campaignId); navigate("/leads");
-  };
-  const created = (campaign) => {
-    setSelectedCampaignId(campaign.campaignId); setDetail(campaign);
-    setNotice({ tone: "success", text: `${campaign.campaignName} created with ${campaign.metrics.channelLeads} channel records. No sites were generated yet.` });
-    refresh(true); navigate("/leads");
   };
   const syncCampaign = async () => {
     if (!selectedCampaignId) return;
@@ -1043,6 +1186,11 @@ function AppShell({ session, onSessionChange, preferenceState }) {
     finally { onSessionChange({ authRequired: true, authenticated: false, configurationSource: session.configurationSource }); }
   };
   const pageName = NAV_ITEMS.find((item) => location.pathname.startsWith(item.to))?.label || "Overview";
+  const backgroundJobLabel = ["QUEUED", "RUNNING"].includes(discoveryActivity?.status)
+    ? "Lead search running"
+    : ["UPLOADING", "PROCESSING"].includes(importActivity?.status)
+      ? `${importActivity.fileName || "Lead file"} processing`
+      : "";
 
   return (
     <div className="app-shell">
@@ -1052,10 +1200,10 @@ function AppShell({ session, onSessionChange, preferenceState }) {
         <div className={`sidebar-connection ${connection.workspaceReady ? "connected" : ""}`}><i /> <div><span>{connection.workspaceReady ? "Zendesk workspace ready" : connection.connected ? "Zendesk setup incomplete" : "Zendesk required"}</span><small>{connection.connected ? connection.subdomain : "Campaigns locked"}</small></div></div>
       </aside>
       <main>
-        <header className="topbar"><div><span>Workspace</span><h1>{pageName}</h1></div><div className="topbar-actions">{notice && <div className={`notice ${notice.tone}`}>{notice.text}<button type="button" aria-label="Dismiss notification" onClick={() => setNotice(null)}>×</button></div>}<button className="icon-button" type="button" aria-label={`Switch to ${preferenceState.resolvedTheme === "dark" ? "light" : "dark"} theme`} onClick={() => preferenceState.updatePreferences({ theme: preferenceState.resolvedTheme === "dark" ? "light" : "dark" })}>{preferenceState.resolvedTheme === "dark" ? <Sun size={17} /> : <Moon size={17} />}</button><button className="refresh-button" type="button" onClick={() => refresh(false)} disabled={refreshing}><RefreshCw size={17} className={refreshing ? "spin" : ""} />Refresh</button>{session.authRequired && <button className="account-button" type="button" onClick={logout}><CircleUserRound size={17} /><span>{session.username || "admin"}</span><LogOut size={15} /></button>}</div></header>
+        <header className="topbar"><div><span>Workspace</span><h1>{pageName}</h1></div><div className="topbar-actions">{backgroundJobLabel && <div className="workspace-job-indicator"><RefreshCw className="spin" size={14} />{backgroundJobLabel}</div>}{notice && <div className={`notice ${notice.tone}`}>{notice.text}<button type="button" aria-label="Dismiss notification" onClick={() => setNotice(null)}>×</button></div>}<button className="icon-button" type="button" aria-label={`Switch to ${preferenceState.resolvedTheme === "dark" ? "light" : "dark"} theme`} onClick={() => preferenceState.updatePreferences({ theme: preferenceState.resolvedTheme === "dark" ? "light" : "dark" })}>{preferenceState.resolvedTheme === "dark" ? <Sun size={17} /> : <Moon size={17} />}</button><button className="refresh-button" type="button" onClick={() => refresh(false)} disabled={refreshing}><RefreshCw size={17} className={refreshing ? "spin" : ""} />Refresh</button>{session.authRequired && <button className="account-button" type="button" onClick={logout}><CircleUserRound size={17} /><span>{session.username || "admin"}</span><LogOut size={15} /></button>}</div></header>
         <div className="page-content">{loading ? <div className="loading-state"><RefreshCw className="spin" /><strong>Loading campaign workspace…</strong></div> : <Routes>
           <Route path="/overview" element={<OverviewPage campaigns={campaigns} totals={totals} onSelectCampaign={selectAndOpen} reducedMotion={preferenceState.effectiveReducedMotion} />} />
-          <Route path="/campaigns" element={<SetupGuard connection={connection}><CampaignsPage presets={presets} connection={connection} onCreated={created} /></SetupGuard>} />
+          <Route path="/campaigns" element={<SetupGuard connection={connection}><CampaignsPage presets={presets} connection={connection} discoveryActivity={discoveryActivity} importActivity={importActivity} importJobs={importJobs} onLaunch={launchCampaign} onUpload={uploadCampaignFile} onRetryImport={retryImport} onResumeImport={processImportJob} onOpenCampaign={selectAndOpen} /></SetupGuard>} />
           <Route path="/leads" element={<SetupGuard connection={connection}><LeadWorkspacePage campaigns={campaigns} selectedCampaignId={selectedCampaignId} setSelectedCampaignId={setSelectedCampaignId} detail={detail} connection={connection} onSync={syncCampaign} syncing={syncing} /></SetupGuard>} />
           <Route path="/deployments" element={<SetupGuard connection={connection}><DeploymentsPage campaigns={campaigns} selectedCampaignId={selectedCampaignId} setSelectedCampaignId={setSelectedCampaignId} detail={detail} history={history} /></SetupGuard>} />
           <Route path="/zendesk" element={<ZendeskPage connection={connection} setConnection={setConnection} />} />

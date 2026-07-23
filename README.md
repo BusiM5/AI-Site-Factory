@@ -50,7 +50,7 @@ For the live proof-of-concept deployment checklist, strict GitHub -> Netlify art
 ## Campaign workflow
 
 1. Connect Zendesk, select an existing brand, and provision the managed fields and two forms. Campaign creation, lead queues, and deployments remain locked until this is ready.
-2. Every campaign requires a mixed contact set with at least one email lead and one phone lead. Run Apify discovery or upload lead data; the optional metadata generator derives a campaign name and stored industry from the resulting businesses.
+2. Every accepted lead requires at least one validated contact method: email or phone. Phone-only, email-only, and mixed Apify results/uploads are accepted without inventing missing details; the optional metadata generator derives a campaign name and stored industry from the resulting businesses.
 3. Zendesk receives separate, tagged email and call tickets. No AI, GitHub, or Netlify work runs yet.
 4. An agent ticks the deploy field. The `deploy_site` webhook generates and persists the HTML, exports the repository, deploys Netlify, and writes the live URL back to the same ticket. Transient GitHub 429/5xx and connection failures are retried with backoff; a repository created before a failed file upload is recovered on the next attempt instead of duplicated, and the saved HTML is reused without another model call.
 5. A second channel for the same canonical lead reuses the existing artifact or live deployment.
