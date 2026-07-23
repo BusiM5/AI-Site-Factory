@@ -984,7 +984,7 @@ def test_discover_leads_accepts_custom_industry_and_search_intent(monkeypatch):
     assert calls == [("commercial solar installers in Cape Town, South Africa", "Cape Town, South Africa", 5)]
 
 
-def test_apify_search_broadens_the_real_query_inside_a_one_minute_budget(monkeypatch):
+def test_apify_search_broadens_the_real_query_inside_a_two_minute_budget(monkeypatch):
     captured = {}
 
     def fake_post(url, **kwargs):
@@ -994,6 +994,8 @@ def test_apify_search_broadens_the_real_query_inside_a_one_minute_budget(monkeyp
         return FakeResponse(payload=[apify_item(121, province="KwaZulu-Natal")])
 
     monkeypatch.setenv("APIFY_API_TOKEN", "test-apify-token")
+    monkeypatch.delenv("APIFY_DISCOVERY_BUDGET_SECONDS", raising=False)
+    monkeypatch.delenv("APIFY_DISCOVERY_TIMEOUT_SECONDS", raising=False)
     monkeypatch.setattr(main.requests, "post", fake_post)
 
     result = main.run_apify_google_maps(
@@ -1007,7 +1009,8 @@ def test_apify_search_broadens_the_real_query_inside_a_one_minute_budget(monkeyp
         "plumbers in Durban, South Africa",
         "plumbers near Durban, South Africa",
     ]
-    assert captured["timeout"] <= 58
+    assert captured["timeout"] <= 120
+    assert "timeout=115" in captured["url"]
     assert "maxItems=100" in captured["url"]
 
 

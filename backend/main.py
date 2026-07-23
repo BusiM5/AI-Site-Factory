@@ -4427,12 +4427,12 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
         searchVariantCount=len(search_variants),
     )
 
-    total_budget = max(15, min(int(os.getenv("APIFY_DISCOVERY_BUDGET_SECONDS", "58")), 58))
+    total_budget = max(90, min(int(os.getenv("APIFY_DISCOVERY_BUDGET_SECONDS", "120")), 120))
     provider_timeout = max(
-        10,
+        85,
         min(
-            int(os.getenv("APIFY_DISCOVERY_TIMEOUT_SECONDS", "55")),
-            55,
+            int(os.getenv("APIFY_DISCOVERY_TIMEOUT_SECONDS", "115")),
+            115,
             total_budget - 3,
         ),
     )
@@ -4441,7 +4441,7 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
     def provider_request(payload: Dict[str, Any]):
         remaining = deadline - time.monotonic()
         if remaining <= 2:
-            raise TimeoutError("The one-minute Apify discovery budget was exhausted.")
+            raise TimeoutError("The two-minute Apify discovery budget was exhausted.")
         actor_timeout = max(1, min(provider_timeout, int(remaining - 1)))
         request_timeout = max(2.0, min(float(actor_timeout + 2), remaining))
         url = (
@@ -10248,7 +10248,7 @@ def discover_leads(request: DiscoverLeadsRequest):
             status_code=502,
             detail={
                 "code": "APIFY_DISCOVERY_FAILED",
-                "message": "Apify could not complete the lead search within one minute. No contacts were invented; retry the search.",
+                "message": "Apify could not complete the lead search within two minutes. No contacts were invented; retry the search.",
                 "providerError": message,
             },
         ) from error
