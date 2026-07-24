@@ -4400,8 +4400,16 @@ def build_google_maps_query(preset: Dict[str, Any], location: str, custom_query:
     return f"{query_term} in {location_term}"
 
 
-def apify_google_maps_search_variants(query: str) -> List[str]:
+def apify_google_maps_search_variants(query: str, location: str = "") -> List[str]:
     primary = compact_text(query)
+    location_term = compact_text(location)
+    location_suffix = f" in {location_term}"
+    if (
+        primary
+        and location_term
+        and primary.casefold().endswith(location_suffix.casefold())
+    ):
+        primary = primary[: -len(location_suffix)].strip()
     return [primary] if primary else []
 
 
@@ -4410,7 +4418,8 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
     actor_id = os.getenv("APIFY_GOOGLE_MAPS_ACTOR_ID", "compass/crawler-google-places").replace("/", "~")
     max_items = max(limit, 5)
     country_code = infer_country_code(location)
-    search_terms = apify_google_maps_search_variants(query)
+    location_query = compact_text(location)
+    search_terms = apify_google_maps_search_variants(query, location_query)
 
     log_event(
         "info",
@@ -4437,9 +4446,12 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
 
     payload = {
         "searchStringsArray": search_terms,
+        "locationQuery": location_query,
         "language": "en",
         "maxCrawledPlacesPerSearch": max_items,
         "includeWebResults": False,
+        "skipClosedPlaces": True,
+        "website": "withoutWebsite",
     }
 
     start_response = requests.post(

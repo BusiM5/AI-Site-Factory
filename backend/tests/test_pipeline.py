@@ -1047,7 +1047,10 @@ def test_apify_search_uses_one_focused_query_inside_a_two_minute_budget(monkeypa
     )
 
     assert len(result) == 1
-    assert captured["payload"]["searchStringsArray"] == ["plumbers in Durban, South Africa"]
+    assert captured["payload"]["searchStringsArray"] == ["plumbers"]
+    assert captured["payload"]["locationQuery"] == "Durban, South Africa"
+    assert captured["payload"]["website"] == "withoutWebsite"
+    assert captured["payload"]["skipClosedPlaces"] is True
     assert captured["payload"]["includeWebResults"] is False
     assert captured["payload"]["maxCrawledPlacesPerSearch"] == 100
     assert len(captured["posts"]) == 1
@@ -4484,6 +4487,13 @@ def test_background_search_finishes_before_zendesk_sync_and_sync_retries_indepen
             break
         time.sleep(0.02)
     assert detail["metrics"]["zendeskTickets"] == 1
+    for _ in range(150):
+        with main.BACKGROUND_JOB_LOCK:
+            sync_active = campaign_id in main.ACTIVE_CAMPAIGN_ZENDESK_SYNCS
+        if not sync_active:
+            break
+        time.sleep(0.02)
+    assert not sync_active
 
 
 def test_discovery_accepts_ten_thousand_target_without_a_hidden_hundred_item_cap(monkeypatch):
@@ -4956,6 +4966,13 @@ def test_uploaded_file_is_ingested_before_zendesk_ticket_sync_finishes(monkeypat
             break
         time.sleep(0.02)
     assert detail["metrics"]["zendeskTickets"] == 1
+    for _ in range(150):
+        with main.BACKGROUND_JOB_LOCK:
+            sync_active = result["campaignId"] in main.ACTIVE_CAMPAIGN_ZENDESK_SYNCS
+        if not sync_active:
+            break
+        time.sleep(0.02)
+    assert not sync_active
 
 
 def test_uploaded_file_without_any_contact_details_is_rejected(monkeypatch):
