@@ -498,7 +498,7 @@ function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign 
       <div className="form-grid three">
         <label>Industry<input required value={form.industry} onChange={(event) => update({ industry: event.target.value, presetId: "custom" })} placeholder="e.g. Solar energy" /></label>
         <label>Search intent<input required={form.presetId === "custom"} value={form.query} onChange={(event) => update({ query: event.target.value })} placeholder="e.g. commercial solar installers" /><small>{form.presetId === "custom" ? "Required for custom campaigns." : "Optional: refine the selected preset."}</small></label>
-        <label>Lead target<input type="number" min="2" max="100" value={form.limit} onChange={(event) => update({ limit: Math.max(2, Math.min(100, Number(event.target.value) || 2)) })} /><small>Choose 2–100 verified, no-website leads. Every accepted lead must have a real email address or phone number.</small></label>
+        <label>Lead target<input type="number" min="1" max="10000" value={form.limit} onChange={(event) => update({ limit: Math.max(1, Math.min(10000, Number(event.target.value) || 1)) })} /><small>Choose 1–10,000 verified, no-website leads. The saved background job continues after navigation or reload.</small></label>
       </div>
       <div className="channel-choice">
         <article className="checked channel-required"><Mail size={20} /><span><strong>Email leads when available</strong><small>Valid email contacts create email queue records</small></span></article>
@@ -513,7 +513,7 @@ function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign 
       <div className="deferred-note"><Zap size={22} /><div><strong>Cost-safe by design</strong><p>This step finds and tags leads only. Gemini, GitHub, and Netlify are not called until an agent requests deployment.</p></div></div>
       {activity && <div className={`background-activity ${activity.status.toLowerCase()}`}>
         <div><strong>{["QUEUED", "RUNNING"].includes(activity.status) ? "Lead search running in the background" : activity.status === "COMPLETED" ? "Lead search completed" : "Lead search needs attention"}</strong><StatusBadge status={activity.status} /></div>
-        <p>{["QUEUED", "RUNNING"].includes(activity.status) ? "The backend owns this search now. You can leave this page—or reload it—without stopping Apify or Zendesk intake." : activity.message}</p>
+        <p>{activity.message}</p>
         {activity.status === "COMPLETED" && activity.campaign && <button className="ghost-button" type="button" onClick={() => onOpenCampaign(activity.campaign.campaignId)}>Open {activity.campaign.metrics?.channelLeads || 0} lead records</button>}
       </div>}
       {error && <div className="inline-alert danger">{error}</div>}
@@ -523,7 +523,7 @@ function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign 
 }
 
 function UploadCampaignForm({ connection, activity, jobs, onUpload, onRetry, onResume, onOpenCampaign }) {
-  const [form, setForm] = useState({ campaignName: "", industry: "Local service", location: "South Africa", chunkSize: 5, autoGenerateMetadata: true });
+  const [form, setForm] = useState({ campaignName: "", industry: "Local service", location: "South Africa", chunkSize: 100, autoGenerateMetadata: true });
   const [file, setFile] = useState(null);
   const [error, setError] = useState("");
   const update = (patch) => setForm((current) => ({ ...current, ...patch }));
@@ -557,7 +557,7 @@ function UploadCampaignForm({ connection, activity, jobs, onUpload, onRetry, onR
       </div>
       <div className="form-grid two">
         <label>Default location<input required value={form.location} onChange={(event) => update({ location: event.target.value })} /></label>
-        <label>Rows per chunk<input type="number" min="1" max="25" value={form.chunkSize} onChange={(event) => update({ chunkSize: Math.max(1, Math.min(25, Number(event.target.value) || 5)) })} /><small>Each row can create an email ticket, a call ticket, or both.</small></label>
+        <label>Rows per chunk<input type="number" min="1" max="500" value={form.chunkSize} onChange={(event) => update({ chunkSize: Math.max(1, Math.min(500, Number(event.target.value) || 100)) })} /><small>Rows are saved first; Zendesk tickets synchronize separately in the background.</small></label>
       </div>
       <label className={`upload-dropzone ${file ? "selected" : ""}`}><Upload size={25} /><span><strong>{file?.name || "Choose lead data"}</strong><small>CSV, JSON, or JSONL · flexible Apify/Amplifier-style field names</small></span><input type="file" accept=".csv,.json,.jsonl,application/json,text/csv" onChange={(event) => setFile(event.target.files?.[0] || null)} /></label>
       <div className="channel-choice">
@@ -1055,7 +1055,7 @@ function AppShell({ session, onSessionChange, preferenceState }) {
       if (current.status === "COMPLETED" && current.campaign) {
         setSelectedCampaignId(current.campaign.campaignId);
         setDetail(current.campaign);
-        setNotice({ tone: "success", text: `${current.fileName} uploaded successfully. ${current.succeededRows || 0} leads were created.` });
+        setNotice({ tone: "success", text: `${current.fileName} was ingested successfully. ${current.succeededRows || 0} leads are ready; Zendesk synchronization continues separately.` });
         refresh(true);
       } else if (current.status === "FAILED") {
         setNotice({ tone: "danger", text: `${current.fileName} finished with ${current.failedRows || 0} failed rows. Open Upload history to review or retry it.` });
@@ -1071,12 +1071,15 @@ function AppShell({ session, onSessionChange, preferenceState }) {
   const applyDiscoveryJob = useCallback((job) => {
     if (!job?.jobId) return;
     const isActive = ["QUEUED", "RUNNING"].includes(job.status);
+    const stageMessage = job.stage === "DISCOVERING_LEADS"
+      ? "Apify is finding and validating leads. This saved job continues after navigation or reload."
+      : "The saved background lead job is waiting to run.";
     const activity = {
       ...job,
       message: isActive
-        ? "The backend is continuing this search independently of the page."
+        ? stageMessage
         : job.status === "COMPLETED"
-          ? `${job.campaign?.metrics?.channelLeads || 0} validated lead records are ready.`
+          ? `${job.campaign?.metrics?.channelLeads || 0} validated lead records are ready. Zendesk ticket synchronization continues as a separate retryable stage.`
           : job.error || "The background lead search failed.",
     };
     if (isActive) {
@@ -1092,7 +1095,7 @@ function AppShell({ session, onSessionChange, preferenceState }) {
       handledDiscoveryJobs.current.add(job.jobId);
       setSelectedCampaignId(job.campaign.campaignId);
       setDetail(job.campaign);
-      setNotice({ source: "discovery", tone: "success", text: `${job.campaign.campaignName} completed in the background with ${job.campaign.metrics?.channelLeads || 0} lead records.` });
+      setNotice({ source: "discovery", tone: "success", text: `${job.campaign.campaignName} found ${job.campaign.metrics?.channelLeads || 0} lead records. Zendesk synchronization is continuing separately.` });
       refresh(true);
     } else if (job.status === "FAILED" && !handledDiscoveryJobs.current.has(job.jobId)) {
       handledDiscoveryJobs.current.add(job.jobId);

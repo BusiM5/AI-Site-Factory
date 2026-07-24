@@ -217,6 +217,28 @@ def test_uploaded_google_main_image_is_preserved_as_the_site_hero():
     assert 'data-ai-default-highlight="#b45309"' in fallback
 
 
+def test_generated_site_stays_image_free_when_source_lead_has_no_image():
+    context = {
+        "businessName": "No Image Plumbing",
+        "industry": "Plumbing",
+        "location": "Johannesburg",
+    }
+    model_html = (
+        '<!doctype html><html><head></head><body><main>'
+        '<img src="https://stock.example.com/invented-plumber.jpg" alt="Invented photo">'
+        "<h1>No Image Plumbing</h1></main></body></html>"
+    )
+
+    generated = main.ensure_generated_hero_and_working_links(model_html, context)
+    fallback = main.build_bootstrap_gsap_landing_html(context, dict(main.FREEFORM_SITE_SPEC))
+
+    assert "<img" not in generated.lower()
+    assert "<img" not in fallback.lower()
+    assert "data-ai-business-main-image" not in generated
+    assert "data-ai-business-main-image" not in fallback
+    assert "stock.example.com" not in generated
+
+
 def test_business_profile_replaces_generic_campaign_copy_with_personalized_services():
     context = {
         "businessName": "G. Dimitriou Physiotherapy",
@@ -410,7 +432,11 @@ def test_seo_gate_enables_indexing_only_when_explicitly_requested():
 
 def test_main_business_image_is_injected_without_replacing_a_logo():
     main_image_url = "https://streetviewpixels-pa.googleapis.com/v1/thumbnail?panoid=business&w=408&h=240"
-    source = '<!doctype html><html><head></head><body><img class="logo" src="logo.svg" alt="Logo"><main>Content</main></body></html>'
+    source = (
+        '<!doctype html><html><head>'
+        f'<meta property="og:image" content="{main_image_url}">'
+        '</head><body><img class="logo" src="logo.svg" alt="Logo"><main>Content</main></body></html>'
+    )
 
     generated = main.ensure_generated_hero_and_working_links(
         source,
@@ -4405,6 +4431,84 @@ def test_campaign_search_job_keeps_running_after_the_submitter_moves_away(monkey
     assert result["campaign"]["metrics"]["emailLeads"] == 0
 
 
+def test_background_search_finishes_before_zendesk_sync_and_sync_retries_independently(monkeypatch):
+    phone_only = apify_item(2982, province="KwaZulu-Natal")
+    phone_only.pop("email", None)
+    zendesk_started = threading.Event()
+    release_zendesk = threading.Event()
+
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda *args, **kwargs: [phone_only])
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
+
+    def delayed_zendesk(**_kwargs):
+        zendesk_started.set()
+        assert release_zendesk.wait(timeout=5)
+        return [{"ticketId": 8793}]
+
+    monkeypatch.setattr(main, "create_zendesk_intake_tickets", delayed_zendesk)
+    queued = client.post(
+        "/api/campaigns/intake/jobs",
+        json={
+            "campaignName": "Separated search and tickets",
+            "presetId": "plumbers",
+            "location": "Durban, South Africa",
+            "limit": 1,
+            "syncZendesk": True,
+        },
+    )
+    assert queued.status_code == 200, queued.text
+
+    job_id = queued.json()["jobId"]
+    result = None
+    try:
+        for _ in range(150):
+            result = client.get(f"/api/campaigns/intake/jobs/{job_id}").json()
+            if result["status"] in {"COMPLETED", "FAILED"}:
+                break
+            time.sleep(0.02)
+
+        assert result["status"] == "COMPLETED", result
+        assert result["stage"] == "LEADS_READY"
+        assert result["campaign"]["metrics"]["callLeads"] == 1
+        assert result["campaign"]["metrics"]["zendeskTickets"] == 0
+        assert zendesk_started.wait(timeout=1)
+    finally:
+        release_zendesk.set()
+
+    campaign_id = result["campaignId"]
+    detail = None
+    for _ in range(150):
+        detail = client.get(f"/api/campaigns/{campaign_id}").json()
+        if detail["metrics"]["zendeskTickets"] == 1:
+            break
+        time.sleep(0.02)
+    assert detail["metrics"]["zendeskTickets"] == 1
+
+
+def test_discovery_accepts_ten_thousand_target_without_a_hidden_hundred_item_cap(monkeypatch):
+    captured = {}
+
+    def fake_apify(query, limit, location):
+        captured["limit"] = limit
+        return [apify_item(2983, province="KwaZulu-Natal")]
+
+    monkeypatch.setattr(main, "run_apify_google_maps", fake_apify)
+    result = client.post(
+        "/api/leads/discover",
+        json={
+            "presetId": "plumbers",
+            "location": "Durban, South Africa",
+            "limit": 10000,
+            "forceRefresh": True,
+        },
+    )
+
+    assert result.status_code == 200, result.text
+    assert result.json()["requestedCount"] == 10000
+    assert captured["limit"] == 10000
+
+
 def test_explicit_force_refresh_creates_a_new_api_idempotency_key():
     request = main.CampaignIntakeRequest(
         campaignName="Fresh search",
@@ -4799,6 +4903,61 @@ def test_apify_google_places_phone_export_uploads_in_the_background(monkeypatch)
     assert result["campaign"]["metrics"]["callLeads"] == 1
 
 
+def test_uploaded_file_is_ingested_before_zendesk_ticket_sync_finishes(monkeypatch):
+    zendesk_started = threading.Event()
+    release_zendesk = threading.Event()
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+    monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
+
+    def delayed_zendesk(**_kwargs):
+        zendesk_started.set()
+        assert release_zendesk.wait(timeout=5)
+        return [{"ticketId": 8121}]
+
+    monkeypatch.setattr(main, "create_zendesk_intake_tickets", delayed_zendesk)
+    queued = client.post(
+        "/api/campaigns/import",
+        data={
+            "campaignName": "Durable upload",
+            "industry": "Plumbing",
+            "location": "Durban",
+            "chunkSize": "100",
+            "background": "true",
+        },
+        files={
+            "file": (
+                "durable.csv",
+                "businessName,phone,industry,location\nDurable Plumbing,+27 31 555 0189,Plumbing,Durban\n",
+                "text/csv",
+            )
+        },
+    )
+    assert queued.status_code == 200, queued.text
+
+    job_id = queued.json()["jobId"]
+    result = None
+    try:
+        for _ in range(150):
+            result = client.get(f"/api/campaigns/imports/{job_id}").json()
+            if result["status"] in {"COMPLETED", "FAILED"}:
+                break
+            time.sleep(0.02)
+        assert result["status"] == "COMPLETED", result
+        assert result["succeededRows"] == 1
+        assert result["campaign"]["metrics"]["zendeskTickets"] == 0
+        assert zendesk_started.wait(timeout=1)
+    finally:
+        release_zendesk.set()
+
+    detail = None
+    for _ in range(150):
+        detail = client.get(f"/api/campaigns/{result['campaignId']}").json()
+        if detail["metrics"]["zendeskTickets"] == 1:
+            break
+        time.sleep(0.02)
+    assert detail["metrics"]["zendeskTickets"] == 1
+
+
 def test_uploaded_file_without_any_contact_details_is_rejected(monkeypatch):
     monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
     monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
@@ -4869,11 +5028,13 @@ def test_uploaded_identity_is_skipped_across_campaigns(monkeypatch):
 
     first_job = queue("First upload", "Alpha Plumbing")
     first_result = client.post(f"/api/campaigns/imports/{first_job['jobId']}/process")
+    first_sync = client.post(f"/api/campaigns/{first_job['campaignId']}/sync-zendesk")
     second_job = queue("Second upload", "Alpha Plumbing (Pty) Ltd")
     second_result = client.post(f"/api/campaigns/imports/{second_job['jobId']}/process")
 
     assert first_result.status_code == 200, first_result.text
     assert first_result.json()["succeededRows"] == 1
+    assert first_sync.status_code == 200, first_sync.text
     assert second_result.status_code == 200, second_result.text
     assert second_result.json()["status"] == "COMPLETED"
     assert second_result.json()["succeededRows"] == 0

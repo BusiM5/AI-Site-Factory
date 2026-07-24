@@ -70,6 +70,7 @@ ADMIN_SESSION_MAX_AGE_SECONDS = int(os.getenv("ADMIN_SESSION_MAX_AGE_SECONDS", s
 BACKGROUND_JOB_LOCK = threading.Lock()
 ACTIVE_CAMPAIGN_INTAKE_JOBS: Set[str] = set()
 ACTIVE_CAMPAIGN_IMPORT_JOBS: Set[str] = set()
+ACTIVE_CAMPAIGN_ZENDESK_SYNCS: Set[str] = set()
 
 
 def admin_auth_settings() -> Dict[str, Any]:
@@ -257,7 +258,7 @@ Rules:
 - Include a visible Business Details section that explicitly states every supplied fact that is useful to a visitor: business name, industry/category, location, address, phone, email, rating/review count, source listing, and main image. Omit unavailable values instead of inventing them.
 - Include crawlable Alpine-powered detail tabs and fact-based FAQ accordions. Interactive content must remain present in the HTML source and usable without animation.
 - Include one descriptive h1, a unique title, a concise meta description, robots metadata, Open Graph metadata, and LocalBusiness JSON-LD based only on supplied facts. The backend SEO gate will normalize and validate them.
-- When mainImageUrl is supplied, use that exact public business-listing image as the prominent hero/banner image. Otherwise, include a generated hero image personalised to the business name, industry, location, and public lead context; prefer an inline SVG or data URI and do not rely on unrelated stock-photo URLs.
+- When mainImageUrl is supplied, use that exact public business-listing image as the prominent hero/banner image. Do not add, generate, or substitute any other image. When mainImageUrl is unavailable, keep the page image-free instead of inventing an image or using unrelated stock photography.
 - Use the supplied brandTheme as the default page palette. Keep the colours appropriate to the business industry and maintain accessible text contrast; the colour widget may let visitors override those defaults.
 - Treat the supplied businessProfile as the authoritative copy plan. Use its tagline, services heading, services intro, and four distinct services; weave in the business name and location naturally. Never repeat generic cards such as "Local service" when a specific profile is available.
 - Personalise the copy with concrete supplied details such as business name, category/industry, city/location, address, rating/review count, source listing, phone, email, service keywords, differentiators, and proof points when they are present. Avoid generic filler when a supplied detail is available.
@@ -1340,7 +1341,7 @@ class DiscoverLeadsRequest(BaseModel):
     industry: Optional[str] = None
     location: str = "South Africa"
     query: Optional[str] = None
-    limit: int = Field(default=3, ge=1, le=100)
+    limit: int = Field(default=3, ge=1, le=10000)
     forceRefresh: bool = False
 
 
@@ -1350,7 +1351,7 @@ class CampaignIntakeRequest(BaseModel):
     industry: Optional[str] = None
     location: str = "South Africa"
     query: Optional[str] = None
-    limit: int = Field(default=10, ge=1, le=100)
+    limit: int = Field(default=10, ge=1, le=10000)
     channels: List[str] = Field(default_factory=lambda: ["email", "phone"])
     forceRefresh: bool = True
     syncZendesk: bool = True
@@ -5068,13 +5069,24 @@ def contact_cta_for_context(context: Dict[str, Any]) -> Tuple[str, str]:
 
 def ensure_generated_hero_and_working_links(site_html: str, context: Dict[str, Any]) -> str:
     html_value = site_html
-    lower_html = html_value.lower()
     contact_href, contact_label = contact_cta_for_context(context)
     main_image_url = normalize_url(context.get("mainImageUrl"))
     main_image_markup_url = html.escape(main_image_url, quote=True) if main_image_url else ""
-    business_theme = business_theme_for_context(context)
 
-    if main_image_url and main_image_url not in html_value and main_image_markup_url not in html_value:
+    def has_visible_source_image(value: str) -> bool:
+        if not main_image_url:
+            return False
+        for image_match in re.finditer(r"<img\b[^>]*>", value, flags=re.IGNORECASE | re.DOTALL):
+            source_match = re.search(
+                r'\bsrc=(["\'])(.*?)\1',
+                image_match.group(0),
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            if source_match and normalize_url(html.unescape(source_match.group(2))) == main_image_url:
+                return True
+        return False
+
+    if main_image_url and not has_visible_source_image(html_value):
         image_tags = list(re.finditer(r"<img\b[^>]*>", html_value, flags=re.IGNORECASE | re.DOTALL))
         preferred_image = next(
             (
@@ -5104,26 +5116,24 @@ def ensure_generated_hero_and_working_links(site_html: str, context: Dict[str, A
             if "data-ai-business-main-image" not in replacement.lower():
                 replacement = replacement[:-1] + ' data-ai-business-main-image fetchpriority="high" loading="eager">'
             html_value = html_value[:preferred_image.start()] + replacement + html_value[preferred_image.end():]
-            lower_html = html_value.lower()
 
-    if (main_image_url and main_image_url not in html_value and main_image_markup_url not in html_value) or (
-        "<img" not in lower_html and (main_image_url or "<svg" not in lower_html)
-    ):
+    if not main_image_url:
+        # A missing source image is valid. Remove model-authored image tags so the
+        # generated page cannot invent a logo, photo, or stock image.
+        html_value = re.sub(r"\s*<img\b[^>]*>", "", html_value, flags=re.IGNORECASE | re.DOTALL)
+
+    if main_image_url and not has_visible_source_image(html_value):
         business_name = compact_text(context.get("businessName"), "Local Business")
         industry = compact_text(context.get("industry"), "Local Service")
         location = compact_text(context.get("location"), "South Africa")
-        hero_image = main_image_url or fallback_image_data_uri(
-            business_name, business_theme["highlight"], f"{industry} in {location}",
-            compact_text(context.get("address") or context.get("sourceLabel") or context.get("source"), "Generated for this business"),
-        )
         hero_markup = f"""
 <section class="ai-generated-hero-image" aria-label="Business banner" data-ai-business-main-image-container>
   <div>
     <span>{html.escape(industry)} in {html.escape(location)}</span>
     <h2>{html.escape(business_name)}</h2>
-    <p>Generated visual based on the supplied public business details.</p>
+    <p>Image supplied by the public business listing.</p>
   </div>
-  <img src="{html.escape(hero_image, quote=True)}" alt="Main image for {html.escape(business_name)}" data-ai-business-main-image fetchpriority="high" loading="eager">
+  <img src="{main_image_markup_url}" alt="Main image for {html.escape(business_name)}" data-ai-business-main-image fetchpriority="high" loading="eager">
 </section>
 """
         hero_css = """
@@ -5282,7 +5292,14 @@ def generate_page_prompt_with_gemini(context: Dict[str, Any], template: Dict[str
     )
     result.setdefault("designNotes", f"Use accent {template.get('accent')} and background {template.get('background')}.")
     result.setdefault("contentGuardrails", "Use only the provided public lead context.")
-    result.setdefault("imageDirection", "Use tasteful CSS gradients or placeholder imagery.")
+    result.setdefault(
+        "imageDirection",
+        (
+            "Use the supplied mainImageUrl exactly and do not add other images."
+            if normalize_url(context.get("mainImageUrl"))
+            else "Do not add or generate images because the source lead has no image."
+        ),
+    )
     return result
 
 def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[str, Any]) -> str:
@@ -5325,21 +5342,12 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
     accent = compact_text(template.get("accent"), "#00AEEF")
     background = compact_text(template.get("background"), "#F7FAFC")
 
-    detail_bits = [industry_raw]
-    if address_raw:
-        detail_bits.append(address_raw)
-    else:
-        detail_bits.append(location_raw)
-    if rating_raw:
-        rating_label = f"{rating_raw} rating"
-        if reviews_raw:
-            rating_label += f" from {reviews_raw} reviews"
-        detail_bits.append(rating_label)
-    elif reviews_raw:
-        detail_bits.append(f"{reviews_raw} public reviews")
-
-    hero_image = normalize_url(context.get("mainImageUrl")) or fallback_image_data_uri(
-        business_name_raw, accent, f"{industry_raw} in {location_raw}", " | ".join(detail_bits[:3]),
+    hero_image = normalize_url(context.get("mainImageUrl"))
+    hero_image_markup = (
+        f'<img src="{html.escape(hero_image, quote=True)}" alt="Main image for {business_name}" '
+        'data-ai-business-main-image fetchpriority="high" loading="eager">'
+        if hero_image
+        else ""
     )
 
     contact_target = "#contact"
@@ -5685,7 +5693,7 @@ def build_bootstrap_gsap_landing_html(context: Dict[str, Any], template: Dict[st
 
         <div class="col-lg-5">
           <div class="hero-card hero-visual">
-            <img src="{hero_image}" alt="Main image for {business_name}" data-ai-business-main-image fetchpriority="high" loading="eager">
+            {hero_image_markup}
             <div class="hero-card-body">
               <p class="fw-bold mb-3">Serving {location}</p>
               {proof_chips_html}
@@ -7152,23 +7160,17 @@ def render_site_html(
     reviews_count = compact_text(context.get("reviewsCount"))
     source_label = html.escape(compact_text(context.get("source") or context.get("sourceLabel"), "public business listing"))
     source_url = normalize_url(context.get("sourceUrl"))
-    if not images:
-        images = [fallback_image_data_uri(compact_text(context.get("businessName"), "Local Business"), accent, f"{industry} in {location}", "Generated hero visual")]
     main_image_url = normalize_url(context.get("mainImageUrl"))
-    if main_image_url:
-        images = [main_image_url, *[image for image in images if image != main_image_url]]
 
     services_html = []
     services = site_content.get("services") or []
     for index, service in enumerate(services[:4]):
         title = html.escape(compact_text(service.get("title"), f"{industry} Service"))
         description = html.escape(compact_text(service.get("description"), "Practical support for local customers."))
-        image = images[(index + 1) % len(images)]
         services_html.append(
             f"""
             <div class="col-md-6 col-xl-3">
               <article class="service-card card h-100">
-                <img src="{image}" alt="{title}">
                 <div class="card-body">
                   <span class="service-number">Service 0{index + 1}</span>
                   <h3>{title}</h3>
@@ -7208,6 +7210,17 @@ def render_site_html(
     else:
         fact_items.append(source_label)
     facts_html = "".join(f'<div class="col-md-3 col-sm-6"><div class="fact">{fact}</div></div>' for fact in fact_items[:4])
+    hero_image_html = (
+        f"""
+        <div class="col-lg-6">
+          <div class="hero-image">
+            <img src="{html.escape(main_image_url, quote=True)}" alt="Main image for {business_name}" data-ai-business-main-image fetchpriority="high" loading="eager">
+          </div>
+        </div>
+        """
+        if main_image_url
+        else ""
+    )
 
     site_html = f"""<!doctype html>
 <html lang="en">
@@ -7465,11 +7478,7 @@ def render_site_html(
             <a class="btn-ghost" href="#services">View services</a>
           </div>
         </div>
-        <div class="col-lg-6">
-          <div class="hero-image">
-            <img src="{images[0]}" alt="Main image for {business_name}" data-ai-business-main-image fetchpriority="high" loading="eager">
-          </div>
-        </div>
+        {hero_image_html}
       </div>
     </div>
   </header>
@@ -10126,8 +10135,8 @@ def get_site_templates():
 def discover_leads(request: DiscoverLeadsRequest):
     preset = resolve_lead_preset(request.presetId, request.industry, request.query)
     location = compact_text(request.location, "Durban, South Africa")
-    limit = max(1, min(int(request.limit or 5), 100))
-    apify_limit = min(max(limit * 2, 10), 100)
+    limit = max(1, min(int(request.limit or 5), 10000))
+    apify_limit = min(max(limit * 2, 10), 10000)
     primary_query = build_google_maps_query(preset, location, request.query)
 
     if not request.forceRefresh:
@@ -11736,7 +11745,11 @@ def campaign_summary_from_row(db: sqlite3.Connection, row: sqlite3.Row, include_
     status = (
         "COMPLETED" if total_channel_leads and live_channel_leads == total_channel_leads
         else "NEEDS_ATTENTION" if failed
-        else persisted_status if persisted_status in {"INTAKE_PENDING", "INTAKE_PROCESSING", "INTAKE_PARTIAL", "BLOCKED_SETUP", "IMPORT_QUEUED", "IMPORT_PROCESSING", "IMPORT_FAILED"}
+        else persisted_status if persisted_status in {
+            "INTAKE_PENDING", "INTAKE_PROCESSING", "INTAKE_PARTIAL",
+            "TICKET_SYNC_PENDING", "TICKET_SYNCING", "TICKET_SYNC_PARTIAL",
+            "BLOCKED_SETUP", "IMPORT_QUEUED", "IMPORT_PROCESSING", "IMPORT_FAILED",
+        }
         else persisted_status if not total_channel_leads
         else "ACTIVE"
     )
@@ -12385,6 +12398,8 @@ def ensure_uploaded_campaign_lead(
     campaign: sqlite3.Row,
     lead: DiscoveredLead,
     channels: List[str],
+    *,
+    sync_tickets: bool = True,
 ) -> Dict[str, Any]:
     if lead_has_website(lead):
         raise ValueError("The row has a website or domain and is not eligible for the no-website campaign.")
@@ -12537,6 +12552,10 @@ def ensure_uploaded_campaign_lead(
                     )
             created_records += 1
 
+        approval_ids.append(approval_id)
+        if not sync_tickets:
+            continue
+
         approval = get_approval_or_404(approval_id)
         channel_context = safe_json_loads(approval["context_json"], {**context, "contactChannel": channel})
         tickets = create_zendesk_intake_tickets(
@@ -12554,7 +12573,6 @@ def ensure_uploaded_campaign_lead(
                 f"UPDATE {table} SET ticket_id = ?, status = ?, updated_at = ? WHERE approval_id = ?",
                 (ticket_id, "TICKET_READY", now_iso(), approval_id),
             )
-        approval_ids.append(approval_id)
         ticket_ids.append(int(ticket_id))
 
     return {
@@ -12617,7 +12635,7 @@ def refresh_campaign_import_job(job_id: str) -> Dict[str, Any]:
         db.execute(
             "UPDATE campaigns SET status = ?, discovered_count = ?, updated_at = ? WHERE id = ?",
             (
-                "ACTIVE" if status == "COMPLETED" else "IMPORT_FAILED" if status == "FAILED" else "IMPORT_PROCESSING",
+                "TICKET_SYNC_PENDING" if status == "COMPLETED" else "IMPORT_FAILED" if status == "FAILED" else "IMPORT_PROCESSING",
                 counts.get("COMPLETE", 0), timestamp, job["campaign_id"],
             ),
         )
@@ -12660,7 +12678,7 @@ async def create_campaign_import(
     industry: str = Form("Local service"),
     location: str = Form("South Africa"),
     channels: str = Form("email,phone"),
-    chunkSize: int = Form(5),
+    chunkSize: int = Form(100),
     autoGenerateMetadata: bool = Form(False),
     background: bool = Form(False),
 ):
@@ -12669,8 +12687,7 @@ async def create_campaign_import(
     if not campaign_name and not autoGenerateMetadata:
         raise HTTPException(status_code=400, detail="Campaign name is required.")
     selected_channels = ["email", "phone"]
-    verify_zendesk_ticket_contracts(selected_channels)
-    safe_chunk_size = max(1, min(int(chunkSize or 5), 25))
+    safe_chunk_size = max(1, min(int(chunkSize or 100), 500))
     content = await file.read()
     max_bytes = int(os.getenv("CAMPAIGN_UPLOAD_MAX_BYTES", str(50 * 1024 * 1024)))
     if not content:
@@ -12814,7 +12831,6 @@ def process_campaign_import(job_id: str):
     job = get_campaign_import_job_or_404(job_id)
     if job["status"] == "COMPLETED":
         return campaign_import_job_summary(job)
-    verify_zendesk_ticket_contracts(safe_json_loads(job["channels_json"], ["email", "phone"]))
     with get_pipeline_db() as db:
         db.execute("BEGIN IMMEDIATE")
         stale_before = (datetime.now() - timedelta(minutes=5)).isoformat()
@@ -12853,7 +12869,12 @@ def process_campaign_import(job_id: str):
             lead = normalize_uploaded_lead(
                 raw_row, item["row_number"], compact_text(campaign["industry"], "Local service"), compact_text(campaign["location"], "South Africa")
             )
-            result = ensure_uploaded_campaign_lead(campaign, lead, channels_for_job)
+            result = ensure_uploaded_campaign_lead(
+                campaign,
+                lead,
+                channels_for_job,
+                sync_tickets=False,
+            )
             with get_pipeline_db() as db:
                 db.execute(
                     """
@@ -12916,7 +12937,10 @@ def run_campaign_import_background(job_id: str) -> None:
                 return
             before = int(job["processed_rows"] or 0)
             result = process_campaign_import(job_id)
-            if result["status"] in {"COMPLETED", "FAILED"}:
+            if result["status"] == "COMPLETED":
+                schedule_campaign_zendesk_sync(result.get("campaignId"))
+                return
+            if result["status"] == "FAILED":
                 return
             if int(result.get("processedRows") or 0) == before:
                 time.sleep(1.5)
@@ -13109,7 +13133,12 @@ def ensure_discovered_campaign_channel_record(
     return row
 
 
-def reconcile_discovered_campaign_intake(campaign_id: str, *, idempotent_replay: bool) -> Dict[str, Any]:
+def reconcile_discovered_campaign_intake(
+    campaign_id: str,
+    *,
+    idempotent_replay: bool,
+    sync_tickets: bool = True,
+) -> Dict[str, Any]:
     with get_pipeline_db() as db:
         campaign = db.execute(
             "SELECT * FROM campaigns WHERE id = ? AND idempotency_key IS NOT NULL", (campaign_id,)
@@ -13141,6 +13170,8 @@ def reconcile_discovered_campaign_intake(campaign_id: str, *, idempotent_replay:
         for channel in available:
             expected_count += 1
             row = ensure_discovered_campaign_channel_record(campaign, lead, channel)
+            if not sync_tickets:
+                continue
             approval = get_approval_or_404(row["approval_id"])
             context = safe_json_loads(approval["context_json"], {})
             table = "campaign_email_leads" if channel == "email" else "campaign_call_leads"
@@ -13220,7 +13251,12 @@ def reconcile_discovered_campaign_intake(campaign_id: str, *, idempotent_replay:
         ]
         warnings = [*warnings, *errors]
         pending_count = max(0, expected_count - ready_count)
-        status = "ACTIVE" if pending_count == 0 else "INTAKE_PARTIAL"
+        if pending_count == 0:
+            status = "ACTIVE"
+        elif sync_tickets:
+            status = "INTAKE_PARTIAL"
+        else:
+            status = "TICKET_SYNC_PENDING"
         timestamp = now_iso()
         db.execute(
             """
@@ -13255,8 +13291,11 @@ def reconcile_discovered_campaign_intake(campaign_id: str, *, idempotent_replay:
     return result
 
 
-@app.post("/api/campaigns/intake")
-def create_campaign_intake(request: CampaignIntakeRequest):
+def create_campaign_intake_internal(
+    request: CampaignIntakeRequest,
+    *,
+    sync_tickets: bool,
+) -> Dict[str, Any]:
     require_zendesk_workspace_ready()
     campaign_name = compact_text(request.campaignName)
     if not campaign_name and not request.autoGenerateMetadata:
@@ -13268,14 +13307,19 @@ def create_campaign_intake(request: CampaignIntakeRequest):
             detail="Campaigns cannot run in local-only mode. Zendesk ticket creation is required.",
         )
 
-    verify_zendesk_ticket_contracts(channels)
+    if sync_tickets:
+        verify_zendesk_ticket_contracts(channels)
     idempotency_key = campaign_request_idempotency_key(request, channels)
     with get_pipeline_db() as db:
         existing_campaign = db.execute(
             "SELECT * FROM campaigns WHERE idempotency_key = ?", (idempotency_key,)
         ).fetchone()
     if existing_campaign:
-        return reconcile_discovered_campaign_intake(existing_campaign["id"], idempotent_replay=True)
+        return reconcile_discovered_campaign_intake(
+            existing_campaign["id"],
+            idempotent_replay=True,
+            sync_tickets=sync_tickets,
+        )
 
     discovery = discover_leads(
         DiscoverLeadsRequest(
@@ -13324,11 +13368,24 @@ def create_campaign_intake(request: CampaignIntakeRequest):
             if existing_campaign:
                 raced_campaign_id = existing_campaign["id"]
     if raced_campaign_id:
-        return reconcile_discovered_campaign_intake(raced_campaign_id, idempotent_replay=True)
-    result = reconcile_discovered_campaign_intake(campaign_id, idempotent_replay=False)
+        return reconcile_discovered_campaign_intake(
+            raced_campaign_id,
+            idempotent_replay=True,
+            sync_tickets=sync_tickets,
+        )
+    result = reconcile_discovered_campaign_intake(
+        campaign_id,
+        idempotent_replay=False,
+        sync_tickets=sync_tickets,
+    )
     result["metadataSuggestion"] = metadata_suggestion
     result["mixedChannelCounts"] = mixed_counts
     return result
+
+
+@app.post("/api/campaigns/intake")
+def create_campaign_intake(request: CampaignIntakeRequest):
+    return create_campaign_intake_internal(request, sync_tickets=True)
 
 
 def campaign_intake_job_summary(row: sqlite3.Row) -> Dict[str, Any]:
@@ -13384,20 +13441,20 @@ def run_campaign_intake_background(job_id: str) -> None:
             db.execute(
                 """
                 UPDATE campaign_intake_jobs
-                SET status = 'RUNNING', stage = 'SEARCHING_AND_CREATING_TICKETS',
+                SET status = 'RUNNING', stage = 'DISCOVERING_LEADS',
                     progress_percent = 10, error = NULL, started_at = COALESCE(started_at, ?),
                     updated_at = ?
                 WHERE id = ?
                 """,
                 (started_at, started_at, job_id),
             )
-        result = create_campaign_intake(request)
+        result = create_campaign_intake_internal(request, sync_tickets=False)
         completed_at = now_iso()
         with get_pipeline_db() as db:
             db.execute(
                 """
                 UPDATE campaign_intake_jobs
-                SET status = 'COMPLETED', stage = 'COMPLETED', progress_percent = 100,
+                SET status = 'COMPLETED', stage = 'LEADS_READY', progress_percent = 100,
                     campaign_id = ?, result_json = ?, error = NULL, updated_at = ?, completed_at = ?
                 WHERE id = ?
                 """,
@@ -13409,6 +13466,7 @@ def run_campaign_intake_background(job_id: str) -> None:
                     job_id,
                 ),
             )
+        schedule_campaign_zendesk_sync(result.get("campaignId"))
     except Exception as error:
         message = campaign_background_error_message(error)
         completed_at = now_iso()
@@ -13451,7 +13509,6 @@ def create_campaign_intake_job(request: CampaignIntakeRequest):
     campaign_name = compact_text(request.campaignName)
     if not campaign_name and not request.autoGenerateMetadata:
         raise HTTPException(status_code=400, detail="Campaign name is required.")
-    verify_zendesk_ticket_contracts(["email", "phone"])
     job_id = str(uuid4())
     queued_request = request.model_copy(deep=True)
     if queued_request.forceRefresh and not compact_text(queued_request.idempotencyKey):
@@ -13534,10 +13591,21 @@ def resume_campaign_background_jobs_on_startup() -> None:
                 """
             ).fetchall()
         ]
+        zendesk_sync_campaign_ids = [
+            row["id"]
+            for row in db.execute(
+                """
+                SELECT id FROM campaigns
+                WHERE status IN ('TICKET_SYNC_PENDING', 'TICKET_SYNCING', 'TICKET_SYNC_PARTIAL')
+                """
+            ).fetchall()
+        ]
     for job_id in intake_job_ids:
         schedule_campaign_intake_job(job_id)
     for job_id in import_job_ids:
         schedule_campaign_import_job(job_id)
+    for campaign_id in zendesk_sync_campaign_ids:
+        schedule_campaign_zendesk_sync(campaign_id)
 
 
 @app.post("/api/campaigns/{campaign_id}/sync-zendesk")
@@ -13551,7 +13619,6 @@ def sync_campaign_to_zendesk(campaign_id: str):
         if not campaign:
             raise HTTPException(status_code=404, detail="Campaign not found.")
         campaign_channels = [value for value in compact_text(campaign["channel_filter"]).split(",") if value]
-        verify_zendesk_ticket_contracts(campaign_channels)
         discovery_campaign = bool(compact_text(campaign["batch_id"]))
         email_rows = db.execute(
             "SELECT * FROM campaign_email_leads WHERE campaign_id = ? AND ticket_id IS NULL",
@@ -13561,6 +13628,7 @@ def sync_campaign_to_zendesk(campaign_id: str):
             "SELECT * FROM campaign_call_leads WHERE campaign_id = ? AND ticket_id IS NULL",
             (campaign_id,),
         ).fetchall()
+    verify_zendesk_ticket_contracts(campaign_channels)
 
     if discovery_campaign:
         return reconcile_discovered_campaign_intake(campaign_id, idempotent_replay=True)
@@ -13596,6 +13664,108 @@ def sync_campaign_to_zendesk(campaign_id: str):
     detail = get_campaign(campaign_id)
     detail["sync"] = {"synced": synced, "errors": errors}
     return detail
+
+
+def pending_campaign_ticket_count(campaign_id: str) -> int:
+    with get_pipeline_db() as db:
+        return int(
+            db.execute(
+                """
+                SELECT (
+                    SELECT COUNT(*) FROM campaign_email_leads
+                    WHERE campaign_id = ? AND ticket_id IS NULL
+                ) + (
+                    SELECT COUNT(*) FROM campaign_call_leads
+                    WHERE campaign_id = ? AND ticket_id IS NULL
+                ) AS count
+                """,
+                (campaign_id, campaign_id),
+            ).fetchone()["count"]
+            or 0
+        )
+
+
+def run_campaign_zendesk_sync_background(campaign_id: str) -> None:
+    last_error = ""
+    try:
+        for attempt in range(1, 4):
+            if pending_campaign_ticket_count(campaign_id) == 0:
+                with get_pipeline_db() as db:
+                    db.execute(
+                        "UPDATE campaigns SET status = 'ACTIVE', updated_at = ? WHERE id = ?",
+                        (now_iso(), campaign_id),
+                    )
+                return
+
+            with get_pipeline_db() as db:
+                db.execute(
+                    "UPDATE campaigns SET status = 'TICKET_SYNCING', updated_at = ? WHERE id = ?",
+                    (now_iso(), campaign_id),
+                )
+            try:
+                result = sync_campaign_to_zendesk(campaign_id)
+                errors = (result.get("sync") or {}).get("errors") or []
+                pending = pending_campaign_ticket_count(campaign_id)
+                if pending == 0:
+                    with get_pipeline_db() as db:
+                        db.execute(
+                            "UPDATE campaigns SET status = 'ACTIVE', updated_at = ? WHERE id = ?",
+                            (now_iso(), campaign_id),
+                        )
+                    return
+                last_error = "; ".join(compact_text(value) for value in errors if compact_text(value))
+                if not last_error:
+                    last_error = f"{pending} Zendesk ticket records remain pending."
+            except Exception as error:
+                last_error = campaign_background_error_message(error)
+
+            log_event(
+                "warning",
+                "campaign.zendesk_sync.retry",
+                "Zendesk ticket synchronization will retry.",
+                campaignId=campaign_id,
+                attempt=attempt,
+                pending=pending_campaign_ticket_count(campaign_id),
+                reason=last_error,
+            )
+            if attempt < 3:
+                time.sleep(1.5 * attempt)
+
+        with get_pipeline_db() as db:
+            campaign = db.execute("SELECT warnings_json FROM campaigns WHERE id = ?", (campaign_id,)).fetchone()
+            warnings = safe_json_loads(campaign["warnings_json"], []) if campaign else []
+            warning = f"Zendesk synchronization remains pending after three attempts: {last_error}"
+            if warning not in warnings:
+                warnings.append(warning)
+            db.execute(
+                """
+                UPDATE campaigns
+                SET status = 'TICKET_SYNC_PARTIAL', warnings_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (json.dumps(warnings, default=str), now_iso(), campaign_id),
+            )
+    finally:
+        with BACKGROUND_JOB_LOCK:
+            ACTIVE_CAMPAIGN_ZENDESK_SYNCS.discard(campaign_id)
+
+
+def schedule_campaign_zendesk_sync(campaign_id: Optional[str]) -> bool:
+    normalized_campaign_id = compact_text(campaign_id)
+    if not normalized_campaign_id or pending_campaign_ticket_count(normalized_campaign_id) == 0:
+        return False
+    with BACKGROUND_JOB_LOCK:
+        if normalized_campaign_id in ACTIVE_CAMPAIGN_ZENDESK_SYNCS:
+            return False
+        ACTIVE_CAMPAIGN_ZENDESK_SYNCS.add(normalized_campaign_id)
+    worker = threading.Thread(
+        target=run_campaign_zendesk_sync_background,
+        args=(normalized_campaign_id,),
+        name=f"campaign-zendesk-{normalized_campaign_id[:8]}",
+        daemon=True,
+    )
+    worker.start()
+    return True
 
 
 @app.get("/api/operations/groups")
