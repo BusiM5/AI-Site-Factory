@@ -2,6 +2,7 @@
   "name": "frontend",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "dependencies": {
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",
@@ -23,7 +24,7 @@
   "scripts": {
     "start": "vite --host 127.0.0.1",
     "build": "vite build",
-    "test": "npm run build",
+    "test": "node --test src/*.test.mjs && vite build",
     "dev": "vite --host 127.0.0.1",
     "preview": "vite preview --host 127.0.0.1"
   },

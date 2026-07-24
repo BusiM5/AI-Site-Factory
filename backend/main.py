@@ -1,5 +1,5 @@
-from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from datetime import datetime, timedelta, timezone
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 from uuid import NAMESPACE_URL, uuid4, uuid5
 import base64
 import binascii
@@ -57,7 +57,7 @@ file_handler.setFormatter(log_formatter)
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
-STARTED_AT = datetime.now()
+STARTED_AT = datetime.now(timezone.utc)
 LOG_BUFFER = deque(maxlen=int(os.getenv("APP_LOG_BUFFER_SIZE", "250")))
 SENSITIVE_KEY_PATTERN = re.compile(r"(token|key|secret|password|authorization|auth|email)", re.IGNORECASE)
 MODEL_CHUNK_CHARS = int(os.getenv("MODEL_CHUNK_CHARS", "1800"))
@@ -1008,29 +1008,42 @@ LEAD_PRESETS = [
 ]
 
 APIFY_PRESET_SEARCH_VARIANTS: Dict[str, List[str]] = {
-    "restaurants": ["restaurants", "cafes", "takeaways"],
-    "plumbers": ["plumbers", "emergency plumbers", "plumbing services"],
-    "dentists": ["dentists", "dental clinics", "cosmetic dentists"],
-    "beauty salons": ["beauty salons", "nail salons", "day spas"],
-    "gyms fitness studios": ["gyms", "fitness centers", "personal trainers"],
+    "restaurants": ["restaurants", "cafes", "takeaways", "food outlets", "local eateries", "family restaurants"],
+    "plumbers": ["plumbers", "emergency plumbers", "plumbing services", "drain cleaning", "leak repair", "geyser repair"],
+    "dentists": ["dentists", "dental clinics", "cosmetic dentists", "family dentists", "oral care clinics", "dental practices"],
+    "beauty salons": ["beauty salons", "nail salons", "day spas", "hair salons", "beauty spas", "skin care clinics"],
+    "gyms fitness studios": ["gyms", "fitness centers", "personal trainers", "fitness studios", "health clubs", "wellness studios"],
     "electricians electrical services": [
         "electricians",
         "electrical installation services",
         "electrical repair services",
+        "emergency electricians",
+        "electrical contractors",
+        "solar electricians",
     ],
-    "roofers roofing contractors": ["roofers", "roofing contractors", "waterproofing services"],
+    "roofers roofing contractors": [
+        "roofers",
+        "roofing contractors",
+        "waterproofing services",
+        "roof repair",
+        "gutter installation",
+        "roof maintenance",
+    ],
     "hvac air conditioning heating": [
         "HVAC contractors",
         "air conditioning services",
         "refrigeration services",
+        "air conditioning repair",
+        "heating contractors",
+        "ventilation services",
     ],
-    "auto repair mechanics": ["auto repair shops", "mechanics", "panel beaters"],
-    "locksmiths": ["locksmiths", "emergency locksmiths", "key cutting services"],
-    "pest control": ["pest control", "exterminators", "fumigation services"],
-    "cleaning services": ["cleaning services", "office cleaning", "carpet cleaning"],
-    "landscapers garden services": ["landscapers", "garden services", "irrigation services"],
-    "painters painting contractors": ["painters", "painting contractors", "commercial painters"],
-    "accountants bookkeeping tax": ["accountants", "bookkeeping services", "tax consultants"],
+    "auto repair mechanics": ["auto repair shops", "mechanics", "panel beaters", "car service centers", "auto electricians", "brake repair"],
+    "locksmiths": ["locksmiths", "emergency locksmiths", "key cutting services", "mobile locksmiths", "lock repair", "security locksmiths"],
+    "pest control": ["pest control", "exterminators", "fumigation services", "termite control", "rodent control", "pest management"],
+    "cleaning services": ["cleaning services", "office cleaning", "carpet cleaning", "house cleaning", "industrial cleaning", "deep cleaning"],
+    "landscapers garden services": ["landscapers", "garden services", "irrigation services", "garden maintenance", "lawn care", "tree services"],
+    "painters painting contractors": ["painters", "painting contractors", "commercial painters", "house painters", "industrial painters", "painting services"],
+    "accountants bookkeeping tax": ["accountants", "bookkeeping services", "tax consultants", "payroll services", "accounting firms", "tax practitioners"],
 }
 
 
@@ -1421,6 +1434,19 @@ class DiscoverLeadsResponse(BaseModel):
     websitesSkipped: int = 0
     noContactSkipped: int = 0
     generatedDuplicatesSkipped: int = 0
+    currentSearchDuplicatesSkipped: int = 0
+    alreadyDeployedSkipped: int = 0
+    activeDeploymentSkipped: int = 0
+    policyExcludedSkipped: int = 0
+    locationSkipped: int = 0
+    invalidRecordSkipped: int = 0
+    reusedPendingOrFailed: int = 0
+    targetOverflowSkipped: int = 0
+    shortfall: int = 0
+    stopReason: str = "RESULTS_EXHAUSTED"
+    searchVariantCount: int = 0
+    providerStatus: str = "UNKNOWN"
+    providerDurationSeconds: float = 0
     emailLeads: int = 0
     phoneLeads: int = 0
     emailAndPhoneLeads: int = 0
@@ -1810,7 +1836,30 @@ SOUTH_AFRICA_PROVINCES = [
 
 
 def now_iso() -> str:
-    return datetime.now().isoformat()
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def parse_api_datetime(value: Optional[str]) -> Optional[datetime]:
+    cleaned = compact_text(value)
+    if not cleaned:
+        return None
+    try:
+        parsed = datetime.fromisoformat(cleaned.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def elapsed_seconds(start_value: Optional[str], end_value: Optional[str] = None) -> float:
+    started = parse_api_datetime(start_value)
+    if not started:
+        return 0.0
+    finished = parse_api_datetime(end_value) if end_value else datetime.now(timezone.utc)
+    if not finished:
+        finished = datetime.now(timezone.utc)
+    return round(max(0.0, (finished - started).total_seconds()), 1)
 
 
 def env_enabled(name: str, default: bool = False) -> bool:
@@ -2870,6 +2919,108 @@ def generated_lead_identity_conflicts(lead: DiscoveredLead, canonical_key: str) 
     return conflicts
 
 
+DISCOVERY_REUSABLE_PRIOR_STATUSES = {
+    "AWAITING_DEPLOYMENT",
+    "PENDING",
+    "GENERATION_FAILED",
+    "EXPORT_FAILED",
+    "PUBLISH_FAILED",
+    "DEPLOY_FAILED",
+}
+DISCOVERY_ACTIVE_PRIOR_STATUSES = {"EXPORTING", "DEPLOY_REQUESTED", "DEPLOYING"}
+DISCOVERY_LIVE_PRIOR_STATUSES = {"APPROVED", "DEPLOYED_ZENDESK_FAILED"}
+LIVE_DEPLOYMENT_STATES = {"ready", "live", "published", "active", "succeeded", "success"}
+
+
+def prior_lead_usage_index() -> Dict[str, List[Dict[str, Any]]]:
+    with get_pipeline_db() as db:
+        approval_rows = db.execute(
+            """
+            SELECT id, canonical_lead_key, lead_key, business_name, status,
+                   context_json, deployment_history_id
+            FROM approval_records
+            """
+        ).fetchall()
+        deployment_rows = db.execute(
+            """
+            SELECT canonical_lead_key, approval_id, state, url, approval_status
+            FROM deployment_history
+            """
+        ).fetchall()
+
+    live_canonical_keys: Set[str] = set()
+    live_approval_ids: Set[str] = set()
+    for row in deployment_rows:
+        state = compact_text(row["state"]).lower()
+        approval_status = compact_text(row["approval_status"]).upper()
+        if state in LIVE_DEPLOYMENT_STATES or (
+            compact_text(row["url"]) and approval_status in {"APPROVED", "DEPLOYED", "DEPLOYED_ZENDESK_FAILED"}
+        ):
+            live_canonical_keys.add(compact_text(row["canonical_lead_key"]))
+            live_approval_ids.add(compact_text(row["approval_id"]))
+
+    index: Dict[str, List[Dict[str, Any]]] = {}
+    for row in approval_rows:
+        canonical_key = compact_text(row["canonical_lead_key"])
+        context = safe_json_loads(row["context_json"], {})
+        existing_lead = DiscoveredLead(
+            leadKey=row["lead_key"] or canonical_key,
+            canonicalLeadKey=canonical_key,
+            businessName=context.get("businessName") or row["business_name"] or "Existing lead",
+            email=context.get("email"),
+            phone=context.get("phone"),
+            website=context.get("website"),
+            domain=context.get("domain"),
+            category=context.get("category") or context.get("industry") or "General Services",
+            address=context.get("address"),
+            location=context.get("location") or "South Africa",
+            source=context.get("source") or "approval-record",
+            sourceUrl=context.get("sourceUrl"),
+            raw=context.get("rawLead") if isinstance(context.get("rawLead"), dict) else {},
+        )
+        record = {
+            "approvalId": row["id"],
+            "canonicalLeadKey": canonical_key,
+            "status": compact_text(row["status"]).upper(),
+            "live": (
+                canonical_key in live_canonical_keys
+                or compact_text(row["id"]) in live_approval_ids
+                or (
+                    compact_text(row["status"]).upper() in DISCOVERY_LIVE_PRIOR_STATUSES
+                    and bool(row["deployment_history_id"])
+                )
+            ),
+        }
+        identity_keys = {identity_key for _identity_type, identity_key in lead_identity_pairs(existing_lead)}
+        identity_keys.add(f"canonical:{canonical_key}")
+        for identity_key in identity_keys:
+            index.setdefault(identity_key, []).append(record)
+    return index
+
+
+def classify_prior_lead_usage(
+    lead: DiscoveredLead,
+    canonical_key: str,
+    usage_index: Dict[str, List[Dict[str, Any]]],
+) -> str:
+    identity_keys = {identity_key for _identity_type, identity_key in lead_identity_pairs(lead)}
+    identity_keys.add(f"canonical:{canonical_key}")
+    matching: Dict[str, Dict[str, Any]] = {}
+    for identity_key in identity_keys:
+        for record in usage_index.get(identity_key, []):
+            matching[record["approvalId"]] = record
+    records = list(matching.values())
+    if any(record["live"] for record in records):
+        return "ALREADY_DEPLOYED"
+    if any(record["status"] in DISCOVERY_ACTIVE_PRIOR_STATUSES for record in records):
+        return "ACTIVE_DEPLOYMENT"
+    if any(record["status"] in DISCOVERY_REUSABLE_PRIOR_STATUSES for record in records):
+        return "REUSABLE_PENDING_OR_FAILED"
+    if records:
+        return "POLICY_EXCLUDED"
+    return "NEW"
+
+
 def select_mixed_contact_leads(leads: List[DiscoveredLead], limit: int) -> List[DiscoveredLead]:
     buckets: Dict[str, List[DiscoveredLead]] = {"email_phone": [], "email": [], "phone": []}
     for lead in leads:
@@ -3100,6 +3251,11 @@ def cached_discovery_response(
     seen_keys: Set[str] = set()
     seen_identities: Set[str] = set()
     revalidated_duplicates = 0
+    revalidated_deployed = 0
+    revalidated_active = 0
+    revalidated_policy = 0
+    revalidated_reused = 0
+    usage_index = prior_lead_usage_index()
     for lead in cached_leads:
         canonical_key = canonical_lead_key_for_lead(lead)
         lead.canonicalLeadKey = canonical_key
@@ -3108,13 +3264,24 @@ def cached_discovery_response(
             continue
         if (
             canonical_key in seen_keys
-            or generated_lead_identity_conflicts(lead, canonical_key)
             or identities.intersection(seen_identities)
         ):
             revalidated_duplicates += 1
             continue
         seen_keys.add(canonical_key)
         seen_identities.update(identities)
+        prior_usage = classify_prior_lead_usage(lead, canonical_key, usage_index)
+        if prior_usage == "ALREADY_DEPLOYED":
+            revalidated_deployed += 1
+            continue
+        if prior_usage == "ACTIVE_DEPLOYMENT":
+            revalidated_active += 1
+            continue
+        if prior_usage == "POLICY_EXCLUDED":
+            revalidated_policy += 1
+            continue
+        if prior_usage == "REUSABLE_PENDING_OR_FAILED":
+            revalidated_reused += 1
         eligible.append(lead)
     leads = select_mixed_contact_leads(eligible, limit)
     if not leads:
@@ -3122,6 +3289,18 @@ def cached_discovery_response(
 
     email_count = sum(1 for lead in leads if normalize_email_identity(lead.email))
     phone_count = sum(1 for lead in leads if compact_text(lead.phone))
+    province_stats = safe_json_loads(row["province_stats_json"], {})
+    stat_rows = list(province_stats.values()) if isinstance(province_stats, dict) else []
+
+    def cached_stat(key: str) -> int:
+        return sum(int((value or {}).get(key) or 0) for value in stat_rows if isinstance(value, dict))
+
+    first_stats = next((value for value in stat_rows if isinstance(value, dict)), {})
+    current_search_duplicates = cached_stat("currentSearchDuplicatesSkipped") + revalidated_duplicates
+    already_deployed = cached_stat("alreadyDeployedSkipped") + revalidated_deployed
+    active_deployment = cached_stat("activeDeploymentSkipped") + revalidated_active
+    policy_excluded = cached_stat("policyExcludedSkipped") + revalidated_policy
+    shortfall = max(0, limit - len(leads))
 
     return DiscoverLeadsResponse(
         batchId=row["batch_id"],
@@ -3131,14 +3310,27 @@ def cached_discovery_response(
         leads=leads,
         sourceStatus="CACHE",
         warnings=safe_json_loads(row["warnings_json"], []),
-        provinceStats=safe_json_loads(row["province_stats_json"], {}),
-        duplicatesSkipped=(row["duplicates_skipped"] or 0) + revalidated_duplicates,
+        provinceStats=province_stats,
+        duplicatesSkipped=current_search_duplicates,
         requestedCount=limit,
-        rawFetched=len(cached_leads),
+        rawFetched=cached_stat("rawItems") or len(cached_leads),
         eligibleReturned=len(leads),
-        websitesSkipped=sum(1 for lead in cached_leads if lead_has_website(lead)),
-        noContactSkipped=sum(1 for lead in cached_leads if not lead_has_contact(lead)),
-        generatedDuplicatesSkipped=(row["duplicates_skipped"] or 0) + revalidated_duplicates,
+        websitesSkipped=cached_stat("websitesSkipped") or sum(1 for lead in cached_leads if lead_has_website(lead)),
+        noContactSkipped=cached_stat("noContactSkipped") or sum(1 for lead in cached_leads if not lead_has_contact(lead)),
+        generatedDuplicatesSkipped=already_deployed + active_deployment + policy_excluded,
+        currentSearchDuplicatesSkipped=current_search_duplicates,
+        alreadyDeployedSkipped=already_deployed,
+        activeDeploymentSkipped=active_deployment,
+        policyExcludedSkipped=policy_excluded,
+        locationSkipped=cached_stat("locationSkipped"),
+        invalidRecordSkipped=cached_stat("invalidRecordSkipped"),
+        reusedPendingOrFailed=cached_stat("reusedPendingOrFailed") + revalidated_reused,
+        targetOverflowSkipped=cached_stat("targetOverflowSkipped") + max(0, len(eligible) - len(leads)),
+        shortfall=shortfall,
+        stopReason="TARGET_MET" if not shortfall else first_stats.get("stopReason") or "RESULTS_EXHAUSTED",
+        searchVariantCount=int(first_stats.get("searchVariantCount") or 0),
+        providerStatus=first_stats.get("providerStatus") or "CACHE",
+        providerDurationSeconds=float(first_stats.get("providerDurationSeconds") or 0),
         emailLeads=email_count,
         phoneLeads=phone_count,
         emailAndPhoneLeads=sum(
@@ -4449,7 +4641,27 @@ def apify_google_maps_search_variants(query: str, location: str = "") -> List[st
     return configured or [primary]
 
 
+class ApifySearchItems(list):
+    def __init__(
+        self,
+        items: Iterable[Dict[str, Any]],
+        *,
+        run_id: str,
+        status: str,
+        duration_seconds: float,
+        search_variant_count: int,
+        partial: bool,
+    ):
+        super().__init__(items)
+        self.run_id = run_id
+        self.status = status
+        self.duration_seconds = duration_seconds
+        self.search_variant_count = search_variant_count
+        self.partial = partial
+
+
 def run_apify_google_maps(query: str, limit: int, location: str = "South Africa") -> List[Dict[str, Any]]:
+    provider_started = time.monotonic()
     token = require_env("APIFY_API_TOKEN")
     actor_id = os.getenv("APIFY_GOOGLE_MAPS_ACTOR_ID", "compass/crawler-google-places").replace("/", "~")
     max_items = max(limit, 5)
@@ -4554,7 +4766,14 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
         itemCount=len(items),
         partial=status != "SUCCEEDED",
     )
-    return items
+    return ApifySearchItems(
+        items,
+        run_id=run_id,
+        status=status or "UNKNOWN",
+        duration_seconds=round(max(0.0, time.monotonic() - provider_started), 1),
+        search_variant_count=len(search_terms),
+        partial=status != "SUCCEEDED",
+    )
 
 
 def item_matches_requested_location(
@@ -4628,10 +4847,13 @@ def normalize_apify_items(
     fallback_category: str,
     location: str,
     limit: int,
+    stats: Optional[Dict[str, int]] = None,
 ) -> List[DiscoveredLead]:
     leads: List[DiscoveredLead] = []
     seen = set()
     skipped_location = 0
+    skipped_invalid = 0
+    skipped_duplicate = 0
 
     for item in items:
         business_name = first_present(
@@ -4639,6 +4861,7 @@ def normalize_apify_items(
             ["title", "name", "businessName", "placeName", "companyName"],
         )
         if not business_name:
+            skipped_invalid += 1
             continue
 
         website = normalize_url(first_present(item, ["website", "site", "homepage"]))
@@ -4679,6 +4902,7 @@ def normalize_apify_items(
         lead_key = stable_lead_key(business_name, website, phone, address)
         canonical_key = canonical_lead_key_from_values(item, business_name, website, phone, address, source_url)
         if lead_key in seen:
+            skipped_duplicate += 1
             continue
         seen.add(lead_key)
 
@@ -4718,12 +4942,23 @@ def normalize_apify_items(
         if len(leads) >= limit:
             break
 
+    if stats is not None:
+        stats.update(
+            {
+                "locationSkipped": skipped_location,
+                "invalidRecordSkipped": skipped_invalid,
+                "currentSearchDuplicatesSkipped": skipped_duplicate,
+            }
+        )
+
     log_event(
         "info",
         "leads.normalize.finish",
         "Lead normalization finished.",
         returned=len(leads),
         skippedLocation=skipped_location,
+        skippedInvalid=skipped_invalid,
+        skippedDuplicate=skipped_duplicate,
         requestedLocation=location,
     )
 
@@ -10118,7 +10353,7 @@ def get_debug_status():
     return {
         "status": status,
         "startedAt": STARTED_AT.isoformat(),
-        "uptimeSeconds": int((datetime.now() - STARTED_AT).total_seconds()),
+        "uptimeSeconds": int((datetime.now(timezone.utc) - STARTED_AT).total_seconds()),
         "providers": providers,
         "chunking": {
             "modelChunkChars": MODEL_CHUNK_CHARS,
@@ -10181,12 +10416,14 @@ def get_lead_presets():
 def get_site_templates():
     return {"templates": [FREEFORM_SITE_SPEC], "deprecated": True}
 
-@app.post("/api/leads/discover", response_model=DiscoverLeadsResponse)
-def discover_leads(request: DiscoverLeadsRequest):
+def discover_leads_internal(
+    request: DiscoverLeadsRequest,
+    progress_callback: Optional[Callable[[str, float], None]] = None,
+) -> DiscoverLeadsResponse:
     preset = resolve_lead_preset(request.presetId, request.industry, request.query)
     location = compact_text(request.location, "Durban, South Africa")
     limit = max(1, min(int(request.limit or 5), 10000))
-    apify_limit = min(max(limit * 2, 10), 10000)
+    apify_limit = min(max(limit * 4, 20), 10000)
     primary_query = build_google_maps_query(preset, location, request.query)
 
     if not request.forceRefresh:
@@ -10208,7 +10445,16 @@ def discover_leads(request: DiscoverLeadsRequest):
     duplicates_skipped = 0
     no_contact_skipped = 0
     websites_skipped = 0
+    already_deployed_skipped = 0
+    active_deployment_skipped = 0
+    policy_excluded_skipped = 0
+    reused_pending_or_failed = 0
+    target_overflow_skipped = 0
+    normalization_stats: Dict[str, int] = {}
     raw_fetched = 0
+    provider_status = "UNKNOWN"
+    provider_duration_seconds = 0.0
+    search_variant_count = len(apify_google_maps_search_variants(primary_query, location))
     selected_leads: List[DiscoveredLead] = []
     eligible_leads: List[DiscoveredLead] = []
 
@@ -10221,6 +10467,14 @@ def discover_leads(request: DiscoverLeadsRequest):
             "duplicatesSkipped": 0,
             "websitesSkipped": 0,
             "noContactSkipped": 0,
+            "currentSearchDuplicatesSkipped": 0,
+            "alreadyDeployedSkipped": 0,
+            "activeDeploymentSkipped": 0,
+            "policyExcludedSkipped": 0,
+            "locationSkipped": 0,
+            "invalidRecordSkipped": 0,
+            "reusedPendingOrFailed": 0,
+            "targetOverflowSkipped": 0,
             "unqualifiedSkipped": 0,
             "eligible": 0,
             "emailLeads": 0,
@@ -10244,27 +10498,36 @@ def discover_leads(request: DiscoverLeadsRequest):
         fetch_limit = apify_limit
         query_items = run_apify_google_maps(primary_query, fetch_limit, location)
         raw_fetched = len(query_items)
+        provider_status = compact_text(getattr(query_items, "status", None), "UNKNOWN").upper()
+        provider_duration_seconds = float(getattr(query_items, "duration_seconds", 0.0) or 0.0)
+        search_variant_count = int(getattr(query_items, "search_variant_count", search_variant_count) or 0)
         province_stats[location]["rawItems"] = raw_fetched
+        if progress_callback:
+            progress_callback("VALIDATING_LEADS", 70)
 
         normalized = normalize_apify_items(
             query_items,
             preset["industry"],
             location,
             fetch_limit,
+            normalization_stats,
         )
         province_stats[location]["normalized"] = len(normalized)
+        province_stats[location]["locationSkipped"] = normalization_stats.get("locationSkipped", 0)
+        province_stats[location]["invalidRecordSkipped"] = normalization_stats.get("invalidRecordSkipped", 0)
+        duplicates_skipped += normalization_stats.get("currentSearchDuplicatesSkipped", 0)
 
         qualified = normalized
         province_stats[location]["qualified"] = len(qualified)
         seen_batch_keys = set()
         seen_batch_identities: Set[str] = set()
+        usage_index = prior_lead_usage_index()
 
         for lead in qualified:
             canonical_key = canonical_lead_key_for_lead(lead)
             lead.canonicalLeadKey = canonical_key
             lead.location = location
             identity_keys = [identity_key for _identity_type, identity_key in lead_identity_pairs(lead)]
-            identity_conflicts = generated_lead_identity_conflicts(lead, canonical_key)
 
             if lead_has_website(lead):
                 websites_skipped += 1
@@ -10278,18 +10541,29 @@ def discover_leads(request: DiscoverLeadsRequest):
 
             if (
                 canonical_key in seen_batch_keys
-                or identity_conflicts
                 or any(identity_key in seen_batch_identities for identity_key in identity_keys)
             ):
                 duplicates_skipped += 1
-                province_stats[location]["duplicatesSkipped"] += 1
                 continue
 
             seen_batch_keys.add(canonical_key)
             seen_batch_identities.update(identity_keys)
+            prior_usage = classify_prior_lead_usage(lead, canonical_key, usage_index)
+            if prior_usage == "ALREADY_DEPLOYED":
+                already_deployed_skipped += 1
+                continue
+            if prior_usage == "ACTIVE_DEPLOYMENT":
+                active_deployment_skipped += 1
+                continue
+            if prior_usage == "POLICY_EXCLUDED":
+                policy_excluded_skipped += 1
+                continue
+            if prior_usage == "REUSABLE_PENDING_OR_FAILED":
+                reused_pending_or_failed += 1
             eligible_leads.append(lead)
 
         selected_leads = select_mixed_contact_leads(eligible_leads, limit)
+        target_overflow_skipped = max(0, len(eligible_leads) - len(selected_leads))
 
     except Exception as error:
         message = sanitize_message(error)
@@ -10318,6 +10592,13 @@ def discover_leads(request: DiscoverLeadsRequest):
 
     province_stats[location]["selected"] = len(selected_leads)
     province_stats[location]["eligible"] = len(eligible_leads)
+    province_stats[location]["duplicatesSkipped"] = duplicates_skipped
+    province_stats[location]["currentSearchDuplicatesSkipped"] = duplicates_skipped
+    province_stats[location]["alreadyDeployedSkipped"] = already_deployed_skipped
+    province_stats[location]["activeDeploymentSkipped"] = active_deployment_skipped
+    province_stats[location]["policyExcludedSkipped"] = policy_excluded_skipped
+    province_stats[location]["reusedPendingOrFailed"] = reused_pending_or_failed
+    province_stats[location]["targetOverflowSkipped"] = target_overflow_skipped
     province_stats[location]["emailLeads"] = sum(1 for lead in selected_leads if normalize_email_identity(lead.email))
     province_stats[location]["phoneLeads"] = sum(1 for lead in selected_leads if normalize_phone_identity(lead.phone))
     province_stats[location]["emailAndPhoneLeads"] = sum(
@@ -10332,10 +10613,24 @@ def discover_leads(request: DiscoverLeadsRequest):
         warnings.append(
             f"Requested {limit} leads but only found {len(selected_leads)} contactable no-website leads. "
             f"Skipped {websites_skipped} with websites, {no_contact_skipped} without email/phone, "
-            f"and {duplicates_skipped} already generated or duplicate leads."
+            f"{duplicates_skipped} duplicates in this search, {already_deployed_skipped} already live, "
+            f"{active_deployment_skipped} actively deploying, and {policy_excluded_skipped} excluded by policy."
         )
 
     batch_id = str(uuid4())
+    shortfall = max(0, limit - len(selected_leads))
+    stop_reason = (
+        "TARGET_MET"
+        if not shortfall
+        else "PROVIDER_DEADLINE"
+        if provider_status == "TIMED-OUT" or provider_duration_seconds >= 105
+        else "RESULTS_EXHAUSTED"
+    )
+    province_stats[location]["shortfall"] = shortfall
+    province_stats[location]["stopReason"] = stop_reason
+    province_stats[location]["searchVariantCount"] = search_variant_count
+    province_stats[location]["providerStatus"] = provider_status
+    province_stats[location]["providerDurationSeconds"] = provider_duration_seconds
 
     response = DiscoverLeadsResponse(
         batchId=batch_id,
@@ -10352,7 +10647,20 @@ def discover_leads(request: DiscoverLeadsRequest):
         eligibleReturned=len(selected_leads),
         websitesSkipped=websites_skipped,
         noContactSkipped=no_contact_skipped,
-        generatedDuplicatesSkipped=duplicates_skipped,
+        generatedDuplicatesSkipped=already_deployed_skipped + active_deployment_skipped + policy_excluded_skipped,
+        currentSearchDuplicatesSkipped=duplicates_skipped,
+        alreadyDeployedSkipped=already_deployed_skipped,
+        activeDeploymentSkipped=active_deployment_skipped,
+        policyExcludedSkipped=policy_excluded_skipped,
+        locationSkipped=normalization_stats.get("locationSkipped", 0),
+        invalidRecordSkipped=normalization_stats.get("invalidRecordSkipped", 0),
+        reusedPendingOrFailed=reused_pending_or_failed,
+        targetOverflowSkipped=target_overflow_skipped,
+        shortfall=shortfall,
+        stopReason=stop_reason,
+        searchVariantCount=search_variant_count,
+        providerStatus=provider_status,
+        providerDurationSeconds=provider_duration_seconds,
         emailLeads=province_stats[location]["emailLeads"],
         phoneLeads=province_stats[location]["phoneLeads"],
         emailAndPhoneLeads=province_stats[location]["emailAndPhoneLeads"],
@@ -10394,6 +10702,11 @@ def discover_leads(request: DiscoverLeadsRequest):
     )
 
     return response
+
+
+@app.post("/api/leads/discover", response_model=DiscoverLeadsResponse)
+def discover_leads(request: DiscoverLeadsRequest):
+    return discover_leads_internal(request)
 
 @app.post("/api/pipeline/run", response_model=PipelineRunResponse)
 def run_pipeline(request: PipelineRunRequest):
@@ -13066,6 +13379,16 @@ def campaign_discovery_plan(campaign: sqlite3.Row) -> Tuple[List[DiscoveredLead]
     websites_skipped = total_stat("websitesSkipped")
     no_contact_skipped = total_stat("noContactSkipped")
     duplicates_skipped = total_stat("duplicatesSkipped") or int(batch["duplicates_skipped"] or 0)
+    current_search_duplicates = total_stat("currentSearchDuplicatesSkipped") or duplicates_skipped
+    already_deployed_skipped = total_stat("alreadyDeployedSkipped")
+    active_deployment_skipped = total_stat("activeDeploymentSkipped")
+    policy_excluded_skipped = total_stat("policyExcludedSkipped")
+    location_skipped = total_stat("locationSkipped")
+    invalid_record_skipped = total_stat("invalidRecordSkipped")
+    reused_pending_or_failed = total_stat("reusedPendingOrFailed")
+    target_overflow_skipped = total_stat("targetOverflowSkipped")
+    first_stats = next((value for value in stat_rows if isinstance(value, dict)), {})
+    shortfall = max(0, int(campaign["requested_count"] or 0) - len(leads))
     snapshot = {
         "batchId": batch_id,
         "preset": resolve_lead_preset(campaign["preset_id"], campaign["industry"], campaign["query"]),
@@ -13081,8 +13404,22 @@ def campaign_discovery_plan(campaign: sqlite3.Row) -> Tuple[List[DiscoveredLead]
         "eligibleReturned": len(leads),
         "websitesSkipped": websites_skipped,
         "noContactSkipped": no_contact_skipped,
-        "generatedDuplicatesSkipped": duplicates_skipped,
-        "shortfall": max(0, int(campaign["requested_count"] or 0) - len(leads)),
+        "generatedDuplicatesSkipped": (
+            already_deployed_skipped + active_deployment_skipped + policy_excluded_skipped
+        ),
+        "currentSearchDuplicatesSkipped": current_search_duplicates,
+        "alreadyDeployedSkipped": already_deployed_skipped,
+        "activeDeploymentSkipped": active_deployment_skipped,
+        "policyExcludedSkipped": policy_excluded_skipped,
+        "locationSkipped": location_skipped,
+        "invalidRecordSkipped": invalid_record_skipped,
+        "reusedPendingOrFailed": reused_pending_or_failed,
+        "targetOverflowSkipped": target_overflow_skipped,
+        "shortfall": shortfall,
+        "stopReason": first_stats.get("stopReason") or ("TARGET_MET" if not shortfall else "RESULTS_EXHAUSTED"),
+        "searchVariantCount": int(first_stats.get("searchVariantCount") or 0),
+        "providerStatus": first_stats.get("providerStatus") or "UNKNOWN",
+        "providerDurationSeconds": float(first_stats.get("providerDurationSeconds") or 0),
         "cached": True,
     }
     return leads, snapshot
@@ -13359,6 +13696,7 @@ def create_campaign_intake_internal(
     request: CampaignIntakeRequest,
     *,
     sync_tickets: bool,
+    progress_callback: Optional[Callable[[str, float], None]] = None,
 ) -> Dict[str, Any]:
     require_zendesk_workspace_ready()
     campaign_name = compact_text(request.campaignName)
@@ -13379,13 +13717,15 @@ def create_campaign_intake_internal(
             "SELECT * FROM campaigns WHERE idempotency_key = ?", (idempotency_key,)
         ).fetchone()
     if existing_campaign:
+        if progress_callback:
+            progress_callback("SAVING_CAMPAIGN", 85)
         return reconcile_discovered_campaign_intake(
             existing_campaign["id"],
             idempotent_replay=True,
             sync_tickets=sync_tickets,
         )
 
-    discovery = discover_leads(
+    discovery = discover_leads_internal(
         DiscoverLeadsRequest(
             presetId=request.presetId,
             industry=request.industry,
@@ -13393,9 +13733,24 @@ def create_campaign_intake_internal(
             query=request.query,
             limit=request.limit,
             forceRefresh=request.forceRefresh,
-        )
+        ),
+        progress_callback=progress_callback,
     )
+    if not discovery.leads:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "NO_ELIGIBLE_LEADS",
+                "message": (
+                    "The two-minute search completed without an eligible no-website lead. "
+                    "No contacts were invented; review the saved rejection breakdown."
+                ),
+                "discovery": discovery.model_dump(),
+            },
+        )
     mixed_counts = require_contactable_leads(discovery.leads, "The Apify search result")
+    if progress_callback:
+        progress_callback("SAVING_CAMPAIGN", 85)
     metadata_suggestion = suggest_campaign_metadata(
         discovery.leads,
         discovery.location,
@@ -13455,13 +13810,22 @@ def create_campaign_intake(request: CampaignIntakeRequest):
 def campaign_intake_job_summary(row: sqlite3.Row) -> Dict[str, Any]:
     request_payload = safe_json_loads(row["request_json"], {})
     result = safe_json_loads(row["result_json"], None)
+    terminal = row["status"] in {"COMPLETED", "FAILED"}
+    timing_end = row["completed_at"] if terminal else None
+    provider_started = parse_api_datetime(row["started_at"])
+    provider_deadline = (
+        (provider_started + timedelta(seconds=120)).isoformat().replace("+00:00", "Z")
+        if provider_started
+        else None
+    )
     return {
         "jobId": row["id"],
         "status": row["status"],
         "stage": row["stage"],
         "progressPercent": row["progress_percent"] or 0,
         "campaignId": row["campaign_id"],
-        "campaign": result,
+        "campaign": result if row["status"] == "COMPLETED" else None,
+        "failureDetails": result if row["status"] == "FAILED" else None,
         "error": row["error"],
         "request": {
             "campaignName": request_payload.get("campaignName"),
@@ -13475,6 +13839,12 @@ def campaign_intake_job_summary(row: sqlite3.Row) -> Dict[str, Any]:
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
         "startedAt": row["started_at"],
+        "providerStartedAt": row["started_at"],
+        "providerDeadlineAt": provider_deadline,
+        "providerLimitSeconds": 120,
+        "queueDurationSeconds": elapsed_seconds(row["created_at"], row["started_at"]) if row["started_at"] else 0,
+        "providerElapsedSeconds": elapsed_seconds(row["started_at"], timing_end) if row["started_at"] else 0,
+        "elapsedSeconds": elapsed_seconds(row["created_at"], timing_end),
         "completedAt": row["completed_at"],
     }
 
@@ -13496,6 +13866,18 @@ def campaign_background_error_message(error: Exception) -> str:
     return sanitize_message(error)
 
 
+def update_campaign_intake_stage(job_id: str, stage: str, progress_percent: float) -> None:
+    with get_pipeline_db() as db:
+        db.execute(
+            """
+            UPDATE campaign_intake_jobs
+            SET stage = ?, progress_percent = ?, updated_at = ?
+            WHERE id = ? AND status = 'RUNNING'
+            """,
+            (stage, max(0, min(float(progress_percent), 99)), now_iso(), job_id),
+        )
+
+
 def run_campaign_intake_background(job_id: str) -> None:
     try:
         job = get_campaign_intake_job_or_404(job_id)
@@ -13505,14 +13887,18 @@ def run_campaign_intake_background(job_id: str) -> None:
             db.execute(
                 """
                 UPDATE campaign_intake_jobs
-                SET status = 'RUNNING', stage = 'DISCOVERING_LEADS',
-                    progress_percent = 10, error = NULL, started_at = COALESCE(started_at, ?),
+                SET status = 'RUNNING', stage = 'SEARCHING_APIFY',
+                    progress_percent = 10, error = NULL, result_json = NULL, started_at = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
                 (started_at, started_at, job_id),
             )
-        result = create_campaign_intake_internal(request, sync_tickets=False)
+        result = create_campaign_intake_internal(
+            request,
+            sync_tickets=False,
+            progress_callback=lambda stage, progress: update_campaign_intake_stage(job_id, stage, progress),
+        )
         completed_at = now_iso()
         with get_pipeline_db() as db:
             db.execute(
@@ -13533,15 +13919,22 @@ def run_campaign_intake_background(job_id: str) -> None:
         schedule_campaign_zendesk_sync(result.get("campaignId"))
     except Exception as error:
         message = campaign_background_error_message(error)
+        error_detail = error.detail if isinstance(error, HTTPException) and isinstance(error.detail, dict) else None
+        failure_details = {
+            "code": compact_text((error_detail or {}).get("code"), "CAMPAIGN_INTAKE_FAILED"),
+            "message": message,
+            "discovery": (error_detail or {}).get("discovery"),
+        }
         completed_at = now_iso()
         with get_pipeline_db() as db:
             db.execute(
                 """
                 UPDATE campaign_intake_jobs
-                SET status = 'FAILED', stage = 'FAILED', error = ?, updated_at = ?, completed_at = ?
+                SET status = 'FAILED', stage = 'FAILED', progress_percent = 100,
+                    error = ?, result_json = ?, updated_at = ?, completed_at = ?
                 WHERE id = ?
                 """,
-                (message, completed_at, completed_at, job_id),
+                (message, json.dumps(failure_details, default=str), completed_at, completed_at, job_id),
             )
         log_event("error", "campaign.intake.background_failed", message, jobId=job_id)
     finally:
@@ -14075,7 +14468,7 @@ def get_public_health():
     return {
         "status": "READY",
         "startedAt": STARTED_AT.isoformat(),
-        "uptimeSeconds": int((datetime.now() - STARTED_AT).total_seconds()),
+        "uptimeSeconds": int((datetime.now(timezone.utc) - STARTED_AT).total_seconds()),
     }
 
 

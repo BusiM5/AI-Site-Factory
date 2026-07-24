@@ -1,4 +1,5 @@
 import base64
+import json
 import re
 import sys
 import threading
@@ -980,7 +981,7 @@ def test_discover_leads_searches_requested_location_and_caches(monkeypatch):
     assert first.json()["cached"] is False
     assert second.json()["cached"] is True
     assert len(second.json()["leads"]) == 2
-    assert calls == [("family restaurants in Gauteng, South Africa", "Gauteng, South Africa", 10)]
+    assert calls == [("family restaurants in Gauteng, South Africa", "Gauteng, South Africa", 20)]
 
 
 def test_discover_leads_accepts_custom_industry_and_search_intent(monkeypatch):
@@ -1007,7 +1008,7 @@ def test_discover_leads_accepts_custom_industry_and_search_intent(monkeypatch):
     assert payload["preset"]["id"] == "custom"
     assert payload["preset"]["industry"] == "Solar Energy"
     assert payload["leads"][0]["category"] == "Solar Energy"
-    assert calls == [("commercial solar installers in Cape Town, South Africa", "Cape Town, South Africa", 10)]
+    assert calls == [("commercial solar installers in Cape Town, South Africa", "Cape Town, South Africa", 20)]
 
 
 def test_apify_search_uses_bounded_focused_variants_inside_a_two_minute_budget(monkeypatch):
@@ -1042,7 +1043,7 @@ def test_apify_search_uses_bounded_focused_variants_inside_a_two_minute_budget(m
 
     result = main.run_apify_google_maps(
         "plumbers in Durban, South Africa",
-        100,
+        200,
         "Durban, South Africa",
     )
 
@@ -1051,6 +1052,9 @@ def test_apify_search_uses_bounded_focused_variants_inside_a_two_minute_budget(m
         "plumbers",
         "emergency plumbers",
         "plumbing services",
+        "drain cleaning",
+        "leak repair",
+        "geyser repair",
     ]
     assert captured["payload"]["locationQuery"] == "Durban, South Africa"
     assert captured["payload"]["website"] == "withoutWebsite"
@@ -1060,7 +1064,7 @@ def test_apify_search_uses_bounded_focused_variants_inside_a_two_minute_budget(m
     assert len(captured["posts"]) == 1
     assert "/runs?timeout=105" in captured["posts"][0]
     assert any("/actor-runs/run-121?waitForFinish=" in url for url in captured["gets"])
-    assert any("/datasets/dataset-121/items?clean=true&format=json&limit=100" in url for url in captured["gets"])
+    assert any("/datasets/dataset-121/items?clean=true&format=json&limit=200" in url for url in captured["gets"])
 
 
 def test_apify_search_returns_verified_partial_dataset_when_actor_times_out(monkeypatch):
@@ -1102,6 +1106,107 @@ def test_apify_search_returns_verified_partial_dataset_when_actor_times_out(monk
     assert calls["posts"] == 1
     assert len(result) == 1
     assert result[0]["title"] == "Lead Business 122"
+
+
+def test_pest_control_target_fifty_overfetches_two_hundred_without_extending_deadline(monkeypatch):
+    captured = {}
+
+    def fake_apify(query, limit, location):
+        captured.update({"query": query, "limit": limit, "location": location})
+        return [apify_item(123, province="KwaZulu-Natal")]
+
+    monkeypatch.setattr(main, "run_apify_google_maps", fake_apify)
+
+    response = client.post(
+        "/api/leads/discover",
+        json={
+            "presetId": "pest-control",
+            "location": "Durban, South Africa",
+            "limit": 50,
+            "forceRefresh": True,
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured["limit"] == 200
+    assert captured["location"] == "Durban, South Africa"
+    assert main.apify_google_maps_search_variants(captured["query"], captured["location"]) == [
+        "pest control",
+        "exterminators",
+        "fumigation services",
+        "termite control",
+        "rodent control",
+        "pest management",
+    ]
+    assert response.json()["shortfall"] == 49
+    assert response.json()["stopReason"] == "RESULTS_EXHAUSTED"
+
+
+def test_prior_lead_usage_reuses_pending_and_failed_but_excludes_live_active_and_rejected():
+    lead = main.DiscoveredLead(
+        leadKey="lead-policy",
+        canonicalLeadKey="canonical-policy",
+        businessName="Policy Pest Control",
+        phone="+27 31 555 0909",
+        category="Pest Control",
+        location="Durban, South Africa",
+    )
+    canonical_key = main.canonical_lead_key_for_lead(lead)
+    identity_key = main.lead_identity_pairs(lead)[0][1]
+
+    def classify(status, *, live=False):
+        return main.classify_prior_lead_usage(
+            lead,
+            canonical_key,
+            {
+                identity_key: [
+                    {
+                        "approvalId": f"approval-{status}",
+                        "canonicalLeadKey": canonical_key,
+                        "status": status,
+                        "live": live,
+                    }
+                ]
+            },
+        )
+
+    for status in ["AWAITING_DEPLOYMENT", "PENDING", "GENERATION_FAILED", "EXPORT_FAILED", "PUBLISH_FAILED", "DEPLOY_FAILED"]:
+        assert classify(status) == "REUSABLE_PENDING_OR_FAILED"
+    for status in ["EXPORTING", "DEPLOY_REQUESTED", "DEPLOYING"]:
+        assert classify(status) == "ACTIVE_DEPLOYMENT"
+    for status in ["REJECTED", "CANCELLED", "SUPERSEDED"]:
+        assert classify(status) == "POLICY_EXCLUDED"
+    assert classify("APPROVED", live=True) == "ALREADY_DEPLOYED"
+    assert classify("DEPLOYED_ZENDESK_FAILED", live=True) == "ALREADY_DEPLOYED"
+
+
+def test_campaign_job_summary_treats_legacy_timezone_less_values_as_utc():
+    with main.get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT INTO campaign_intake_jobs (
+                id, request_json, status, stage, progress_percent, result_json,
+                created_at, updated_at, started_at, completed_at
+            ) VALUES (?, ?, 'COMPLETED', 'LEADS_READY', 100, ?, ?, ?, ?, ?)
+            """,
+            (
+                "legacy-time-job",
+                json.dumps({"limit": 1}),
+                json.dumps({}),
+                "2026-07-24T02:00:00",
+                "2026-07-24T02:01:16",
+                "2026-07-24T02:00:10",
+                "2026-07-24T02:01:16",
+            ),
+        )
+        row = db.execute("SELECT * FROM campaign_intake_jobs WHERE id = ?", ("legacy-time-job",)).fetchone()
+
+    summary = main.campaign_intake_job_summary(row)
+
+    assert summary["queueDurationSeconds"] == 10
+    assert summary["providerElapsedSeconds"] == 66
+    assert summary["elapsedSeconds"] == 76
+    assert summary["providerDeadlineAt"] == "2026-07-24T02:02:10Z"
 
 
 def test_custom_discovery_requires_industry_and_search_intent():
@@ -1509,6 +1614,18 @@ def test_discovery_accepts_large_limit_and_returns_contactable_mixed_leads(monke
     assert payload["emailLeads"] == 2
     assert payload["phoneLeads"] == 2
     assert payload["emailAndPhoneLeads"] == 1
+    assert (
+        payload["eligibleReturned"]
+        + payload["websitesSkipped"]
+        + payload["noContactSkipped"]
+        + payload["currentSearchDuplicatesSkipped"]
+        + payload["alreadyDeployedSkipped"]
+        + payload["activeDeploymentSkipped"]
+        + payload["policyExcludedSkipped"]
+        + payload["locationSkipped"]
+        + payload["invalidRecordSkipped"]
+        + payload["targetOverflowSkipped"]
+    ) == payload["rawFetched"]
     assert [lead["businessName"] for lead in payload["leads"]] == [
         "Lead Business 1",
         "Lead Business 2",
@@ -1535,7 +1652,7 @@ def test_discovered_but_not_generated_lead_can_reappear(monkeypatch):
     assert second.json()["leads"][0]["businessName"] == "Lead Business 11"
 
 
-def test_already_generated_lead_is_skipped_in_discovery(monkeypatch):
+def test_pending_never_deployed_lead_is_reused_in_discovery(monkeypatch):
     item = {**apify_item(12, "Plumbing"), "email": "generated@example.com"}
     lead = main.normalize_apify_items([item], "Plumbing", "Durban, South Africa", 1)[0]
     canonical_key = main.canonical_lead_key_for_lead(lead)
@@ -1559,8 +1676,58 @@ def test_already_generated_lead_is_skipped_in_discovery(monkeypatch):
 
     assert result.status_code == 200
     payload = result.json()
-    assert payload["leads"] == []
-    assert payload["generatedDuplicatesSkipped"] == 1
+    assert len(payload["leads"]) == 1
+    assert payload["reusedPendingOrFailed"] == 1
+    assert payload["alreadyDeployedSkipped"] == 0
+
+
+def test_successfully_deployed_lead_is_excluded_from_discovery(monkeypatch):
+    item = {**apify_item(13, "Plumbing"), "email": "live@example.com"}
+    lead = main.normalize_apify_items([item], "Plumbing", "Durban, South Africa", 1)[0]
+    canonical_key = main.canonical_lead_key_for_lead(lead)
+    approval_id = main.create_approval_record(
+        pipeline_id="pipeline-live",
+        canonical_key=canonical_key,
+        lead_key=lead.leadKey,
+        business_name=lead.businessName,
+        site_html="<!doctype html><html><body>Live</body></html>",
+        context=lead.model_dump(),
+        site_content={},
+        template={},
+        status="APPROVED",
+    )
+    with main.get_pipeline_db() as db:
+        db.execute(
+            """
+            INSERT INTO deployment_history (
+                id, canonical_lead_key, pipeline_id, approval_id, url, state,
+                deployed_at, approval_status
+            ) VALUES (?, ?, ?, ?, ?, 'ready', ?, 'APPROVED')
+            """,
+            (
+                "history-live-lead",
+                canonical_key,
+                "pipeline-live",
+                approval_id,
+                "https://live-lead.example.net",
+                main.now_iso(),
+            ),
+        )
+        db.execute(
+            "UPDATE approval_records SET deployment_history_id = ? WHERE id = ?",
+            ("history-live-lead", approval_id),
+        )
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda query, limit, location: [item])
+
+    result = client.post(
+        "/api/leads/discover",
+        json={"presetId": "plumbers", "location": "Durban, South Africa", "limit": 5, "forceRefresh": True},
+    )
+
+    assert result.status_code == 200
+    assert result.json()["leads"] == []
+    assert result.json()["alreadyDeployedSkipped"] == 1
+    assert result.json()["reusedPendingOrFailed"] == 0
 
 
 def test_sites_endpoint_filters_by_live_email_leads(monkeypatch):
@@ -4436,6 +4603,39 @@ def test_campaign_search_job_keeps_running_after_the_submitter_moves_away(monkey
     assert result["status"] == "COMPLETED", result
     assert result["campaign"]["metrics"]["callLeads"] == 1
     assert result["campaign"]["metrics"]["emailLeads"] == 0
+
+
+def test_background_search_with_zero_eligible_leads_finishes_with_saved_breakdown(monkeypatch):
+    monkeypatch.setattr(main, "run_apify_google_maps", lambda *args, **kwargs: [])
+    monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
+
+    queued = client.post(
+        "/api/campaigns/intake/jobs",
+        json={
+            "campaignName": "No fabricated leads",
+            "presetId": "pest-control",
+            "location": "Durban, South Africa",
+            "limit": 5,
+            "channels": ["email", "phone"],
+            "syncZendesk": True,
+        },
+    )
+    assert queued.status_code == 200, queued.text
+
+    job_id = queued.json()["jobId"]
+    result = None
+    for _ in range(100):
+        result = client.get(f"/api/campaigns/intake/jobs/{job_id}").json()
+        if result["status"] in {"COMPLETED", "FAILED"}:
+            break
+        time.sleep(0.02)
+
+    assert result["status"] == "FAILED"
+    assert result["stage"] == "FAILED"
+    assert result["failureDetails"]["code"] == "NO_ELIGIBLE_LEADS"
+    assert result["failureDetails"]["discovery"]["eligibleReturned"] == 0
+    assert result["failureDetails"]["discovery"]["shortfall"] == 5
+    assert result["failureDetails"]["discovery"]["stopReason"] == "RESULTS_EXHAUSTED"
 
 
 def test_background_search_finishes_before_zendesk_sync_and_sync_retries_independently(monkeypatch):

@@ -42,6 +42,7 @@ import {
   Zap,
 } from "lucide-react";
 import "./App.css";
+import { formatDuration, parseApiTimestamp } from "./time.js";
 
 const DEFAULT_API_BASE = import.meta.env.PROD
   ? "https://ai-site-factory-backend-c4w6.onrender.com"
@@ -112,13 +113,7 @@ function errorMessage(error) {
 
 function formatDate(value) {
   if (!value) return "Not yet";
-  return new Date(value).toLocaleString();
-}
-
-function formatDuration(totalSeconds) {
-  const safeSeconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
-  const minutes = Math.floor(safeSeconds / 60);
-  return `${minutes}:${String(safeSeconds % 60).padStart(2, "0")}`;
+  return parseApiTimestamp(value)?.toLocaleString() || "Invalid date";
 }
 
 const wait = (milliseconds) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
@@ -449,19 +444,55 @@ function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign,
   const [clock, setClock] = useState(Date.now());
   const update = (patch) => setForm((current) => ({ ...current, ...patch }));
   const busy = ["QUEUED", "RUNNING"].includes(activity?.status);
-  const discovery = activity?.campaign?.discovery || null;
+  const discovery = activity?.campaign?.discovery || activity?.failureDetails?.discovery || null;
   const requestedLeads = Number(activity?.request?.limit ?? discovery?.requestedCount ?? activity?.campaign?.requestedCount ?? form.limit) || 0;
   const acceptedLeads = Number(discovery?.eligibleReturned ?? activity?.campaign?.discoveredLeads ?? 0) || 0;
   const rawFetched = Number(discovery?.rawFetched ?? 0) || 0;
   const noContactSkipped = Number(discovery?.noContactSkipped ?? 0) || 0;
-  const duplicateSkipped = Number(discovery?.generatedDuplicatesSkipped ?? discovery?.duplicatesSkipped ?? 0) || 0;
+  const duplicateSkipped = Number(discovery?.currentSearchDuplicatesSkipped ?? discovery?.duplicatesSkipped ?? 0) || 0;
   const websiteSkipped = Number(discovery?.websitesSkipped ?? 0) || 0;
-  const otherSkipped = Math.max(0, rawFetched - acceptedLeads - noContactSkipped - duplicateSkipped - websiteSkipped);
-  const shortfall = Math.max(0, requestedLeads - acceptedLeads);
-  const startedAt = activity?.startedAt || activity?.createdAt;
-  const elapsedSeconds = startedAt ? Math.max(0, (clock - new Date(startedAt).getTime()) / 1000) : 0;
-  const providerSearching = activity?.stage === "DISCOVERING_LEADS";
-  const providerWindowProgress = providerSearching ? Math.min(100, (elapsedSeconds / 120) * 100) : 0;
+  const deployedSkipped = Number(discovery?.alreadyDeployedSkipped ?? 0) || 0;
+  const activeDeploymentSkipped = Number(discovery?.activeDeploymentSkipped ?? 0) || 0;
+  const policySkipped = Number(discovery?.policyExcludedSkipped ?? 0) || 0;
+  const locationSkipped = Number(discovery?.locationSkipped ?? 0) || 0;
+  const invalidSkipped = Number(discovery?.invalidRecordSkipped ?? 0) || 0;
+  const reusedLeads = Number(discovery?.reusedPendingOrFailed ?? 0) || 0;
+  const reserveLeads = Number(discovery?.targetOverflowSkipped ?? 0) || 0;
+  const shortfall = Number(discovery?.shortfall ?? Math.max(0, requestedLeads - acceptedLeads)) || 0;
+  const createdAt = parseApiTimestamp(activity?.createdAt);
+  const providerStartedAt = parseApiTimestamp(activity?.providerStartedAt || activity?.startedAt);
+  const completedAt = parseApiTimestamp(activity?.completedAt);
+  const totalElapsedSeconds = completedAt && createdAt
+    ? Math.max(0, (completedAt.getTime() - createdAt.getTime()) / 1000)
+    : createdAt
+      ? Math.max(0, (clock - createdAt.getTime()) / 1000)
+      : Number(activity?.elapsedSeconds ?? 0) || 0;
+  const providerElapsedSeconds = completedAt && providerStartedAt
+    ? Math.max(0, (completedAt.getTime() - providerStartedAt.getTime()) / 1000)
+    : providerStartedAt
+      ? Math.max(0, (clock - providerStartedAt.getTime()) / 1000)
+      : Number(activity?.providerElapsedSeconds ?? 0) || 0;
+  const queueElapsedSeconds = Number(activity?.queueDurationSeconds ?? (
+    createdAt && providerStartedAt ? Math.max(0, (providerStartedAt.getTime() - createdAt.getTime()) / 1000) : 0
+  )) || 0;
+  const providerSearching = ["SEARCHING_APIFY", "DISCOVERING_LEADS"].includes(activity?.stage);
+  const providerWindowProgress = providerSearching
+    ? Math.min(100, (providerElapsedSeconds / Number(activity?.providerLimitSeconds || 120)) * 100)
+    : Math.min(100, Number(activity?.progressPercent ?? 0));
+  const stageLabels = {
+    QUEUED: "Queued",
+    SEARCHING_APIFY: "Searching Apify",
+    DISCOVERING_LEADS: "Searching Apify",
+    VALIDATING_LEADS: "Validating",
+    SAVING_CAMPAIGN: "Saving campaign",
+    LEADS_READY: "Completed",
+    FAILED: "Failed",
+  };
+  const stopReasonLabels = {
+    TARGET_MET: "Target met",
+    PROVIDER_DEADLINE: "Two-minute provider deadline reached",
+    RESULTS_EXHAUSTED: "Search results exhausted",
+  };
 
   useEffect(() => {
     if (!busy) return undefined;
@@ -545,24 +576,38 @@ function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign,
           <div className="search-progress-track"><i style={{ width: `${providerWindowProgress}%` }} /></div>
           <div className="search-running-facts">
             <span><strong>{requestedLeads.toLocaleString()}</strong>Target</span>
-            <span><strong>{formatDuration(elapsedSeconds)}</strong>Elapsed</span>
-            <span><strong>{providerSearching ? "2:00" : "Not started"}</strong>Apify limit</span>
-            <span><strong>{providerSearching ? "Searching" : "Queued"}</strong>Stage</span>
+            <span><strong>{formatDuration(queueElapsedSeconds)}</strong>Queue</span>
+            <span><strong>{formatDuration(providerElapsedSeconds)}</strong>Apify</span>
+            <span><strong>{formatDuration(totalElapsedSeconds)}</strong>Total</span>
+            <span><strong>{stageLabels[activity?.stage] || "Working"}</strong>Stage</span>
           </div>
-          <small className="search-deadline-note">{providerSearching ? "The Apify search has a two-minute deadline. Validation counts appear here as soon as its dataset returns." : "The backend is waking and saving the job. Render Free can add 50 seconds before the Apify clock starts."}</small>
+          <small className="search-deadline-note">{providerSearching ? "Apify has a strict two-minute deadline. A verified partial dataset is kept if the actor reaches its limit." : activity?.stage === "QUEUED" ? "The backend is waking and saving the job. Render Free can add 50 seconds before the Apify clock starts." : "Apify has returned. The backend is validating and saving the verified results."}</small>
         </>}
         {activity.status === "COMPLETED" && activity.campaign && <>
+          <div className="search-running-facts">
+            <span><strong>{formatDuration(queueElapsedSeconds)}</strong>Queue</span>
+            <span><strong>{formatDuration(discovery?.providerDurationSeconds ?? providerElapsedSeconds)}</strong>Apify</span>
+            <span><strong>{formatDuration(totalElapsedSeconds)}</strong>Total</span>
+            <span><strong>{stopReasonLabels[discovery?.stopReason] || "Completed"}</strong>Stopped because</span>
+          </div>
           <div className="discovery-breakdown">
             <span><strong>{requestedLeads.toLocaleString()}</strong>Target</span>
             <span><strong>{rawFetched.toLocaleString()}</strong>Returned</span>
             <span className="accepted"><strong>{acceptedLeads.toLocaleString()}</strong>Accepted</span>
             <span><strong>{noContactSkipped.toLocaleString()}</strong>No contact</span>
-            <span><strong>{duplicateSkipped.toLocaleString()}</strong>Duplicate/used</span>
-            <span><strong>{otherSkipped.toLocaleString()}</strong>Location/other</span>
+            <span><strong>{websiteSkipped.toLocaleString()}</strong>Website present</span>
+            <span><strong>{duplicateSkipped.toLocaleString()}</strong>Search duplicate</span>
+            <span><strong>{deployedSkipped.toLocaleString()}</strong>Already live</span>
+            <span><strong>{activeDeploymentSkipped.toLocaleString()}</strong>Active deployment</span>
+            <span><strong>{policySkipped.toLocaleString()}</strong>Rejected/cancelled</span>
+            <span><strong>{locationSkipped.toLocaleString()}</strong>Wrong location</span>
+            <span><strong>{invalidSkipped.toLocaleString()}</strong>Invalid record</span>
+            <span className="accepted"><strong>{reusedLeads.toLocaleString()}</strong>Pending/failed reused</span>
+            <span><strong>{reserveLeads.toLocaleString()}</strong>Eligible reserve</span>
           </div>
           <div className={`search-shortfall ${shortfall ? "warning" : "success"}`}>
-            <strong>{shortfall ? `Target not met: ${shortfall.toLocaleString()} fewer eligible businesses were available.` : "Target met."}</strong>
-            <span>Apify filters out businesses with websites before returning results. Missing contacts and duplicates are never replaced with invented data.</span>
+            <strong>{shortfall ? `This search ended ${shortfall.toLocaleString()} leads below target.` : "Target met."}</strong>
+            <span>{stopReasonLabels[discovery?.stopReason] || "Search completed"}. Missing contacts and excluded records are never replaced with invented data.</span>
           </div>
           <div className="activity-actions">
             <button className="ghost-button" type="button" onClick={() => onOpenCampaign(activity.campaign.campaignId)}>Open {acceptedLeads.toLocaleString()} leads</button>
@@ -572,10 +617,19 @@ function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign,
         {activity.status === "FAILED" && <>
           <div className="search-running-facts">
             <span><strong>{requestedLeads.toLocaleString()}</strong>Target</span>
-            <span><strong>{formatDuration(elapsedSeconds)}</strong>Elapsed</span>
+            <span><strong>{formatDuration(queueElapsedSeconds)}</strong>Queue</span>
+            <span><strong>{formatDuration(providerElapsedSeconds)}</strong>Apify</span>
+            <span><strong>{formatDuration(totalElapsedSeconds)}</strong>Total</span>
             <span><strong>Failed</strong>Terminal state</span>
-            <span><strong>0</strong>Invented leads</span>
           </div>
+          {discovery && <div className="discovery-breakdown">
+            <span><strong>{rawFetched.toLocaleString()}</strong>Returned</span>
+            <span><strong>{noContactSkipped.toLocaleString()}</strong>No contact</span>
+            <span><strong>{duplicateSkipped.toLocaleString()}</strong>Search duplicate</span>
+            <span><strong>{deployedSkipped.toLocaleString()}</strong>Already live</span>
+            <span><strong>{locationSkipped.toLocaleString()}</strong>Wrong location</span>
+            <span><strong>0</strong>Invented</span>
+          </div>}
           <button className="text-button" type="button" onClick={onDismissActivity}>Dismiss error</button>
         </>}
       </div>}
@@ -1134,9 +1188,14 @@ function AppShell({ session, onSessionChange, preferenceState }) {
   const applyDiscoveryJob = useCallback((job) => {
     if (!job?.jobId) return;
     const isActive = ["QUEUED", "RUNNING"].includes(job.status);
-    const stageMessage = job.stage === "DISCOVERING_LEADS"
-      ? "Apify is finding and validating leads. This saved job continues after navigation or reload."
-      : "The saved background lead job is waiting to run.";
+    const stageMessages = {
+      QUEUED: "The saved background lead job is waiting to run.",
+      SEARCHING_APIFY: "Apify is finding leads. This saved job continues after navigation or reload.",
+      DISCOVERING_LEADS: "Apify is finding leads. This saved job continues after navigation or reload.",
+      VALIDATING_LEADS: "Apify returned. Contact, website, location and reuse rules are being validated.",
+      SAVING_CAMPAIGN: "Verified leads are being saved to the campaign.",
+    };
+    const stageMessage = stageMessages[job.stage] || "The saved background lead job is continuing.";
     const activity = {
       ...job,
       message: isActive
@@ -1203,7 +1262,7 @@ function AppShell({ session, onSessionChange, preferenceState }) {
   }, [applyDiscoveryJob, connection.workspaceReady, pollDiscoveryJob]);
 
   const launchCampaign = useCallback(async (request) => {
-    setDiscoveryActivity({ status: "QUEUED", startedAt: new Date().toISOString(), request, message: "Saving the background lead search." });
+    setDiscoveryActivity({ status: "QUEUED", createdAt: new Date().toISOString(), request, message: "Saving the background lead search." });
     try {
       const { data } = await axios.post(`${API_BASE}/api/campaigns/intake/jobs`, request, { timeout: 30000 });
       applyDiscoveryJob(data);
