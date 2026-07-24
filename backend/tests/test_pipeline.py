@@ -1010,7 +1010,7 @@ def test_discover_leads_accepts_custom_industry_and_search_intent(monkeypatch):
     assert calls == [("commercial solar installers in Cape Town, South Africa", "Cape Town, South Africa", 10)]
 
 
-def test_apify_search_uses_one_focused_query_inside_a_two_minute_budget(monkeypatch):
+def test_apify_search_uses_bounded_focused_variants_inside_a_two_minute_budget(monkeypatch):
     captured = {"posts": [], "gets": []}
 
     def fake_post(url, **kwargs):
@@ -1047,12 +1047,16 @@ def test_apify_search_uses_one_focused_query_inside_a_two_minute_budget(monkeypa
     )
 
     assert len(result) == 1
-    assert captured["payload"]["searchStringsArray"] == ["plumbers"]
+    assert captured["payload"]["searchStringsArray"] == [
+        "plumbers",
+        "emergency plumbers",
+        "plumbing services",
+    ]
     assert captured["payload"]["locationQuery"] == "Durban, South Africa"
     assert captured["payload"]["website"] == "withoutWebsite"
     assert captured["payload"]["skipClosedPlaces"] is True
     assert captured["payload"]["includeWebResults"] is False
-    assert captured["payload"]["maxCrawledPlacesPerSearch"] == 100
+    assert captured["payload"]["maxCrawledPlacesPerSearch"] == 34
     assert len(captured["posts"]) == 1
     assert "/runs?timeout=105" in captured["posts"][0]
     assert any("/actor-runs/run-121?waitForFinish=" in url for url in captured["gets"])
@@ -4437,10 +4441,19 @@ def test_campaign_search_job_keeps_running_after_the_submitter_moves_away(monkey
 def test_background_search_finishes_before_zendesk_sync_and_sync_retries_independently(monkeypatch):
     phone_only = apify_item(2982, province="KwaZulu-Natal")
     phone_only.pop("email", None)
+    no_contact = apify_item(2984, province="KwaZulu-Natal")
+    no_contact.pop("email", None)
+    no_contact["phone"] = None
+    with_website = apify_item(2985, province="KwaZulu-Natal")
+    with_website["website"] = "https://already-online.example.com"
     zendesk_started = threading.Event()
     release_zendesk = threading.Event()
 
-    monkeypatch.setattr(main, "run_apify_google_maps", lambda *args, **kwargs: [phone_only])
+    monkeypatch.setattr(
+        main,
+        "run_apify_google_maps",
+        lambda *args, **kwargs: [phone_only, no_contact, with_website],
+    )
     monkeypatch.setattr(main, "require_zendesk_workspace_ready", lambda: {"workspaceReady": True})
     monkeypatch.setattr(main, "verify_zendesk_ticket_contracts", lambda channels: {})
 
@@ -4456,7 +4469,7 @@ def test_background_search_finishes_before_zendesk_sync_and_sync_retries_indepen
             "campaignName": "Separated search and tickets",
             "presetId": "plumbers",
             "location": "Durban, South Africa",
-            "limit": 1,
+            "limit": 3,
             "syncZendesk": True,
         },
     )
@@ -4475,6 +4488,11 @@ def test_background_search_finishes_before_zendesk_sync_and_sync_retries_indepen
         assert result["stage"] == "LEADS_READY"
         assert result["campaign"]["metrics"]["callLeads"] == 1
         assert result["campaign"]["metrics"]["zendeskTickets"] == 0
+        assert result["campaign"]["discovery"]["rawFetched"] == 3
+        assert result["campaign"]["discovery"]["eligibleReturned"] == 1
+        assert result["campaign"]["discovery"]["websitesSkipped"] == 1
+        assert result["campaign"]["discovery"]["noContactSkipped"] == 1
+        assert result["campaign"]["discovery"]["shortfall"] == 2
         assert zendesk_started.wait(timeout=1)
     finally:
         release_zendesk.set()
@@ -4572,6 +4590,31 @@ def test_campaign_auto_generates_name_and_industry_from_mixed_results(monkeypatc
     assert payload["mixedChannelCounts"]["phoneLeads"] >= 1
     assert payload["metrics"]["emailLeads"] == 1
     assert payload["metrics"]["callLeads"] == 1
+
+
+def test_campaign_metadata_uses_the_selected_specific_industry_instead_of_google_taxonomy_noise():
+    leads = [
+        main.DiscoveredLead(
+            leadKey="durban-spark",
+            businessName="Durban Spark",
+            category="Electrical installation service",
+            location="Durban",
+            phone="+27 31 555 0111",
+        ),
+        main.DiscoveredLead(
+            leadKey="utility-spark",
+            businessName="Utility Spark",
+            category="Utility contractor",
+            location="Durban",
+            phone="+27 31 555 0112",
+        ),
+    ]
+
+    metadata = main.suggest_campaign_metadata(leads, "Durban, South Africa", "Electrical")
+
+    assert metadata["industry"] == "Electrical"
+    assert metadata["campaignName"].startswith("Durban Electrical Leads")
+    assert "Utility contractor" not in metadata["campaignName"]
 
 
 def test_campaign_intake_splits_email_and_call_records_without_generation(monkeypatch):

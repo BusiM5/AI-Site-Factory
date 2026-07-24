@@ -115,6 +115,12 @@ function formatDate(value) {
   return new Date(value).toLocaleString();
 }
 
+function formatDuration(totalSeconds) {
+  const safeSeconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+  const minutes = Math.floor(safeSeconds / 60);
+  return `${minutes}:${String(safeSeconds % 60).padStart(2, "0")}`;
+}
+
 const wait = (milliseconds) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 
 function statusTone(status = "") {
@@ -428,7 +434,7 @@ function OverviewPage({ campaigns, totals, onSelectCampaign, reducedMotion = fal
   );
 }
 
-function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign }) {
+function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign, onDismissActivity }) {
   const [form, setForm] = useState({
     campaignName: "",
     presetId: presets[0]?.id || "restaurants",
@@ -440,8 +446,29 @@ function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign 
     autoGenerateMetadata: true,
   });
   const [error, setError] = useState("");
+  const [clock, setClock] = useState(Date.now());
   const update = (patch) => setForm((current) => ({ ...current, ...patch }));
   const busy = ["QUEUED", "RUNNING"].includes(activity?.status);
+  const discovery = activity?.campaign?.discovery || null;
+  const requestedLeads = Number(activity?.request?.limit ?? discovery?.requestedCount ?? activity?.campaign?.requestedCount ?? form.limit) || 0;
+  const acceptedLeads = Number(discovery?.eligibleReturned ?? activity?.campaign?.discoveredLeads ?? 0) || 0;
+  const rawFetched = Number(discovery?.rawFetched ?? 0) || 0;
+  const noContactSkipped = Number(discovery?.noContactSkipped ?? 0) || 0;
+  const duplicateSkipped = Number(discovery?.generatedDuplicatesSkipped ?? discovery?.duplicatesSkipped ?? 0) || 0;
+  const websiteSkipped = Number(discovery?.websitesSkipped ?? 0) || 0;
+  const otherSkipped = Math.max(0, rawFetched - acceptedLeads - noContactSkipped - duplicateSkipped - websiteSkipped);
+  const shortfall = Math.max(0, requestedLeads - acceptedLeads);
+  const startedAt = activity?.startedAt || activity?.createdAt;
+  const elapsedSeconds = startedAt ? Math.max(0, (clock - new Date(startedAt).getTime()) / 1000) : 0;
+  const providerSearching = activity?.stage === "DISCOVERING_LEADS";
+  const providerWindowProgress = providerSearching ? Math.min(100, (elapsedSeconds / 120) * 100) : 0;
+
+  useEffect(() => {
+    if (!busy) return undefined;
+    setClock(Date.now());
+    const timer = window.setInterval(() => setClock(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, [busy, activity?.jobId]);
 
   useEffect(() => {
     if (!error) return undefined;
@@ -481,8 +508,8 @@ function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign 
   return (
     <form className="campaign-form" onSubmit={submit}>
       <div className="form-grid two">
-        <label>Campaign name<input required={!form.autoGenerateMetadata} disabled={form.autoGenerateMetadata} value={form.campaignName} onChange={(event) => update({ campaignName: event.target.value })} placeholder={form.autoGenerateMetadata ? "Generated from discovered leads" : "e.g. Durban Plumbers - July"} /><small>{form.autoGenerateMetadata ? "Created from the detected industries, location, and channel mix." : "Enter a descriptive campaign name."}</small></label>
-        <label>Location<input required value={form.location} onChange={(event) => update({ location: event.target.value })} placeholder="City, province, or country" /></label>
+        <label>Campaign name<input name="campaignName" required={!form.autoGenerateMetadata} disabled={form.autoGenerateMetadata} value={form.campaignName} onChange={(event) => update({ campaignName: event.target.value })} placeholder={form.autoGenerateMetadata ? "Generated from discovered leads" : "e.g. Durban Plumbers - July"} /><small>{form.autoGenerateMetadata ? "Created from the selected industry, location, and verified results." : "Enter a descriptive campaign name."}</small></label>
+        <label>Location<input name="location" required value={form.location} onChange={(event) => update({ location: event.target.value })} placeholder="City, province, or country" /></label>
       </div>
       <div className="preset-heading"><strong>Choose a starting point</strong><span>Select a preset or define your own industry and search intent.</span></div>
       <div className="preset-selector">
@@ -496,17 +523,17 @@ function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign 
         ))}
       </div>
       <div className="form-grid three">
-        <label>Industry<input required value={form.industry} onChange={(event) => update({ industry: event.target.value, presetId: "custom" })} placeholder="e.g. Solar energy" /></label>
-        <label>Search intent<input required={form.presetId === "custom"} value={form.query} onChange={(event) => update({ query: event.target.value })} placeholder="e.g. commercial solar installers" /><small>{form.presetId === "custom" ? "Required for custom campaigns." : "Optional: refine the selected preset."}</small></label>
-        <label>Lead target<input type="number" min="1" max="10000" value={form.limit} onChange={(event) => update({ limit: Math.max(1, Math.min(10000, Number(event.target.value) || 1)) })} /><small>Choose 1–10,000 verified, no-website leads. The saved background job continues after navigation or reload.</small></label>
+        <label>Industry<input name="industry" required value={form.industry} onChange={(event) => update({ industry: event.target.value, presetId: "custom" })} placeholder="e.g. Solar energy" /></label>
+        <label>Search intent<input name="query" required={form.presetId === "custom"} value={form.query} onChange={(event) => update({ query: event.target.value })} placeholder="e.g. commercial solar installers" /><small>{form.presetId === "custom" ? "Required for custom campaigns." : "Optional: refine the selected preset."}</small></label>
+        <label>Lead target<input name="limit" type="number" min="1" max="10000" value={form.limit} onChange={(event) => update({ limit: Math.max(1, Math.min(10000, Number(event.target.value) || 1)) })} /><small>Choose 1–10,000 verified, no-website leads. The saved background job continues after navigation or reload.</small></label>
       </div>
       <div className="channel-choice">
         <article className="checked channel-required"><Mail size={20} /><span><strong>Email leads when available</strong><small>Valid email contacts create email queue records</small></span></article>
         <article className="checked channel-required"><Phone size={20} /><span><strong>Call leads when available</strong><small>Valid phone contacts create call queue records</small></span></article>
       </div>
       <div className="form-options">
-        <label><input type="checkbox" checked={form.autoGenerateMetadata} onChange={(event) => update({ autoGenerateMetadata: event.target.checked })} />Generate campaign name and stored industry from results</label>
-        <label><input type="checkbox" checked={form.forceRefresh} onChange={(event) => update({ forceRefresh: event.target.checked })} />Force a fresh Apify run</label>
+        <label><input name="autoGenerateMetadata" type="checkbox" checked={form.autoGenerateMetadata} onChange={(event) => update({ autoGenerateMetadata: event.target.checked })} />Generate campaign name and stored industry from results</label>
+        <label><input name="forceRefresh" type="checkbox" checked={form.forceRefresh} onChange={(event) => update({ forceRefresh: event.target.checked })} />Force a fresh Apify run</label>
       </div>
       <div className="required-setting"><TicketCheck size={17} /><span><strong>Zendesk intake is required</strong><small>Tickets are created after Apify returns the verified lead set.</small></span></div>
       <div className="mixed-channel-note"><ShieldCheck size={20} /><div><strong>Real-contact guarantee</strong><p>Every lead must contain at least one valid email address or phone number. Missing contact channels are never invented.</p></div></div>
@@ -514,7 +541,43 @@ function CampaignForm({ presets, connection, activity, onLaunch, onOpenCampaign 
       {activity && <div className={`background-activity ${activity.status.toLowerCase()}`}>
         <div><strong>{["QUEUED", "RUNNING"].includes(activity.status) ? "Lead search running in the background" : activity.status === "COMPLETED" ? "Lead search completed" : "Lead search needs attention"}</strong><StatusBadge status={activity.status} /></div>
         <p>{activity.message}</p>
-        {activity.status === "COMPLETED" && activity.campaign && <button className="ghost-button" type="button" onClick={() => onOpenCampaign(activity.campaign.campaignId)}>Open {activity.campaign.metrics?.channelLeads || 0} lead records</button>}
+        {busy && <>
+          <div className="search-progress-track"><i style={{ width: `${providerWindowProgress}%` }} /></div>
+          <div className="search-running-facts">
+            <span><strong>{requestedLeads.toLocaleString()}</strong>Target</span>
+            <span><strong>{formatDuration(elapsedSeconds)}</strong>Elapsed</span>
+            <span><strong>{providerSearching ? "2:00" : "Not started"}</strong>Apify limit</span>
+            <span><strong>{providerSearching ? "Searching" : "Queued"}</strong>Stage</span>
+          </div>
+          <small className="search-deadline-note">{providerSearching ? "The Apify search has a two-minute deadline. Validation counts appear here as soon as its dataset returns." : "The backend is waking and saving the job. Render Free can add 50 seconds before the Apify clock starts."}</small>
+        </>}
+        {activity.status === "COMPLETED" && activity.campaign && <>
+          <div className="discovery-breakdown">
+            <span><strong>{requestedLeads.toLocaleString()}</strong>Target</span>
+            <span><strong>{rawFetched.toLocaleString()}</strong>Returned</span>
+            <span className="accepted"><strong>{acceptedLeads.toLocaleString()}</strong>Accepted</span>
+            <span><strong>{noContactSkipped.toLocaleString()}</strong>No contact</span>
+            <span><strong>{duplicateSkipped.toLocaleString()}</strong>Duplicate/used</span>
+            <span><strong>{otherSkipped.toLocaleString()}</strong>Location/other</span>
+          </div>
+          <div className={`search-shortfall ${shortfall ? "warning" : "success"}`}>
+            <strong>{shortfall ? `Target not met: ${shortfall.toLocaleString()} fewer eligible businesses were available.` : "Target met."}</strong>
+            <span>Apify filters out businesses with websites before returning results. Missing contacts and duplicates are never replaced with invented data.</span>
+          </div>
+          <div className="activity-actions">
+            <button className="ghost-button" type="button" onClick={() => onOpenCampaign(activity.campaign.campaignId)}>Open {acceptedLeads.toLocaleString()} leads</button>
+            <button className="text-button" type="button" onClick={onDismissActivity}>Dismiss result</button>
+          </div>
+        </>}
+        {activity.status === "FAILED" && <>
+          <div className="search-running-facts">
+            <span><strong>{requestedLeads.toLocaleString()}</strong>Target</span>
+            <span><strong>{formatDuration(elapsedSeconds)}</strong>Elapsed</span>
+            <span><strong>Failed</strong>Terminal state</span>
+            <span><strong>0</strong>Invented leads</span>
+          </div>
+          <button className="text-button" type="button" onClick={onDismissActivity}>Dismiss error</button>
+        </>}
       </div>}
       {error && <div className="inline-alert danger">{error}</div>}
       <div className="form-submit"><button className="primary-button" type="submit" disabled={busy || !connection.workspaceReady}>{busy ? <><RefreshCw className="spin" size={18} />Running in background…</> : <><Rocket size={18} />Launch campaign</>}</button><span>The search continues if you leave this page.</span></div>
@@ -581,14 +644,14 @@ function UploadCampaignForm({ connection, activity, jobs, onUpload, onRetry, onR
   );
 }
 
-function CampaignsPage({ presets, connection, discoveryActivity, importActivity, importJobs, onLaunch, onUpload, onRetryImport, onResumeImport, onOpenCampaign }) {
+function CampaignsPage({ presets, connection, discoveryActivity, importActivity, importJobs, onLaunch, onUpload, onRetryImport, onResumeImport, onOpenCampaign, onDismissDiscovery }) {
   const [mode, setMode] = useState("discover");
   return (
     <div className="page-stack">
       <PageSection title="Create a lead campaign" eyebrow="Zendesk-first intake" description="Discover new leads or upload an existing lead file. Both paths create tagged Zendesk tickets and defer site generation.">
         <div className="campaign-mode-tabs"><button type="button" className={mode === "discover" ? "active" : ""} onClick={() => setMode("discover")}><MapPin size={17} />Find leads</button><button type="button" className={mode === "upload" ? "active" : ""} onClick={() => setMode("upload")}><Upload size={17} />Upload lead data</button></div>
         {mode === "discover"
-          ? <CampaignForm presets={presets} connection={connection} activity={discoveryActivity} onLaunch={onLaunch} onOpenCampaign={onOpenCampaign} />
+          ? <CampaignForm presets={presets} connection={connection} activity={discoveryActivity} onLaunch={onLaunch} onOpenCampaign={onOpenCampaign} onDismissActivity={onDismissDiscovery} />
           : <UploadCampaignForm connection={connection} activity={importActivity} jobs={importJobs} onUpload={onUpload} onRetry={onRetryImport} onResume={onResumeImport} onOpenCampaign={onOpenCampaign} />}
       </PageSection>
       <div className="form-tag-grid">
@@ -1079,23 +1142,21 @@ function AppShell({ session, onSessionChange, preferenceState }) {
       message: isActive
         ? stageMessage
         : job.status === "COMPLETED"
-          ? `${job.campaign?.metrics?.channelLeads || 0} validated lead records are ready. Zendesk ticket synchronization continues as a separate retryable stage.`
+          ? `${job.campaign?.discovery?.eligibleReturned ?? job.campaign?.discoveredLeads ?? 0} unique businesses passed the no-website and real-contact rules.`
           : job.error || "The background lead search failed.",
     };
-    if (isActive) {
-      setDiscoveryActivity(activity);
-    } else {
-      setDiscoveryActivity((current) => (
-        current?.jobId && current.jobId !== job.jobId && ["QUEUED", "RUNNING"].includes(current.status)
-          ? current
-          : null
-      ));
-    }
+    setDiscoveryActivity((current) => (
+      current?.jobId && current.jobId !== job.jobId && ["QUEUED", "RUNNING"].includes(current.status)
+        ? current
+        : activity
+    ));
     if (job.status === "COMPLETED" && job.campaign && !handledDiscoveryJobs.current.has(job.jobId)) {
       handledDiscoveryJobs.current.add(job.jobId);
       setSelectedCampaignId(job.campaign.campaignId);
       setDetail(job.campaign);
-      setNotice({ source: "discovery", tone: "success", text: `${job.campaign.campaignName} found ${job.campaign.metrics?.channelLeads || 0} lead records. Zendesk synchronization is continuing separately.` });
+      const accepted = Number(job.campaign?.discovery?.eligibleReturned ?? job.campaign?.discoveredLeads ?? 0);
+      const requested = Number(job.request?.limit ?? job.campaign?.requestedCount ?? accepted);
+      setNotice({ source: "discovery", tone: accepted < requested ? "warning" : "success", text: `${job.campaign.campaignName} accepted ${accepted} of ${requested} requested businesses. Open the result breakdown for skipped and unmet counts.` });
       refresh(true);
     } else if (job.status === "FAILED" && !handledDiscoveryJobs.current.has(job.jobId)) {
       handledDiscoveryJobs.current.add(job.jobId);
@@ -1131,7 +1192,9 @@ function AppShell({ session, onSessionChange, preferenceState }) {
         applyDiscoveryJob(active);
         void pollDiscoveryJob(active.jobId);
       } else {
-        setDiscoveryActivity((current) => current?.jobId ? null : current);
+        setDiscoveryActivity((current) => (
+          current && ["QUEUED", "RUNNING"].includes(current.status) ? null : current
+        ));
       }
       return jobs;
     } catch {
@@ -1232,7 +1295,7 @@ function AppShell({ session, onSessionChange, preferenceState }) {
         <header className="topbar"><div><span>Workspace</span><h1>{pageName}</h1></div><div className="topbar-actions">{backgroundJobLabel && <div className="workspace-job-indicator"><RefreshCw className="spin" size={14} />{backgroundJobLabel}</div>}{notice && <div className={`notice ${notice.tone}`}>{notice.text}<button type="button" aria-label="Dismiss notification" onClick={() => setNotice(null)}>×</button></div>}<button className="icon-button" type="button" aria-label={`Switch to ${preferenceState.resolvedTheme === "dark" ? "light" : "dark"} theme`} onClick={() => preferenceState.updatePreferences({ theme: preferenceState.resolvedTheme === "dark" ? "light" : "dark" })}>{preferenceState.resolvedTheme === "dark" ? <Sun size={17} /> : <Moon size={17} />}</button><button className="refresh-button" type="button" onClick={() => refresh(false)} disabled={refreshing}><RefreshCw size={17} className={refreshing ? "spin" : ""} />Refresh</button>{session.authRequired && <button className="account-button" type="button" onClick={logout}><CircleUserRound size={17} /><span>{session.username || "admin"}</span><LogOut size={15} /></button>}</div></header>
         <div className="page-content">{loading ? <div className="loading-state"><RefreshCw className="spin" /><strong>Loading campaign workspace…</strong></div> : <Routes>
           <Route path="/overview" element={<OverviewPage campaigns={campaigns} totals={totals} onSelectCampaign={selectAndOpen} reducedMotion={preferenceState.effectiveReducedMotion} />} />
-          <Route path="/campaigns" element={<SetupGuard connection={connection}><CampaignsPage presets={presets} connection={connection} discoveryActivity={discoveryActivity} importActivity={importActivity} importJobs={importJobs} onLaunch={launchCampaign} onUpload={uploadCampaignFile} onRetryImport={retryImport} onResumeImport={processImportJob} onOpenCampaign={selectAndOpen} /></SetupGuard>} />
+          <Route path="/campaigns" element={<SetupGuard connection={connection}><CampaignsPage presets={presets} connection={connection} discoveryActivity={discoveryActivity} importActivity={importActivity} importJobs={importJobs} onLaunch={launchCampaign} onUpload={uploadCampaignFile} onRetryImport={retryImport} onResumeImport={processImportJob} onOpenCampaign={selectAndOpen} onDismissDiscovery={() => setDiscoveryActivity(null)} /></SetupGuard>} />
           <Route path="/leads" element={<SetupGuard connection={connection}><LeadWorkspacePage campaigns={campaigns} selectedCampaignId={selectedCampaignId} setSelectedCampaignId={setSelectedCampaignId} detail={detail} connection={connection} onSync={syncCampaign} syncing={syncing} /></SetupGuard>} />
           <Route path="/deployments" element={<SetupGuard connection={connection}><DeploymentsPage campaigns={campaigns} selectedCampaignId={selectedCampaignId} setSelectedCampaignId={setSelectedCampaignId} detail={detail} history={history} /></SetupGuard>} />
           <Route path="/zendesk" element={<ZendeskPage connection={connection} setConnection={setConnection} />} />

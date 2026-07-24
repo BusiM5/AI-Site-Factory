@@ -1007,6 +1007,32 @@ LEAD_PRESETS = [
     },
 ]
 
+APIFY_PRESET_SEARCH_VARIANTS: Dict[str, List[str]] = {
+    "restaurants": ["restaurants", "cafes", "takeaways"],
+    "plumbers": ["plumbers", "emergency plumbers", "plumbing services"],
+    "dentists": ["dentists", "dental clinics", "cosmetic dentists"],
+    "beauty salons": ["beauty salons", "nail salons", "day spas"],
+    "gyms fitness studios": ["gyms", "fitness centers", "personal trainers"],
+    "electricians electrical services": [
+        "electricians",
+        "electrical installation services",
+        "electrical repair services",
+    ],
+    "roofers roofing contractors": ["roofers", "roofing contractors", "waterproofing services"],
+    "hvac air conditioning heating": [
+        "HVAC contractors",
+        "air conditioning services",
+        "refrigeration services",
+    ],
+    "auto repair mechanics": ["auto repair shops", "mechanics", "panel beaters"],
+    "locksmiths": ["locksmiths", "emergency locksmiths", "key cutting services"],
+    "pest control": ["pest control", "exterminators", "fumigation services"],
+    "cleaning services": ["cleaning services", "office cleaning", "carpet cleaning"],
+    "landscapers garden services": ["landscapers", "garden services", "irrigation services"],
+    "painters painting contractors": ["painters", "painting contractors", "commercial painters"],
+    "accountants bookkeeping tax": ["accountants", "bookkeeping services", "tax consultants"],
+}
+
 
 SITE_TEMPLATES = [
     {
@@ -2907,6 +2933,8 @@ def suggest_campaign_metadata(
     location: str,
     fallback_industry: str = "Mixed industries",
 ) -> Dict[str, Any]:
+    fallback_label = compact_text(fallback_industry)
+    prefer_fallback = bool(fallback_label and not is_generic_industry_label(fallback_label))
     industry_counts: Dict[str, int] = {}
     for lead in leads:
         category = compact_text(lead.category)
@@ -2914,7 +2942,9 @@ def suggest_campaign_metadata(
             industry_counts[category] = industry_counts.get(category, 0) + 1
     ranked = sorted(industry_counts.items(), key=lambda item: (-item[1], item[0].casefold()))
     total_classified = sum(industry_counts.values())
-    if len(ranked) == 1 or (ranked and ranked[0][1] / max(1, total_classified) >= 0.65):
+    if prefer_fallback:
+        industry = fallback_label
+    elif len(ranked) == 1 or (ranked and ranked[0][1] / max(1, total_classified) >= 0.65):
         industry = ranked[0][0]
     elif ranked:
         industry = "Mixed industries"
@@ -2924,7 +2954,9 @@ def suggest_campaign_metadata(
             industry = "Mixed industries"
 
     top_industries = [name for name, _count in ranked[:3]]
-    if not top_industries:
+    if prefer_fallback:
+        descriptor = fallback_label
+    elif not top_industries:
         descriptor = "Mixed Business"
     elif len(top_industries) == 1:
         descriptor = top_industries[0]
@@ -2933,7 +2965,8 @@ def suggest_campaign_metadata(
     else:
         descriptor = f"{top_industries[0]}, {top_industries[1]} & {top_industries[2]}"
     location_label = compact_text(location, "South Africa").split(",", 1)[0]
-    campaign_name = f"{location_label} {descriptor} Mixed Leads — {datetime.now().strftime('%b %Y')}"
+    name_suffix = "Mixed Leads" if industry == "Mixed industries" else "Leads"
+    campaign_name = f"{location_label} {descriptor} {name_suffix} — {datetime.now().strftime('%b %Y')}"
     return {
         "campaignName": campaign_name,
         "industry": industry,
@@ -4410,7 +4443,10 @@ def apify_google_maps_search_variants(query: str, location: str = "") -> List[st
         and primary.casefold().endswith(location_suffix.casefold())
     ):
         primary = primary[: -len(location_suffix)].strip()
-    return [primary] if primary else []
+    if not primary:
+        return []
+    configured = APIFY_PRESET_SEARCH_VARIANTS.get(primary.casefold())
+    return configured or [primary]
 
 
 def run_apify_google_maps(query: str, limit: int, location: str = "South Africa") -> List[Dict[str, Any]]:
@@ -4420,6 +4456,7 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
     country_code = infer_country_code(location)
     location_query = compact_text(location)
     search_terms = apify_google_maps_search_variants(query, location_query)
+    per_search_limit = max(1, (max_items + len(search_terms) - 1) // len(search_terms))
 
     log_event(
         "info",
@@ -4431,6 +4468,7 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
         actorId=actor_id,
         countryCode=country_code,
         searchVariantCount=len(search_terms),
+        perSearchLimit=per_search_limit,
     )
 
     total_budget = max(90, min(int(os.getenv("APIFY_DISCOVERY_BUDGET_SECONDS", "120")), 120))
@@ -4448,7 +4486,7 @@ def run_apify_google_maps(query: str, limit: int, location: str = "South Africa"
         "searchStringsArray": search_terms,
         "locationQuery": location_query,
         "language": "en",
-        "maxCrawledPlacesPerSearch": max_items,
+        "maxCrawledPlacesPerSearch": per_search_limit,
         "includeWebResults": False,
         "skipClosedPlaces": True,
         "website": "withoutWebsite",
@@ -13018,6 +13056,16 @@ def campaign_discovery_plan(campaign: sqlite3.Row) -> Tuple[List[DiscoveredLead]
             },
         )
     leads = [DiscoveredLead(**value) for value in safe_json_loads(batch["leads_json"], [])]
+    province_stats = safe_json_loads(batch["province_stats_json"], {})
+    stat_rows = list(province_stats.values()) if isinstance(province_stats, dict) else []
+
+    def total_stat(key: str) -> int:
+        return sum(int((value or {}).get(key) or 0) for value in stat_rows if isinstance(value, dict))
+
+    raw_fetched = total_stat("rawItems")
+    websites_skipped = total_stat("websitesSkipped")
+    no_contact_skipped = total_stat("noContactSkipped")
+    duplicates_skipped = total_stat("duplicatesSkipped") or int(batch["duplicates_skipped"] or 0)
     snapshot = {
         "batchId": batch_id,
         "preset": resolve_lead_preset(campaign["preset_id"], campaign["industry"], campaign["query"]),
@@ -13026,11 +13074,15 @@ def campaign_discovery_plan(campaign: sqlite3.Row) -> Tuple[List[DiscoveredLead]
         "leads": [lead.model_dump() for lead in leads],
         "sourceStatus": "SAVED_CAMPAIGN_PLAN",
         "warnings": safe_json_loads(batch["warnings_json"], []),
-        "provinceStats": safe_json_loads(batch["province_stats_json"], {}),
-        "duplicatesSkipped": batch["duplicates_skipped"] or 0,
+        "provinceStats": province_stats,
+        "duplicatesSkipped": duplicates_skipped,
         "requestedCount": campaign["requested_count"],
-        "rawFetched": batch["lead_count"] or len(leads),
+        "rawFetched": raw_fetched or int(batch["lead_count"] or 0) or len(leads),
         "eligibleReturned": len(leads),
+        "websitesSkipped": websites_skipped,
+        "noContactSkipped": no_contact_skipped,
+        "generatedDuplicatesSkipped": duplicates_skipped,
+        "shortfall": max(0, int(campaign["requested_count"] or 0) - len(leads)),
         "cached": True,
     }
     return leads, snapshot
